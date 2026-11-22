@@ -462,11 +462,123 @@ class Ramp(unittest.TestCase):
                          HOST_RESERVE=5, ramp_room=lambda *a: 0)
             with mock.patch.object(ramp.runpy, 'run_path', return_value=state):
                 result = ramp.remote(mock.Mock(action='sample', coldbox=str(source), since=0))
-            self.assertEqual(result['cpus'], ramp.os.cpu_count()-2)
+            self.assertEqual(result['cpus'], ramp.os.sysconf('SC_NPROCESSORS_ONLN')-2)
             self.assertEqual(result['total'], 90)
             self.assertEqual((result['busy'], result['warm'], result['active'], result['cap']), (2, 1, [], None))
             self.assertEqual(len(result['cpu']), 8)
             self.assertTrue(result['cap_supported'])
+
+
+class CapacityAudit(unittest.TestCase):
+    def test_mixed_reservations_include_booting_disks_and_untracked_vms(self):
+        from contextlib import nullcontext
+
+        self.assertIsNotNone(getattr(ramp, 'capacity_sample', None))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'ready').mkdir()
+            (root / 'ready' / 'small').touch()
+            workers = [argparse.Namespace(name='small', memory=4, kind='burst'),
+                       argparse.Namespace(name='large', memory=16, kind='burst')]
+            state = dict(STATE=root, POOL='test', RESERVE=root / 'reserve', CORES_PER_JOB=3,
+                         host_lock=nullcontext, live_workers=lambda path, prune: workers,
+                         unreadable_live_workers=lambda path: [], host_vms=lambda: {'small', 'untracked'},
+                         adhoc_vms=lambda: {},
+                         vm_memory=lambda: 8, vm_bytes=lambda worker, memory: worker.memory,
+                         host_memory=lambda field='MemTotal': 64 if field == 'MemTotal' else 17,
+                         host_share=lambda host: 8, memory_floor=lambda host: 16,
+                         additional_vm_memory=lambda *args: 5, vm_disk=lambda: 40,
+                         query=lambda path: {'space': {'used': 60, 'total': 100}},
+                         host_setting=lambda *args: 4, host_cpus=lambda: 16,
+                         build_id=lambda loaded: '123456789abc')
+            ready_workers = set()
+            sample = ramp.capacity_sample(state, ready_workers)
+            self.assertEqual(sample['budgets'], dict(cpu=[9, 12], ram=[33, 56], disk=[100, 90]))
+            self.assertEqual(ramp.capacity_summary([sample])['over_admissions'], 1)
+            sample['available'] = 15
+            self.assertEqual(ramp.capacity_summary([sample])['floor_violations'], 1)
+            (root / 'receipts').mkdir()
+            (root / 'receipts' / 'large.json').write_text(json.dumps(dict(
+                vm=dict(destroyed=True, destroyed_at='2026-11-20T00:00:30Z'))))
+            settled = ramp.capacity_sample(state, ready_workers)
+            self.assertEqual(settled['budgets']['disk'], [60, 90])
+            self.assertEqual(ramp.capacity_summary([settled])['over_admissions'], 0)
+
+    def test_teardown_does_not_reserve_a_disk_for_a_worker_that_booted(self):
+        from contextlib import nullcontext
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / 'ready' / 'finishing'
+            marker.parent.mkdir()
+            marker.touch()
+            workers = [argparse.Namespace(name=name, kind='burst') for name in ('starting', 'finishing')]
+            inventory = {'finishing'}
+
+            def destroy_during_sample(*args):
+                marker.unlink()
+                inventory.clear()
+                return 0
+
+            state = dict(STATE=root, POOL='test', RESERVE=root / 'reserve', CORES_PER_JOB=3,
+                         host_lock=nullcontext, live_workers=lambda path, prune: workers,
+                         unreadable_live_workers=lambda path: [], host_vms=lambda: set(inventory),
+                         vm_memory=lambda: 8, vm_bytes=lambda worker, memory: memory,
+                         host_memory=lambda field='MemTotal': 64, host_share=lambda host: 8,
+                         memory_floor=lambda host: 16, additional_vm_memory=destroy_during_sample,
+                         vm_disk=lambda: 40, query=lambda path: {'space': {'used': 15, 'total': 100}},
+                         host_setting=lambda *args: 4, host_cpus=lambda: 16,
+                         build_id=lambda loaded: '123456789abc')
+            ready_workers = set()
+            crossing = ramp.capacity_sample(state, ready_workers)
+            self.assertEqual(crossing['budgets']['disk'], [55, 90])
+            state['additional_vm_memory'] = lambda *args: 0
+            after_destroy = ramp.capacity_sample(state, ready_workers)
+            self.assertEqual(after_destroy['budgets']['disk'], [55, 90])
+
+            receipt = root / 'receipts' / 'finishing.json'
+            receipt.parent.mkdir()
+            receipt.write_text(json.dumps({'vm': {
+                'ready_seconds': 26.295, 'destroyed': True,
+                'destroyed_at': '2026-11-20T18:51:04Z',
+            }}))
+            inventory.add('finishing')
+            fresh_audit = ramp.capacity_sample(state, set())
+            self.assertEqual(fresh_audit['budgets']['disk'], [55, 90])
+
+            workers[1] = argparse.Namespace(name='another-starting', kind='burst')
+            inventory.clear()
+            two_boots = ramp.capacity_sample(state, ready_workers)
+            self.assertEqual(two_boots['budgets']['disk'], [95, 90])
+            report = ramp.capacity_summary([crossing, after_destroy, fresh_audit, two_boots])
+            self.assertEqual(report['over_admissions'], 1)
+
+    def test_burst_requires_fifo_and_a_final_receipt_for_each_request(self):
+        self.assertIsNotNone(getattr(ramp, 'burst_summary', None))
+        sizes = dict(small=4, default=8, large=16)
+        jobs = [dict(id=number, labels=[label], runner_name=size, status='completed')
+                for number, (size, label) in enumerate(zip(sizes, ['coldbox-small', 'coldbox', 'coldbox-large']), 1)]
+        direct = ['first', 'second']
+        revision = dict(repo='fixture/capacity', sha='a' * 40)
+        cohort = dict(jobs=jobs, direct=direct, **revision)
+        vm = dict(destroyed_at='2026-11-20T00:00:30Z', destroyed=True)
+        receipts = [dict(id=job['runner_name'], mode='runner', github={'job_id': job['id']}, vm=vm, **revision)
+                    for job in jobs]
+        receipts.extend(dict(id=name, mode='local', vm=vm, **revision) for name in direct)
+        samples = [dict(workers={}, direct_admitted={}, direct_queued=[dict(id=name, **revision) for name in direct]),
+                   dict(workers=dict(sizes, first=8, second=8), direct_admitted=dict(first=10, second=20),
+                        direct_queued=[])]
+        result = ramp.burst_summary(samples, receipts, cohort, sizes, cb.job_size)
+        self.assertEqual((result['requests'], result['non_terminal'], result['actions_sizes']),
+                         (5, 0, ['default', 'large', 'small']))
+        self.assertTrue(result['fifo'])
+        self.assertTrue(result['mixed_overlap'])
+        samples[1]['direct_admitted']['second'] = 9
+        self.assertFalse(ramp.burst_summary(samples, receipts, cohort, sizes, cb.job_size)['fifo'])
+        self.assertEqual(ramp.burst_summary(samples, receipts[:-1], cohort, sizes, cb.job_size)['non_terminal'], 1)
+        samples[1]['direct_admitted']['second'] = 20
+        samples[0]['direct_queued'].append(dict(id='unlisted', **revision))
+        self.assertFalse(ramp.burst_summary(samples, receipts, cohort, sizes, cb.job_size)['fifo'])
 
 
 class Trials(unittest.TestCase):

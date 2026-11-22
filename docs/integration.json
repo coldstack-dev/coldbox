@@ -1,0 +1,8 @@
+{
+  "schema": "coldbox.integration/v1",
+  "documentation": "integration.md",
+  "backend": "coldbox",
+  "interface": "cold.exec/v0",
+  "evidence_schema": "coldbox.evidence/v1",
+  "receipt_schema": "coldbox.receipt/v1"
+}

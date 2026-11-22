@@ -1,13 +1,19 @@
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import importlib.machinery
 import importlib.util
 import io
+import itertools
 import json
+import multiprocessing
 import os
+import pty
+import termios
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -19,6 +25,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,7 +36,8 @@ os.environ['COLDBOX_INCUS_ENV'] = str(Path(tempfile.mkdtemp()) / 'incus.env')
 os.environ['COLDBOX_STATE'] = tempfile.mkdtemp()
 os.environ['COLDBOX_GITHUB_APP_ENV'] = str(Path(tempfile.mkdtemp()) / 'github-app.env')
 os.environ['COLDBOX_RESERVE'] = str(Path(tempfile.mkdtemp()) / 'reserve')
-for inherited_from_a_coldbox_job in ('PYTEST_ADDOPTS', 'COLDBOX_JOB_DIR', 'COLDBOX_JUNIT'):
+os.environ['COLDBOX_TOOLCACHE'] = str(Path(tempfile.mkdtemp()) / 'toolcache')
+for inherited_from_a_coldbox_job in ('PYTEST_ADDOPTS', 'COLDBOX_JOB_DIR', 'COLDBOX_JUNIT', 'GITHUB_EVENT_NAME'):
     os.environ.pop(inherited_from_a_coldbox_job, None)
 
 
@@ -87,9 +95,12 @@ class Version(unittest.TestCase):
         self.assertEqual(result.stdout, f'coldbox 0.2.0 (build {build})\n')
 
 
+PYTEST_SOURCE = 'def test_x():\n    pass\n'
+
+
 class Detect(unittest.TestCase):
     def test_python_repo_gets_lint_and_pytest(self):
-        found = cb.detect(repo({'pyproject.toml': '', 'tests/test_x.py': ''}))
+        found = cb.detect(repo({'pyproject.toml': '', 'tests/test_x.py': PYTEST_SOURCE}))
         self.assertEqual(found['test'], ['python3 -m pytest -q'])
         self.assertIn('compileall', found['lint'][0])
         self.assertNotIn('setup', found)
@@ -97,12 +108,44 @@ class Detect(unittest.TestCase):
     def test_python_without_tests_has_no_test_check(self):
         self.assertNotIn('test', cb.detect(repo({'app.py': ''})))
 
+    def test_pytest_ignores_empty_and_helper_only_test_files(self):
+        found = cb.detect(repo({'pytest.ini': '[pytest]\n', 'tests/test_empty.py': '',
+                                'tests/test_helpers.py': 'from pathlib import Path\n# def test_example():\n'
+                                                         'def helper():\n    return Path.cwd()\n'}))
+        self.assertNotIn('test', found)
+
+    def test_pytest_keeps_inherited_and_generated_tests(self):
+        for source in ('from base import Base\nclass Inherited(Base):\n    pass\n',
+                       'import base\nclass Inherited(base.Base):\n    pass\n',
+                       'from pytest_bdd import scenarios\nscenarios("features")\n'):
+            with self.subTest(source=source):
+                found = cb.detect(repo({'base.py': 'import unittest\nclass Base(unittest.TestCase):\n'
+                                                   '    def test_base(self):\n        pass\n',
+                                        'test_suite.py': source}))
+                self.assertEqual(found.get('test'), ['python3 -m pytest -q'])
+
     def test_node_uses_lockfile_and_skips_npm_placeholder_test(self):
         pkg = json.dumps({'scripts': {'lint': 'eslint .', 'test': 'echo "Error: no test specified" && exit 1'}})
         found = cb.detect(repo({'package.json': pkg, 'package-lock.json': '{}'}))
         self.assertEqual(found['setup'], ['npm ci'])
         self.assertEqual(found['lint'], ['npm run lint'])
         self.assertNotIn('test', found)
+
+    def test_node_omits_scripts_that_only_print_or_exit(self):
+        for script in ('', 'echo no-tests-ran', 'echo no test specified; exit 0',
+                       'printf "%s" "no tests"', 'true', ':', 'exit 0'):
+            with self.subTest(script=script):
+                pkg = json.dumps({'scripts': {'test': script}})
+                self.assertNotIn('test', cb.detect(repo({'package.json': pkg})))
+
+    def test_node_keeps_tests_run_by_lifecycle_scripts_and_shell_commands(self):
+        for scripts in ({'test': 'echo done', 'pretest': 'node --test'},
+                        {'test': 'echo no test specified; node --test'},
+                        {'test': 'echo "$(node --test)"'},
+                        {'test': 'echo starting\nnode --test'}):
+            with self.subTest(scripts=scripts):
+                pkg = json.dumps({'scripts': scripts})
+                self.assertEqual(cb.detect(repo({'package.json': pkg})).get('test'), ['npm test'])
 
     def test_python_runs_ruff_and_mypy_only_when_configured(self):
         ruff = cb.PY_VENV + 'pip install -q ruff && ruff check .'
@@ -154,6 +197,22 @@ class Detect(unittest.TestCase):
         found = cb.detect(repo({'package.json': '{}', 'tsconfig.json': '{}'}))
         self.assertEqual(found['lint'], ['npx --yes -p typescript tsc --noEmit'])
         self.assertNotIn('lint', cb.detect(repo({'package.json': '{}'})))
+
+    def test_tsconfig_references_use_build_mode(self):
+        files = {'package.json': '{}',
+                 'tsconfig.json': '\ufeff{"files": [], // Solution config\n'
+                                  '"references": /* packages */ [{"path": "./app",},],}'}
+        self.assertEqual(cb.detect(repo(files))['lint'], ['npx --yes -p typescript tsc --build'])
+        files.update({'package.json': '{"packageManager":"yarn@4.5.1"}', 'yarn.lock': ''})
+        self.assertEqual(cb.detect(repo(files))['lint'],
+                         ['npx --yes -p @yarnpkg/cli-dist@4.5.1 yarn tsc --build'])
+
+    def test_tsconfig_without_project_references_keeps_no_emit(self):
+        for config in ('{"references": []}', '{} // "references": [{"path": "app"}]',
+                       '{"compilerOptions": {"paths": {"references": ["./app"]}}}'):
+            with self.subTest(config=config):
+                found = cb.detect(repo({'package.json': '{}', 'tsconfig.json': config}))
+                self.assertEqual(found['lint'], ['npx --yes -p typescript tsc --noEmit'])
 
     def test_node_tools_from_dev_dependencies_or_config_without_scripts(self):
         pkg = json.dumps({'devDependencies': {'eslint': '^9', 'vitest': '^2'}})
@@ -222,7 +281,7 @@ class Config(unittest.TestCase):
         self.assertEqual(cb.plan(root), [('test', ['make t'])])
 
     def test_custom_check_runs_after_builtins(self):
-        root = repo({'tests/test_x.py': '', 'coldbox.toml': '[commands]\ntypecheck = "mypy ."\n'})
+        root = repo({'tests/test_x.py': PYTEST_SOURCE, 'coldbox.toml': '[commands]\ntypecheck = "mypy ."\n'})
         self.assertEqual([name for name, _ in cb.plan(root)], ['lint', 'test', 'typecheck'])
 
     def test_rejects_bad_config(self):
@@ -230,6 +289,18 @@ class Config(unittest.TestCase):
                      '[checks]\nverify = true\n', '[commands]\n"Bad Name" = "x"\n', 'not toml ['):
             with self.subTest(text=text), self.assertRaises(cb.ConfigError):
                 cb.plan(repo({'app.py': '', 'coldbox.toml': text}))
+
+    def test_rejects_profiles_without_a_distinct_list_of_check_names(self):
+        for value in ('"test"', '[]', '["test", "test"]', '[1]'):
+            with self.subTest(value=value), self.assertRaisesRegex(cb.ConfigError, 'must list distinct check names'):
+                cb.plan(repo({'coldbox.toml': f'[profiles]\nquick = {value}\n'}))
+
+    def test_direct_profile_cannot_replace_pull_request_checks(self):
+        root = repo({'coldbox.toml': '[profiles]\nquick = ["test"]\n[commands]\ntest = "true"\n'})
+        with mock.patch.dict(os.environ, GITHUB_EVENT_NAME='pull_request'):
+            code, output = quiet(cb.main, ['checks', str(root), '--profile', 'quick'])
+        self.assertEqual(code, 2)
+        self.assertIn('--profile is only for direct verification', output)
 
 
 class VmSizes(unittest.TestCase):
@@ -247,7 +318,7 @@ class VmSizes(unittest.TestCase):
         def shape(size, host_gib, threads):
             with mock.patch.multiple(cb, vm_memory=lambda: 12 * GIB, ic=lambda *a: '8\n',
                                      host_memory=lambda field='MemTotal': host_gib * GIB), \
-                    mock.patch.object(cb.os, 'cpu_count', lambda: threads):
+                    mock.patch.object(cb, 'host_cpus', lambda: threads):
                 return cb.vm_shape(size)
         self.assertEqual(shape('default', 64, 32), (None, {}))
         self.assertEqual(shape('small', 64, 32), (6 * GIB, {'limits.cpu': '4', 'limits.memory': '6144MiB'}))
@@ -259,7 +330,8 @@ class VmSizes(unittest.TestCase):
         self.assertEqual(cb.runner_labels('default'), cb.LABELS)
         self.assertEqual(cb.runner_labels('large'), ['self-hosted', 'linux', 'x64', 'coldbox-large'])
         for labels, size in ((['self-hosted', 'coldbox'], 'default'), (['self-hosted', 'Coldbox-Large'], 'large'),
-                             (['coldbox-small'], 'small'), (['self-hosted', 'coldbox', 'coldbox-large'], None),
+                             (['coldbox-small'], 'small'), (['dependabot'], 'default'), (['dependabot', 'gpu'], None),
+                             (['self-hosted', 'coldbox', 'coldbox-large'], None),
                              (['coldbox-small', 'coldbox-large'], None), (['coldbox-huge'], None), ([], None)):
             with self.subTest(labels=labels):
                 self.assertEqual(cb.job_size(labels), size)
@@ -286,7 +358,7 @@ class HostChecks(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_host_default_switches_a_check_off(self):
-        root = repo({'tests/test_x.py': ''})
+        root = repo({'tests/test_x.py': PYTEST_SOURCE})
         self.assertEqual([name for name, _ in cb.plan(root)], ['test'])
         code, output = quiet(cb.detect_cmd, argparse.Namespace(path=str(root), workflow=False))
         self.assertEqual(code, 0)
@@ -301,10 +373,10 @@ class HostChecks(unittest.TestCase):
         self.assertIn('add verify = "coldverify --ci" under [commands], or verify = false under [checks]', stderr.getvalue())
 
     def test_a_fleet_recipe_with_verify_switched_off_runs_the_rest(self):
-        root = repo({'.fleet/verify.sh': '', 'tests/test_x.py': '', 'coldbox.toml': '[checks]\nverify = false\n'})
+        root = repo({'.fleet/verify.sh': '', 'tests/test_x.py': PYTEST_SOURCE, 'coldbox.toml': '[checks]\nverify = false\n'})
         self.assertEqual([name for name, _ in cb.plan(root)], ['test'])
         self.host.write_text('[checks]\nlint = false\nverify = false\n')
-        self.assertEqual([name for name, _ in cb.plan(repo({'.fleet/verify.sh': '', 'tests/test_x.py': ''}))], ['test'])
+        self.assertEqual([name for name, _ in cb.plan(repo({'.fleet/verify.sh': '', 'tests/test_x.py': PYTEST_SOURCE}))], ['test'])
 
     def test_verify_runs_the_command_coldbox_toml_names(self):
         root = repo({'.fleet/verify.sh': '', 'coldbox.toml': '[checks]\nverify = true\n[commands]\nverify = "coldverify --ci"\n'})
@@ -317,7 +389,7 @@ class HostChecks(unittest.TestCase):
 
     def test_detect_workflow_proposes_the_example_workflow_then_the_checks(self):
         import yaml
-        root = repo({'pyproject.toml': '', 'tests/test_x.py': ''})
+        root = repo({'pyproject.toml': '', 'tests/test_x.py': PYTEST_SOURCE})
         code, output = quiet(cb.detect_cmd, argparse.Namespace(path=str(root), workflow=True))
         example = (ROOT / 'examples' / 'coldbox.yml').read_text()
         self.assertEqual(code, 0)
@@ -354,7 +426,7 @@ class HostChecks(unittest.TestCase):
         for text, code in (('steps:\n  - name: Run coldbox checks\n    run: make\n', 0),
                            ('steps:\n  - run: make test # previously ran coldbox checks\n', 0),
                            ('steps:\n  - run: coldbox   checks\n', 1)):
-            root = repo({'tests/test_x.py': '', '.github/workflows/ci.yml': text})
+            root = repo({'tests/test_x.py': PYTEST_SOURCE, '.github/workflows/ci.yml': text})
             with self.subTest(text=text):
                 self.assertEqual(quiet(cb.detect_cmd, argparse.Namespace(path=str(root), workflow=True))[0], code)
 
@@ -411,6 +483,14 @@ class JobGuestFiles(unittest.TestCase):
                 self.assertLess(calls.index(extract), calls.index(('job-command',)))
                 self.assertNotIn('error', receipt)
 
+    def test_only_runner_jobs_apply_directory_modes_with_the_managed_handler(self):
+        files = repo({'opt/tool/marker': 'new'})
+        for mode, handler in (('runner', '/usr/bin/python3'), ('local', 'sh'), ('adhoc', 'sh')):
+            with self.subTest(mode=mode):
+                calls, _ = self.run_job(files, mode=mode)
+                dirs = next(call for call in calls if call[-2:] == ('/', cb.OVERLAY_DIRS_RECORD))
+                self.assertEqual(dirs[0], handler)
+
     def test_missing_guest_files_still_passes_without_an_extract(self):
         calls, receipt = self.run_job(Path(tempfile.mkdtemp()) / 'missing')
         self.assertFalse(any(call[0] == 'tar' for call in calls))
@@ -453,6 +533,298 @@ class JobGuestFiles(unittest.TestCase):
         self.assertTrue(receipt['vm']['destroyed'])
 
 
+class DependencyCache(unittest.TestCase):
+    def setUp(self):
+        self.state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(cb, 'STATE', self.state))
+        self.addCleanup(cb.CLEANUP.clear)
+        self.folder = self.state / 'cache/me/app'
+
+    def github(self, event='push', branch='main', head='me/app', runner='cbx-1', conclusion='success', sha='tip',
+               runner_id=7):
+        answers = {'repos/me/app/actions/runs/5': dict(id=5, event=event, head_branch=branch, head_sha=sha,
+                                                       head_repository=dict(full_name=head)),
+                   'repos/me/app/actions/runs/5/attempts/1/jobs?per_page=100&page=1':
+                       dict(jobs=[dict(runner_name=runner, runner_id=runner_id, conclusion=conclusion)]),
+                   'repos/me/app': dict(default_branch='main'),
+                   'repos/me/app/git/ref/heads/main': dict(object=dict(sha='tip'))}
+        return lambda path, body=None: answers[path]
+
+    def run_job(self, name, writes=None, github=None, folders=tuple(cb.CACHES.values())):
+        home = self.state / name
+        for path in folders:
+            (home / path).mkdir(parents=True)
+        devices = []
+
+        def in_vm(vm, *command, **kwargs):
+            if command[:2] in (('tar', '-x'), ('tar', '-c')):
+                return [*command[:2], '-C', str(home), command[4]]
+            if command[0] == 'test':
+                return ['test', '-e', str(home / Path(command[2]).relative_to(f'/home/{cb.RUNNER}'))]
+            return ['false'] if command[0] == 'coldbox' else ['true']
+
+        def command(*args):
+            for rel, text in (writes or {}).items():
+                (home / rel).write_text(text)
+            return 0
+
+        metadata = dict(repo='me/app', sha='abc', run_id='5', run_attempt='1')
+        with mock.patch.multiple(cb, boot=lambda *a: None, ic=lambda *a: devices.append(a), ic_exec=in_vm,
+                                 tee=command, destroy=lambda vm: True, vm_resources=lambda vm: {},
+                                 copy_artifacts=lambda *a: ([], True), record_queue_wait=lambda *a: None,
+                                 pull=lambda vm, path: metadata if path.endswith('job.json') else None,
+                                 gh=github or self.github(runner=name)):
+            quiet(lambda: cb.job('runner', name, 60, ['true'], 'me/app', extra=dict(runner_id=7),
+                                 cache=cb.cache_folder('me/app', False)))
+        receipt = json.loads((self.state / f'receipts/{name}.json').read_text())
+        self.assertFalse([call for call in devices if 'device' in call])
+        return home, receipt
+
+    def test_a_default_branch_push_fills_the_npm_pip_go_and_cargo_caches_and_the_next_job_starts_with_them(self):
+        self.folder.mkdir(parents=True)
+        _, first = self.run_job('cbx-1', writes={'.npm/pkg': 'tarball', '.cache/pip/wheel': 'whl',
+                                                 'go/pkg/mod/mod.zip': 'zip', '.cargo/registry/serde.crate': 'crate',
+                                                 '.cargo/git/db': 'pack'})
+        home, second = self.run_job('cbx-2', github=self.github(event='pull_request', branch='topic', runner='cbx-2'))
+        self.assertEqual((home / '.npm/pkg').read_text(), 'tarball')
+        self.assertEqual((home / '.cache/pip/wheel').read_text(), 'whl')
+        self.assertEqual((home / 'go/pkg/mod/mod.zip').read_text(), 'zip')
+        self.assertEqual((home / '.cargo/registry/serde.crate').read_text(), 'crate')
+        self.assertEqual((home / '.cargo/git/db').read_text(), 'pack')
+        for tool, fields in (('npm', lambda r: r['cache']), ('pip', lambda r: r['cache']['pip']),
+                             ('go', lambda r: r['cache']['go']), ('cargo', lambda r: r['cache']['cargo']),
+                             ('cargo-git', lambda r: r['cache']['cargo-git'])):
+            with self.subTest(tool):
+                self.assertGreater(fields(first)['out_bytes'], 0)
+                self.assertEqual(fields(second)['in_bytes'], (self.folder / f'{tool}.tar').stat().st_size)
+                self.assertEqual(fields(second)['in_exit'], 0)
+                self.assertNotIn('out_bytes', fields(second))
+        self.assertEqual(sorted(p.name for p in self.folder.iterdir()),
+                         ['.fill.lock', 'cargo-git.tar', 'cargo.tar', 'go.tar', 'npm.tar', 'pip.tar'])
+
+    def test_a_folder_the_job_never_made_is_recorded_absent_and_keeps_its_saved_cache(self):
+        self.folder.mkdir(parents=True)
+        (self.folder / 'pip.tar').write_bytes(b'old pip')
+        _, receipt = self.run_job('cbx-1', writes={'.npm/pkg': 'tarball'}, folders=('.npm',))
+        self.assertGreater(receipt['cache']['out_bytes'], 0)
+        self.assertNotIn('out_absent', receipt['cache'])
+        for tool in ('pip', 'go', 'cargo', 'cargo-git'):
+            with self.subTest(tool):
+                fields = receipt['cache'][tool]
+                self.assertEqual((fields['out_bytes'], fields['out_absent']), (0, True))
+                self.assertNotIn('out_refused', fields)
+        self.assertEqual((self.folder / 'pip.tar').read_bytes(), b'old pip')
+        self.assertFalse((self.folder / 'go.tar').exists())
+
+    def test_only_a_passing_push_of_the_default_branch_tip_on_this_runner_registration_fills_the_cache(self):
+        self.folder.mkdir(parents=True)
+        for why, github in (('pull request', dict(event='pull_request')), ('other branch', dict(branch='topic')),
+                            ('fork head', dict(head='stranger/app')), ('other runner', dict(runner='cbx-9')),
+                            ('failed job', dict(conclusion='failure')), ('unfinished job', dict(conclusion=None)),
+                            ('reused runner name', dict(runner_id=8)), ('rerun of an older push', dict(sha='old'))):
+            with self.subTest(why):
+                name = f"cbx-{why.replace(' ', '-')}"
+                _, receipt = self.run_job(name, writes={'.npm/pkg': 'evil', '.cache/pip/wheel': 'evil'},
+                                          github=self.github(**{'runner': name, **github})
+                                          if why != 'other runner' else self.github(**github))
+                self.assertEqual(receipt['cache'], {'in_bytes': 0, 'pip': dict(in_bytes=0), 'go': dict(in_bytes=0),
+                                                    'cargo': dict(in_bytes=0), 'cargo-git': dict(in_bytes=0)})
+                self.assertEqual([p.name for p in self.folder.iterdir()], [])
+
+    def test_the_cache_is_off_unless_its_folder_exists_and_never_for_outside_code_or_org_runners(self):
+        self.assertIsNone(cb.cache_folder('me/app', False))
+        self.folder.mkdir(parents=True)
+        (self.state / 'cache/me-org').mkdir()
+        self.assertEqual(cb.cache_folder('me/app', False), self.folder)
+        self.assertIsNone(cb.cache_folder('me/app', True))
+        self.assertIsNone(cb.cache_folder('me-org', False))
+
+    def test_an_unreadable_cache_is_a_miss_and_the_job_still_runs(self):
+        (self.folder / 'npm.tar').mkdir(parents=True)
+        home, receipt = self.run_job('cbx-1', writes={'.npm/pkg': 'tarball'},
+                                     github=self.github(event='pull_request', runner='cbx-1'))
+        self.assertNotIn('error', receipt)
+        self.assertEqual(receipt['cache']['in_bytes'], 0)
+        self.assertIn('in_error', receipt['cache'])
+        self.assertEqual((home / '.npm/pkg').read_text(), 'tarball')
+
+    def test_a_failed_host_write_stops_the_guest_tar_at_once_and_leaves_no_partial_file(self):
+        self.folder.mkdir(parents=True)
+        real_open = Path.open
+
+        class Full:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def write(self, data):
+                raise OSError(errno.ENOSPC, 'No space left on device')
+
+        def opener(path, mode='r', *a, **k):
+            return Full() if mode == 'wb' else real_open(path, mode, *a, **k)
+
+        started = time.time()
+        with mock.patch.object(cb, 'ic_exec', lambda vm, *c, **k: ['yes'] if c[0] == 'tar' else ['true']), \
+                mock.patch.object(Path, 'open', opener), self.assertRaises(OSError):
+            cb.cache_out('cbx-1', self.folder, 'npm')
+        self.assertLess(time.time() - started, 30)
+        self.assertEqual([p.name for p in self.folder.iterdir()], ['.fill.lock'])
+
+    def test_one_fill_per_repo_at_a_time_and_a_fill_clears_abandoned_partial_files(self):
+        self.folder.mkdir(parents=True)
+        (self.folder / '.npm.tar.cbx-killed').write_bytes(b'x' * 100)
+        fake = lambda vm, *c, **k: ['sh', '-c', 'printf cache']
+        with (self.folder / '.fill.lock').open('w') as held, mock.patch.object(cb, 'ic_exec', fake):
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.assertEqual(cb.cache_out('cbx-2', self.folder, 'npm')['out_bytes'], 0)
+        with mock.patch.object(cb, 'ic_exec', fake):
+            self.assertEqual(cb.cache_out('cbx-3', self.folder, 'npm')['out_bytes'], 5)
+        self.assertEqual(sorted(p.name for p in self.folder.iterdir()), ['.fill.lock', 'npm.tar'])
+
+    def test_a_cache_over_the_cap_is_discarded_and_leaves_no_partial_file(self):
+        self.folder.mkdir(parents=True)
+        with mock.patch.object(cb, 'CACHE_MAX_BYTES', 4096):
+            _, receipt = self.run_job('cbx-1', writes={'.npm/big': 'x' * 100000, '.cache/pip/big': 'x' * 100000,
+                                                      'go/pkg/mod/big': 'x' * 100000, '.cargo/registry/big': 'x' * 100000,
+                                                      '.cargo/git/big': 'x' * 100000})
+        for fields in [receipt['cache'], *(receipt['cache'][tool] for tool in ('pip', 'go', 'cargo', 'cargo-git'))]:
+            self.assertEqual(fields['out_bytes'], 0)
+            self.assertIn('out_refused', fields)
+        self.assertEqual([p.name for p in self.folder.iterdir()], ['.fill.lock'])
+
+    def test_serve_hands_the_runner_job_its_repos_cache_folder(self):
+        self.folder.mkdir(parents=True)
+        runner = {'runner': {'id': 7}, 'encoded_jit_config': 'c'}
+        handler = cb.signal.getsignal(cb.signal.SIGTERM)
+        self.addCleanup(cb.signal.signal, cb.signal.SIGTERM, handler)
+        seen = []
+        for target, public in (('me/app', False), ('me/app', True), ('me/other', False)):
+            args = cb.argparse.Namespace(target=target, slots=1, ttl=60, allow_public=public,
+                                         once=True, worker=False, idle=0, name=None, size='default')
+            with mock.patch.multiple(cb, guard=lambda *a: None, gh=lambda *a, **k: runner, admit=mock.DEFAULT,
+                                     job=lambda *a, **k: seen.append(k['cache']) or {'verdict': 'pass'}):
+                quiet(cb.serve, args)
+        self.assertEqual(seen, [self.folder, None, None])
+
+
+class PullRequestBaseChecks(unittest.TestCase):
+    def pull_request(self, base, head, event=None):
+        root = git_repo(base)
+        sha = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True,
+                             check=True).stdout.strip()
+        for name, text in head.items():
+            if text is None:
+                (root / name).unlink()
+            else:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text)
+        for command in (['add', '-A'], ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'head']):
+            subprocess.run(['git', '-C', str(root), *command], check=True)
+        event_path = Path(tempfile.mkdtemp()) / 'event.json'
+        event_path.write_text(json.dumps(event if event is not None else {'pull_request': {'base': {'sha': sha}}}))
+        patcher = mock.patch.dict(os.environ, GITHUB_EVENT_NAME='pull_request', GITHUB_EVENT_PATH=str(event_path))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return root
+
+    def test_a_head_that_switches_verify_off_still_runs_the_base_verify(self):
+        root = self.pull_request({'coldbox.toml': '[commands]\nverify = "exit 1"\n'},
+                                 {'coldbox.toml': '[commands]\nverify = "exit 1"\nlint = "true"\n[checks]\nverify = false\n'})
+        code, output = quiet(cb.main, ['checks', str(root)])
+        self.assertEqual(code, 1)
+        self.assertIn('FAIL     verify', output)
+        self.assertIn('::notice title=coldbox runs the base check::the base coldbox.toml still runs verify: exit 1', output)
+
+    def test_a_head_that_swaps_the_command_runs_the_base_command_then_its_own(self):
+        root = self.pull_request({'coldbox.toml': '[commands]\nverify = "echo base >> ran"\n'},
+                                 {'coldbox.toml': '[commands]\nverify = "echo head >> ran"\n'})
+        self.assertEqual(quiet(cb.main, ['checks', str(root)])[0], 0)
+        self.assertEqual((root / 'ran').read_text(), 'base\nhead\n')
+
+    def test_a_check_the_head_adds_runs_after_every_base_check(self):
+        root = self.pull_request({'coldbox.toml': '[commands]\nverify = "test ! -e bypass"\n'},
+                                 {'bypass': '', 'coldbox.toml': '[commands]\nsetup = "rm -f bypass"\nverify = "true"\n'})
+        self.assertEqual(cb.checks_plan(root), [('verify', ['test ! -e bypass']), ('setup', ['rm -f bypass']),
+                                                ('verify', ['true'])])
+        self.assertEqual(quiet(cb.main, ['checks', str(root)])[0], 1)
+
+    def test_a_head_that_renames_a_check_still_runs_the_base_one(self):
+        root = self.pull_request({'coldbox.toml': '[commands]\nunit = "exit 1"\n'},
+                                 {'coldbox.toml': '[commands]\nunits = "true"\n'})
+        self.assertEqual(cb.checks_plan(root), [('unit', ['exit 1']), ('units', ['true'])])
+        self.assertEqual(quiet(cb.main, ['checks', str(root)])[0], 1)
+
+    def test_a_base_without_coldbox_toml_keeps_its_detected_checks(self):
+        root = self.pull_request({'test_x.py': 'def test_x():\n    pass\n'},
+                                 {'coldbox.toml': '[checks]\nlint = false\ntest = false\n'})
+        self.assertEqual(cb.plan(root), [])
+        self.assertEqual([name for name, _ in cb.checks_plan(root)], ['lint', 'test'])
+
+    def test_base_files_marked_export_ignore_still_count(self):
+        root = self.pull_request({'.gitattributes': 'tests/ export-ignore\n', 'tests/test_x.py': PYTEST_SOURCE,
+                                  'coldbox.toml': '[commands]\nverify = "exit 1"\n'},
+                                 {'coldbox.toml': '[checks]\nlint = false\ntest = false\n'})
+        self.assertEqual([name for name, _ in cb.checks_plan(root)], ['lint', 'test', 'verify'])
+
+    def test_a_head_that_adds_a_check_runs_it_at_once(self):
+        root = self.pull_request({'coldbox.toml': '[commands]\ntest = "true"\n'},
+                                 {'coldbox.toml': '[commands]\ntest = "true"\nverify = "exit 4"\n'})
+        code, output = quiet(cb.main, ['checks', str(root)])
+        self.assertEqual(code, 1)
+        self.assertNotIn('::notice', output)
+
+    def test_a_base_command_with_shell_metacharacters_runs_as_it_does_on_push(self):
+        command = '''printf '%s|%s\\n' "a  b" $(echo c) > out; x='$HOME'; echo "$x" 'q"t' >> out; echo $((2+3)) >> out'''
+        toml = f"[commands]\nverify = '''{command}'''\n"
+        root = self.pull_request({'coldbox.toml': toml}, {'coldbox.toml': '[commands]\nverify = "true"\n'})
+        self.assertEqual(quiet(cb.main, ['checks', str(root)])[0], 0)
+        on_pull_request = (root / 'out').read_text()
+        push = repo({'coldbox.toml': toml})
+        with mock.patch.dict(os.environ, GITHUB_EVENT_NAME='push'):
+            self.assertEqual(quiet(cb.main, ['checks', str(push)])[0], 0)
+        self.assertEqual(on_pull_request, (push / 'out').read_text())
+        self.assertEqual(on_pull_request, 'a  b|c\n$HOME q"t\n5\n')
+
+    def test_push_events_plan_from_the_checkout_alone(self):
+        root = self.pull_request({'coldbox.toml': '[commands]\nverify = "exit 1"\n'},
+                                 {'coldbox.toml': '[checks]\nverify = false\n[commands]\ntest = "true"\n'})
+        with mock.patch.dict(os.environ, GITHUB_EVENT_NAME='push'):
+            self.assertEqual(cb.checks_plan(root), [('test', ['true'])])
+
+    def test_a_base_commit_missing_from_the_checkout_fails(self):
+        root = self.pull_request({'coldbox.toml': '[commands]\nverify = "true"\n'}, {'x': ''},
+                                 event={'pull_request': {'base': {'sha': 'a' * 40}}})
+        code, output = quiet(cb.main, ['checks', str(root)])
+        self.assertEqual(code, 2)
+        self.assertIn(f"base commit {'a' * 40} is not in this checkout; check out with fetch-depth: 0", output)
+
+    def test_an_unreadable_event_fails(self):
+        for event in ({}, {'pull_request': None}, {'pull_request': {'base': {'sha': 'HEAD'}}},
+                      {'pull_request': {'base': {'sha': '--output=x'}}}):
+            with self.subTest(event=event):
+                root = self.pull_request({'coldbox.toml': '[commands]\nverify = "true"\n'}, {'x': ''}, event=event)
+                with self.assertRaises(cb.ConfigError):
+                    cb.checks_plan(root)
+        with mock.patch.dict(os.environ, GITHUB_EVENT_PATH=str(root / 'missing.json')):
+            with self.assertRaisesRegex(cb.ConfigError, 'no readable pull_request.base.sha'):
+                cb.checks_plan(root)
+
+    def test_an_unparsable_base_coldbox_toml_fails(self):
+        root = self.pull_request({'coldbox.toml': '[commands\n'}, {'coldbox.toml': '[commands]\nverify = "true"\n'})
+        with self.assertRaisesRegex(cb.ConfigError, 'coldbox.toml'):
+            cb.checks_plan(root)
+
+    def test_an_unparsable_base_coldbox_toml_error_names_the_base_commit(self):
+        root = self.pull_request({'coldbox.toml': '[commands\n'}, {'coldbox.toml': '[commands]\nverify = "true"\n'})
+        sha = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD~1'], capture_output=True, text=True,
+                             check=True).stdout.strip()
+        code, output = quiet(cb.main, ['checks', str(root)])
+        self.assertEqual(code, 2)
+        self.assertIn(f'coldbox: base coldbox.toml ({sha}): Expected', output)
+
+
 class Checks(unittest.TestCase):
     def test_records_pass_fail_and_exit_code(self):
         root = repo({'coldbox.toml': '[commands]\nlint = "true"\ntest = "exit 3"\n'})
@@ -474,6 +846,20 @@ class Checks(unittest.TestCase):
                        checks=result['checks'], checks_verdict=result['verdict'])
         cb.settle(receipt)
         self.assertEqual((receipt['verdict'], receipt['cause']), ('fail', 'setup'))
+
+    def test_failed_lint_stops_before_the_suite(self):
+        root = repo({'coldbox.toml': '[commands]\nlint = "exit 2"\ntest = "touch ran"\nverify = "touch ran"\n'})
+        out = root / 'checks.json'
+        code, _ = quiet(cb.run_checks, root, out)
+        result = json.loads(out.read_text())
+        self.assertEqual((code, result['verdict']), (1, 'fail'))
+        self.assertFalse((root / 'ran').exists())
+        self.assertEqual([(r['check'], r['status'], r['exit']) for r in result['checks']],
+                         [('lint', 'fail', 2), ('test', 'not_run', None), ('verify', 'not_run', None)])
+        receipt = dict(mode='local', vm={'destroyed': True, 'ready_seconds': 1}, exit=1,
+                       checks=result['checks'], checks_verdict=result['verdict'])
+        cb.settle(receipt)
+        self.assertEqual((receipt['verdict'], receipt['cause']), ('fail', 'lint'))
 
     def test_nothing_to_run_is_a_failure(self):
         root = repo({'README.md': ''})
@@ -820,7 +1206,7 @@ class InstallStorage(unittest.TestCase):
         log = tmp / 'modprobe.log'
         return result, log.read_text() if log.exists() else ''
 
-    packages = 'incus incus-agent qemu-system-x86 ovmf dnsmasq-base python3 git'
+    packages = 'incus incus-agent qemu-system-x86 ovmf dnsmasq-base python3 python3-yaml git'
 
     def test_a_missing_zfs_module_falls_back_to_dir_and_says_so(self):
         result, probes = self.check(has_zfs=False)
@@ -879,6 +1265,22 @@ class InstallDiskFloor(unittest.TestCase):
         result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script], capture_output=True, text=True, env=env)
         self.assertEqual((tmp / 'df.args').read_text(), '--output=avail -B1 /var/lib\n')
         return result
+
+    def test_a_new_or_claimed_project_and_pool_get_an_expiry(self):
+        text = (ROOT / 'install.sh').read_text()
+        start = text.index('claim project "$prefix" || ic project create')
+        end = text.index('\n', text.index('ic storage set "$prefix" "$forever"')) + 1
+        tmp = Path(tempfile.mkdtemp())
+        for claimed in (0, 1):
+            with self.subTest(claimed=claimed):
+                log = tmp / f'ic-{claimed}'
+                script = (f'claim() {{ return {claimed}; }}\nic() {{ echo "$*" >> {log}; }}\n'
+                          'prefix=cbx mark=user.coldbox.managed=true forever=user.coldbox.expires=never\n'
+                          + text[start:end])
+                subprocess.run(['bash', '-euo', 'pipefail', '-c', script], check=True)
+                calls = log.read_text().splitlines()
+                self.assertEqual(calls[-2:], ['project set cbx user.coldbox.expires=never',
+                                              'storage set cbx user.coldbox.expires=never'])
 
     def test_a_25_gib_pool_installs_with_30_gib_free(self):
         result = self.check(30 * GIB, pool_size='25GiB', disk='20GiB')
@@ -1249,8 +1651,9 @@ class ExampleReceipts(unittest.TestCase):
 
 class IntegrationContract(unittest.TestCase):
     DOC = (ROOT / 'docs' / 'integration.md').read_text()
-    VALUES = {'TTL': '600', 'NAME': 'cbx-1-a', 'CMD': 'true', 'OWNER/REPO': 'o/r', 'SHA': 'a' * 40, 'DIR': '/r', 'PATH': '.'}
-    HANDLERS = ('run_repo', 'run_local', 'run_adhoc', 'vm_cmd', 'run_checks')
+    VALUES = {'TTL': '600', 'NAME': 'cbx-1-a', 'CMD': 'true', 'OWNER/REPO': 'o/r', 'SHA': 'a' * 40, 'DIR': '/r', 'PATH': '.',
+              'ID': 'cbx-1-abcdef-vm-01'}
+    HANDLERS = ('run_repo', 'run_local', 'run_adhoc', 'vm_cmd', 'run_checks', 'api_cmd')
 
     def section(self, heading):
         return self.DOC.split(f'\n## {heading}\n')[1].split('\n## ')[0]
@@ -1266,11 +1669,13 @@ class IntegrationContract(unittest.TestCase):
             return 'run_checks'
         if argv[0] == 'vm':
             return 'vm_cmd'
+        if argv[0] == 'api':
+            return 'api_cmd'
         return 'run_repo' if '--repo' in argv else 'run_adhoc' if '--' in argv else 'run_local'
 
     def test_every_consumer_call_parses_and_reaches_its_handler(self):
         calls = self.consumer_calls()
-        self.assertGreaterEqual(len(calls), 10)
+        self.assertGreaterEqual(len(calls), 13)
         for call in calls:
             with self.subTest(' '.join(call)):
                 self.assertEqual(call[0], 'coldbox')
@@ -1299,11 +1704,20 @@ class IntegrationContract(unittest.TestCase):
 
     def test_malformed_arguments_exit_2(self):
         for argv in (['run', '--repo', 'o/r', '--sha', 'ABC'], ['run', '--repo', 'not-a-repo', '--sha', 'a' * 40],
-                     ['vm', 'exec'], ['vm', 'up', '--ttl', 'soon']):
+                     ['vm', 'exec'], ['vm', 'up', '--ttl', 'soon'], ['api', 'status', 'cbx-nope']):
             with self.subTest(argv), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as raised:
                     cb.main(argv)
                 self.assertEqual(raised.exception.code, 2)
+
+    def test_api_receipt_exits_75_until_the_submission_is_done(self):
+        row = next(row for row in self.section('Exit codes').splitlines() if row.startswith('| 75 |'))
+        for state in ('queued', 'running'):
+            with self.subTest(state), contextlib.redirect_stderr(io.StringIO()):
+                with mock.patch.object(cb, 'submission', return_value=(None, {'state': state})):
+                    self.assertEqual(cb.main(['api', 'receipt', self.VALUES['ID']]), 75)
+                self.assertIn(f'`{state}`', row)
+        self.assertIn('`api receipt`', row)
 
     def test_the_receipt_schema_is_the_one_receipts_carry(self):
         self.assertIn('`coldbox.receipt/v1`', self.section('Receipt'))
@@ -1311,18 +1725,16 @@ class IntegrationContract(unittest.TestCase):
 
 
 class ExampleWorkflow(unittest.TestCase):
-    FORK = "github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository"
+    SAME_REPO = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
 
     def setUp(self):
         self.text = (ROOT / 'examples' / 'coldbox.yml').read_text()
 
-    def test_fork_pull_requests_go_to_a_hosted_runner_and_fail_before_checkout(self):
-        route = f"runs-on: ${{{{ {self.FORK} && 'ubuntu-latest' || fromJSON('[\"self-hosted\", \"coldbox\"]') }}}}"
-        refuse = f'if: {self.FORK}\n        run: |\n          echo "Fork pull requests are not verified on Coldbox." >&2\n' \
-                 '          exit 1\n'
-        self.assertIn(route, self.text)
+    def test_every_job_runs_on_coldbox_and_fork_pull_requests_never_start_one(self):
+        self.assertIn(f'  verify:\n    if: {self.SAME_REPO}\n    runs-on: [self-hosted, coldbox]\n', self.text)
+        self.assertEqual(self.text.count('runs-on:'), 1)
         self.assertEqual(self.text.count('self-hosted'), 1)
-        self.assertLess(self.text.index(refuse), self.text.index('uses: actions/checkout'))
+        self.assertNotIn('ubuntu', self.text)
         self.assertNotIn('pull_request_target', self.text)
 
     def test_job_is_bounded_and_checkout_keeps_no_token(self):
@@ -1337,8 +1749,99 @@ class ExampleWorkflow(unittest.TestCase):
         self.assertEqual(self.text.count('concurrency'), 1)
         self.assertLess(self.text.index(block), self.text.index('jobs:'))
 
+    def test_generated_workflow_requires_a_test_that_ran(self):
+        import yaml
+
+        cases = (
+            ('lint only', '', 1, 0, 'fail'),
+            ('all skipped', '<testcase name="skipped"><skipped/></testcase>', 1, 0, 'fail'),
+            ('one passed', '<testcase name="passed"/>', 0, 1, 'pass'),
+        )
+        for label, testcase, exit_code, count, verdict in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                job = Path(directory)
+                marker = job / 'started'
+                marker.touch()
+                files = {'coldbox.toml': '[commands]\nlint = "true"\n'}
+                if testcase:
+                    files['coldbox.toml'] += 'test = "python3 report.py"\n'
+                    report = f'<testsuite>{testcase}</testsuite>'
+                    files['report.py'] = ('import os\nfrom pathlib import Path\n'
+                                          f'Path(os.environ["COLDBOX_JUNIT"]).write_text({report!r})\n')
+                root = git_repo(files)
+                code, output = quiet(cb.detect_workflow, root)
+                self.assertEqual(code, 0, output)
+                steps = yaml.safe_load(output)['jobs']['verify']['steps']
+                env = dict(os.environ, GITHUB_ACTIONS='true', COLDBOX_JOB_DIR=str(job), PATH=f'{ROOT}:{os.environ["PATH"]}')
+                log = []
+                for command in (step['run'] for step in steps if 'run' in step):
+                    result = subprocess.run(['bash', '-eo', 'pipefail', '-c', command], cwd=root, env=env,
+                                            capture_output=True, text=True)
+                    log.extend([result.stdout, result.stderr])
+                    if result.returncode:
+                        break
+                checks = json.loads((job / 'checks.json').read_text())
+                tests = cb.junit_summary([job / 'junit', root], newer=marker)
+                ran, _ = cb.tests_ran(tests, cb.cold_verify_counts([root], newer=marker))
+                receipt = dict(mode='runner', vm=dict(destroyed=True, ready_seconds=1), github=dict(repo='o/r'),
+                               job_result='Failed' if result.returncode else 'Succeeded',
+                               checks_verdict=checks['verdict'], checks=checks['checks'], tests_ran=ran)
+                cb.settle(receipt)
+                self.assertEqual(checks['verdict'], 'pass')
+                self.assertEqual((result.returncode, receipt['tests_ran'], receipt['verdict']),
+                                 (exit_code, count, verdict), ''.join(log))
+                expected = {'lint only': 'no_usable_tests', 'all skipped': 'all_tests_skipped', 'one passed': 'pass'}
+                self.assertIn(f'[{expected[label]}]', ''.join(log))
+
 
 class Tests(unittest.TestCase):
+    def test_junit_sums_executed_time_before_truncating_case_details(self):
+        root = repo({'report.xml': '<testsuites><testcase name="one" time="0.1234"/>'
+                                   '<testsuite><testcase name="two" time="0.5674"><failure/></testcase>'
+                                   '<testcase name="skipped" time="99"><skipped/></testcase>'
+                                   '</testsuite></testsuites>'})
+        with mock.patch.object(cb, 'MAX_TEST_RESULTS', 1):
+            code, raw = quiet(cb.main, ['junit', str(root)])
+        self.assertEqual(code, 0)
+        report = json.loads(raw)
+        self.assertEqual(report['elapsed_test_seconds'], 0.691)
+        self.assertEqual(len(report['results']), 1)
+
+    def test_junit_counts_a_top_level_node_test(self):
+        root = repo({'report.xml': '<testsuites><testcase name="top-level" time="0.001"/>'
+                                   '<testsuite name="nested"><testcase name="child"><skipped/>'
+                                   '</testcase></testsuite></testsuites>'})
+        with tempfile.TemporaryDirectory() as directory:
+            job = Path(directory)
+            (job / 'started').touch()
+            os.utime(job / 'started', (0, 0))
+            code, output = quiet(cb.require_tests, root, job)
+            self.assertEqual((code, output.strip()), (0, 'coldbox verification: PASS (1 test(s) ran) [pass]'))
+        summary = cb.junit_summary([root])
+        self.assertEqual([(case['suite'], case['name']) for case in summary['results']],
+                         [('', 'top-level'), ('nested', 'child')])
+
+    def test_checks_install_requirements_and_count_detected_pytest(self):
+        wheel = 'coldbox_fixture_dep-1.0-py3-none-any.whl'
+        root = repo({'requirements.txt': f'./{wheel}\n',
+                     'test_dependency.py': 'from coldbox_fixture_dep import VALUE\n\n'
+                                           'def test_dependency():\n    assert VALUE == 42\n'})
+        with zipfile.ZipFile(root / wheel, 'w') as package:
+            package.writestr('coldbox_fixture_dep.py', 'VALUE = 42\n')
+            info = 'coldbox_fixture_dep-1.0.dist-info/'
+            package.writestr(info + 'METADATA', 'Metadata-Version: 2.1\nName: coldbox-fixture-dep\nVersion: 1.0\n')
+            package.writestr(info + 'WHEEL', 'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
+            package.writestr(info + 'RECORD', '')
+        for config in ('', '[commands]\ntest = "python3 -m pytest -q test_dependency.py"\n'):
+            with self.subTest(config=config), tempfile.TemporaryDirectory() as tmp:
+                (root / 'coldbox.toml').write_text(config)
+                job = Path(tmp)
+                with mock.patch.dict(os.environ, TMPDIR=tmp, PIP_NO_INDEX='1', PIP_REQUIRE_VIRTUALENV='1'):
+                    code = cb.run_checks(root, job / 'checks.json')
+                self.assertEqual(code, 0)
+                summary = cb.junit_summary([job / 'junit'])
+                self.assertEqual((summary['total'], summary['passed']), (1, 1))
+
     def test_checks_ask_pytest_for_junit_and_results_are_parsed(self):
         fake = ("import os, re, pathlib\n"
                 "path = pathlib.Path(re.search(r'--junitxml=(\\S+)', os.environ['PYTEST_ADDOPTS'])[1])\n"
@@ -1462,7 +1965,7 @@ class ForkGuard(unittest.TestCase):
 
     def test_fork_pr_is_refused(self):
         code, job = self.run_hook('stranger/app')
-        self.assertEqual((code, job['refused']), (1, 'fork pull request'))
+        self.assertEqual((code, job['refused']), (1, cb.FORK_REFUSED))
 
     def test_refusal_kills_the_runner_worker_so_always_steps_cannot_run(self):
         tmp = Path(tempfile.mkdtemp())
@@ -1483,13 +1986,15 @@ class ForkGuard(unittest.TestCase):
     def test_deleted_fork_is_refused(self):
         self.assertEqual(self.run_hook(None)[0], 1)
 
-    def test_fork_allowed_only_with_opt_in(self):
-        self.assertEqual(self.run_hook('stranger/app', allow=True)[0], 0)
+    def test_a_fork_never_runs_even_with_the_old_fork_opt_in(self):
+        code, job = self.run_hook('stranger/app', allow=True)
+        self.assertEqual((code, job['refused']), (1, cb.FORK_REFUSED))
 
-    def event(self, name, payload, allow=False):
+    def event(self, name, payload, allow=False, ref=''):
         tmp = Path(tempfile.mkdtemp())
         (tmp / 'event.json').write_text(json.dumps(payload))
-        env = {'GITHUB_EVENT_PATH': str(tmp / 'event.json'), 'GITHUB_EVENT_NAME': name, 'COLDBOX_JOB_DIR': str(tmp)}
+        env = {'GITHUB_EVENT_PATH': str(tmp / 'event.json'), 'GITHUB_EVENT_NAME': name, 'COLDBOX_JOB_DIR': str(tmp),
+               'GITHUB_REF': ref}
         if allow:
             env['COLDBOX_ALLOW_FORKS'] = '1'
         code, _ = quiet(cb.job_started, env)
@@ -1498,13 +2003,26 @@ class ForkGuard(unittest.TestCase):
     def test_push_event_runs(self):
         self.assertEqual(self.event('push', {'ref': 'refs/heads/main'})[0], 0)
 
-    def test_merge_queue_is_refused_without_opt_in(self):
+    def test_dynamic_job_on_a_private_repo_runs_only_when_its_code_is_shown_same_repo(self):
+        def pr(head):
+            return {'pull_request': {'head': {'repo': head and {'full_name': head}},
+                                     'base': {'repo': {'full_name': 'me/app'}}}}
+        code, job = self.event('dynamic', {})
+        self.assertEqual((code, job['fork_pr'], job['refused']), (0, False, None))
+        self.assertEqual(self.event('dynamic', pr('me/app'))[0], 0)
+        for head in ('stranger/app', None):
+            code, job = self.event('dynamic', pr(head))
+            self.assertEqual((code, job['fork_pr'], job['refused']), (1, True, cb.FORK_REFUSED), head)
+        code, job = self.event('dynamic', {}, ref='refs/pull/7/merge')
+        self.assertEqual((code, job['fork_pr']), (1, None))
+
+    def test_merge_queue_is_refused_on_a_private_repo(self):
         payload = {'merge_group': {'head_ref': 'refs/heads/gh-readonly-queue/main/pr-1'}}
         code, job = self.event('merge_group', payload)
         self.assertEqual(code, 1)
         self.assertIsNone(job['fork_pr'])
         self.assertIn('merge_group', job['refused'])
-        self.assertEqual(self.event('merge_group', payload, allow=True)[0], 0)
+        self.assertEqual(self.event('merge_group', payload, allow=True)[0], 1)
 
     def test_workflow_run_checks_the_head_repository(self):
         def payload(head):
@@ -1534,12 +2052,28 @@ class PublicJobGuard(unittest.TestCase):
         self.assertEqual(self.hook('pull_request', 'Pal')[:2], (0, None))
         self.assertEqual(self.hook('merge_group', 'me', payload={'merge_group': {}})[:2], (0, None))
 
-    def test_approved_outside_fork_pull_request_runs(self):
-        self.assertEqual(self.hook('pull_request', 'stranger', head='stranger/app')[:2], (0, None))
+    def test_an_approved_outside_fork_pull_request_is_refused(self):
+        code, refused, out = self.hook('pull_request', 'stranger', head='stranger/app')
+        self.assertEqual((code, refused), (1, cb.FORK_REFUSED))
+        self.assertIn(f'coldbox: refusing this job ({cb.FORK_REFUSED})', out)
+
+    def test_a_fork_pull_request_is_refused_even_from_a_writer_or_re_run_by_one(self):
+        workflow_run = {'repository': {'full_name': 'me/app'},
+                        'workflow_run': {'head_repository': {'full_name': 'me/app-fork'}}}
+        for event, actor, rerun_by, payload in (('pull_request', 'me', None, None),
+                                                ('pull_request_target', 'pal', None, None),
+                                                ('pull_request', 'stranger', 'me', None),
+                                                ('workflow_run', 'me', None, workflow_run)):
+            code, refused, _ = self.hook(event, actor, head='me/app-fork', rerun_by=rerun_by, payload=payload)
+            self.assertEqual((code, refused), (1, cb.FORK_REFUSED), (event, actor, rerun_by))
+
+    def test_outside_fork_jobs_github_does_not_hold_for_approval_are_refused_as_forks(self):
+        for event in ('pull_request_target', 'workflow_run'):
+            code, refused, _ = self.hook(event, 'stranger', head='stranger/app')
+            self.assertEqual((code, refused), (1, cb.FORK_REFUSED), event)
 
     def test_outside_jobs_github_does_not_hold_for_approval_are_refused(self):
-        for event, head in (('pull_request_target', 'stranger/app'), ('issue_comment', 'me/app'),
-                            ('workflow_run', 'stranger/app'), ('pull_request', 'me/app')):
+        for event, head in (('issue_comment', 'me/app'), ('pull_request', 'me/app'), ('dynamic', 'me/app')):
             code, refused, out = self.hook(event, 'stranger', head=head)
             self.assertEqual(code, 1, event)
             self.assertEqual(refused, f'{event} event triggered by stranger, who has no write access')
@@ -1675,6 +2209,21 @@ class Guard(unittest.TestCase):
 class Verdict(unittest.TestCase):
     def receipt(self, **kw):
         return dict(mode='runner', vm={'destroyed': True}, **kw)
+
+    def test_the_executed_test_gate_alone_leaves_verification_incomplete(self):
+        receipt = self.receipt(job_result='Failed', tests_ran=0, checks_verdict='pass',
+                               github=dict(steps=[dict(name='Run coldbox require-tests', conclusion='failure')]))
+        receipt['vm']['ready_seconds'] = 1
+        for changes, expected in (
+            ({}, ('incomplete', 'no_tests', 'no_usable_tests')),
+            (dict(checks_verdict='fail', checks=[dict(check='lint', status='fail')]),
+             ('fail', 'lint', 'check_failed')),
+            (dict(tests_source='junit', tests=dict(failed=1)), ('fail', 'job', 'test_failed')),
+        ):
+            with self.subTest(changes=changes):
+                settled = dict(receipt, **changes)
+                cb.settle(settled)
+                self.assertEqual((settled['verdict'], settled['cause'], settled['reason_code']), expected)
 
     def test_cases(self):
         self.assertEqual(cb.verdict(dict(mode='local', vm={'destroyed': True}, checks_verdict='pass', exit=0,
@@ -1904,6 +2453,215 @@ class RunLocal(unittest.TestCase):
             self.run_local(root)
 
 
+    def test_a_commit_made_while_waiting_for_room_is_not_what_runs(self):
+        root = git_repo({'app.py': 'old\n'})
+        sha = cb.git(root, 'rev-parse', 'HEAD').decode().strip()
+
+        def commit_while_waiting(*args):
+            (root / 'app.py').write_text('new\n')
+            subprocess.run(['git', '-C', str(root), '-c', 'user.name=t', '-c', 'user.email=t@example.com',
+                            'commit', '-qam', 'later'], check=True)
+
+        ran = {}
+        with mock.patch.multiple(cb, admit_or_wait=commit_while_waiting,
+                                 job=lambda *a, **kw: ran.update(kw) or dict(verdict='pass')):
+            cb.run_local(argparse.Namespace(path=str(root), ttl=60, offline=False, receipts=None, memory=None, cpus=None))
+        with tarfile.open(fileobj=io.BytesIO(ran['archive'])) as archive:
+            self.assertEqual((ran['sha'], archive.extractfile('app.py').read()), (sha, b'old\n'))
+
+
+class TrustedSuite(unittest.TestCase):
+    def run_paired_suite(self, root, *, destroy_base=True):
+        checkout = git_repo({'app.py': 'value = 1\n'})
+        self.addCleanup(shutil.rmtree, checkout)
+        base = cb.git(checkout, 'rev-parse', 'HEAD').decode().strip()
+        (checkout / 'app.py').write_text('value = 2\n')
+        proof = 'from app import value\nassert value == 2\n'
+        (checkout / 'test_app.py').write_text(proof)
+        cb.git(checkout, 'add', 'test_app.py')
+        subprocess.run(['git', '-C', str(checkout), '-c', 'user.name=t', '-c', 'user.email=t@example.com',
+                        'commit', '-qam', 'fix'], check=True)
+        head = cb.git(checkout, 'rev-parse', 'HEAD').decode().strip()
+        manifest = root / 'suite.json'
+        manifest.write_text(json.dumps(dict(
+            base=base,
+            proof=[dict(name='test_app.py::test_value', argv=['python3', '-c', proof])],
+            suite=[dict(name='smoke', argv=['true'])],
+        )))
+        receipts = root / 'receipts'
+        lifecycle = []
+
+        def boot(name, *args):
+            (root / name).mkdir()
+            lifecycle.append(('boot', name))
+
+        def execute(name, *command, **kwargs):
+            if command[0] == 'bash':
+                return ['tar', '-x', '-C', str(root / name)]
+            if command[0] == 'python3':
+                return ['env', '-C', str(root / name), sys.executable, *command[1:]]
+            return ['true']
+
+        def destroy(name):
+            lifecycle.append(('destroy', name))
+            if len(lifecycle) == 2 and not destroy_base:
+                return False
+            shutil.rmtree(root / name)
+            return True
+
+        with mock.patch.multiple(cb, STATE=root, admit_or_wait=mock.DEFAULT, sizing=lambda *a: (0, ()),
+                                 boot=boot, ic=mock.DEFAULT, ic_exec=execute, vm_resources=lambda *a: {},
+                                 destroy=destroy, pull=mock.DEFAULT, incus_group_exec=mock.DEFAULT):
+            code, output = quiet(cb.main, ['run', '--offline', '--receipts', str(receipts),
+                                           '--trusted-suite', str(manifest), str(checkout)])
+            cb.pull.assert_not_called()
+        return base, head, code, output, receipts, lifecycle
+
+    def test_named_suite_records_both_revisions_after_a_base_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base, head, code, output, receipts, lifecycle = self.run_paired_suite(Path(folder))
+            self.assertEqual(code, 0, output)
+            (_, base_vm), (_, head_vm) = lifecycle[0], lifecycle[2]
+            self.assertNotEqual(base_vm, head_vm)
+            self.assertEqual(lifecycle, [
+                ('boot', base_vm), ('destroy', base_vm), ('boot', head_vm), ('destroy', head_vm),
+            ])
+            self.assertEqual(output.splitlines()[-1], f'coldbox: PASS receipt {receipts / (head_vm + ".json")}')
+            base_receipt = json.loads((receipts / f'{base_vm}.json').read_text())
+            head_receipt = json.loads((receipts / f'{head_vm}.json').read_text())
+            self.assertEqual((base_receipt['sha'], base_receipt['verdict'], base_receipt['vm']['destroyed']),
+                             (base, 'fail', True))
+            self.assertEqual((head_receipt['sha'], head_receipt['verdict'], head_receipt['vm']['destroyed']),
+                             (head, 'pass', True))
+            observation = head_receipt['suite_observation']
+            self.assertEqual((observation['base_receipt'], observation['tests_ran']), (base_vm, 2))
+            self.assertEqual(observation['tests'], [
+                dict(name='test_app.py::test_value', group='proof', base_exit=1, head_exit=0),
+                dict(name='smoke', group='suite', base_exit=0, head_exit=0),
+            ])
+            self.assertEqual(base_receipt['suite_observation']['tests'], [
+                dict(name='test_app.py::test_value', group='proof', base_exit=1),
+                dict(name='smoke', group='suite', base_exit=0),
+            ])
+
+    def test_named_suite_does_not_boot_head_when_base_teardown_fails(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _, _, code, output, receipts, lifecycle = self.run_paired_suite(Path(folder), destroy_base=False)
+            self.assertEqual(code, 125, output)
+            [(action, base_vm), destroyed] = lifecycle
+            self.assertEqual((action, destroyed), ('boot', ('destroy', base_vm)))
+            self.assertEqual([path.stem for path in receipts.glob('*.json')], [base_vm])
+            receipt = json.loads((receipts / f'{base_vm}.json').read_text())
+            self.assertEqual((receipt['verdict'], receipt['vm']['destroyed']), ('incomplete', False))
+
+    def test_invalid_pair_is_refused_before_admission(self):
+        checkout = git_repo({'app.py': ''})
+        self.addCleanup(shutil.rmtree, checkout)
+        head = cb.git(checkout, 'rev-parse', 'HEAD').decode().strip()
+        proof = dict(name='proof', argv=['true'])
+        suite = dict(name='suite', argv=['true'])
+        manifest = dict(base='b' * 40, proof=[proof], suite=[suite])
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.multiple(cb, admit_or_wait=mock.DEFAULT, incus_group_exec=mock.DEFAULT):
+            path = Path(folder) / 'suite.json'
+            command = ['run', '--offline', '--trusted-suite', str(path), str(checkout)]
+            for changes, options, error in (
+                ({}, [], 'is missing from the checkout'),
+                (dict(base=head), [], 'must name a commit distinct from HEAD'),
+                (dict(base='main'), [], 'base must be a full commit SHA'),
+                (dict(proof=[]), [], 'proof must be a nonempty array of cases'),
+                (dict(suite=[]), [], 'suite must be a nonempty array of cases'),
+                (dict(suite=[proof]), [], 'each named case needs a unique nonempty name'),
+                (dict(suite=[dict(suite, stdout=None)]), [], 'needs expected stdout as a string'),
+                ({}, ['--verify-job', '7'], '--verify-job requires a single-revision suite'),
+            ):
+                with self.subTest(error=error):
+                    path.write_text(json.dumps(dict(manifest, **changes)))
+                    code, output = quiet(cb.main, command + options)
+                    self.assertEqual(code, 2, output)
+                    self.assertIn(error, output)
+            cb.admit_or_wait.assert_not_called()
+
+    def run_suite(self, directory, source, suite):
+        checkout = git_repo({'app.py': source})
+        (checkout / 'app.py').write_text('raise RuntimeError("uncommitted checkout was used")\n')
+        guest = directory / 'guest'
+        guest.mkdir()
+        manifest = directory / 'suite.json'
+        manifest.write_text(json.dumps(suite))
+        receipts = directory / 'receipts'
+
+        def execute(name, *command, **kwargs):
+            if command[0] == 'bash':
+                return ['tar', '-x', '-C', str(guest)]
+            if command[0] == 'python3':
+                return [sys.executable, str(guest / command[1]), *command[2:]]
+            return ['true']
+
+        def invoke():
+            try:
+                return cb.main(['run', '--offline', '--receipts', str(receipts),
+                                '--trusted-suite', str(manifest), str(checkout)])
+            except SystemExit as error:
+                return error.code
+
+        with mock.patch.multiple(cb, STATE=directory, admit_or_wait=mock.DEFAULT, sizing=lambda *a: (0, ()),
+                                 boot=lambda *a: None, ic=lambda *a: None, ic_exec=execute,
+                                 vm_resources=lambda *a: {}, copy_artifacts=lambda *a: ([], True),
+                                 destroy=lambda *a: True, pull=mock.DEFAULT), \
+                mock.patch.object(cb, 'incus_group_exec'):
+            code, output = quiet(invoke)
+            cb.pull.assert_not_called()
+        paths = list(receipts.glob('*.json'))
+        return checkout, code, json.loads(paths[0].read_text()) if paths else None, output
+
+    def test_host_counts_the_checked_cases_and_binds_the_revision(self):
+        with tempfile.TemporaryDirectory() as folder:
+            checkout, code, receipt, _ = self.run_suite(Path(folder), 'import sys\nprint(int(sys.argv[1]) * 2)\n', [
+                dict(argv=['python3', 'app.py', '21'], stdout='42\n'),
+                dict(argv=['python3', 'app.py', '17'], stdout='34\n'),
+            ])
+            self.assertEqual(code, 0)
+            self.assertEqual((receipt['verdict'], receipt['tests_ran'], receipt['tests_source']),
+                             ('pass', 2, 'host-suite'))
+            self.assertEqual(receipt['suite_observation'], dict(
+                schema='coldbox.suite-observation/v1', result='PASS', tests_ran=2,
+                commit=cb.git(checkout, 'rev-parse', 'HEAD').decode().strip(),
+                tree=cb.git(checkout, 'rev-parse', 'HEAD^{tree}').decode().strip(),
+                suite_sha256=hashlib.sha256((Path(folder) / 'suite.json').read_bytes()).hexdigest()))
+
+    def test_forged_guest_pass_is_ignored_even_with_a_zero_command_exit(self):
+        source = '''from pathlib import Path
+report = Path(__file__).parent / '.cold' / 'verify-receipt.json'
+report.parent.mkdir()
+report.write_text('{"result":"PASS","run":{"tests_ran":999}}')
+print('fake PASS')
+'''
+        with tempfile.TemporaryDirectory() as folder:
+            _, code, receipt, _ = self.run_suite(Path(folder), source, [
+                dict(argv=['python3', 'app.py'], stdout='42\n'),
+            ])
+            self.assertEqual(code, 1)
+            self.assertTrue((Path(folder) / 'guest' / '.cold' / 'verify-receipt.json').exists())
+            self.assertEqual((receipt['verdict'], receipt['tests_ran'], receipt['suite_observation']['result']),
+                             ('fail', 1, 'FAIL'))
+
+    def test_excess_output_fails_even_if_the_closed_pipe_interrupts_the_command(self):
+        source = "import os, signal\nsignal.signal(signal.SIGPIPE, signal.SIG_DFL)\nos.write(1, b'x' * 1_000_000)\n"
+        with tempfile.TemporaryDirectory() as folder:
+            _, code, receipt, _ = self.run_suite(Path(folder), source, [
+                dict(argv=['python3', 'app.py'], stdout='42\n'),
+            ])
+            self.assertEqual(code, 1)
+            self.assertEqual((receipt['verdict'], receipt['tests_ran']), ('fail', 1))
+
+    def test_empty_suite_does_not_start_a_job(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _, code, receipt, output = self.run_suite(Path(folder), '', [])
+            self.assertEqual((code, receipt), (2, None))
+            self.assertIn('expected a nonempty array of cases', output)
+
+
 def live_worker(test, state, name):
     process = subprocess.Popen(['sleep', '600'])
     test.addCleanup(process.wait)
@@ -1927,8 +2685,12 @@ class Reap(unittest.TestCase):
         self.assertEqual(calls, [('list', '--format', 'json', '--columns', 'n')])
 
     def reap(self, ip_script, project='coldbox', extra=(), delete_fails=None, expected_deletes=(), orphans=(),
-             receipt_files=None, build_running=False, unreadable=None, rollback=None, **env):
+             receipt_files=None, build_running=False, unreadable=None, rollback=None, host_config=None, artifacts=None,
+             **env):
         tmp = Path(tempfile.mkdtemp())
+        host_config = {'user.coldbox.managed': 'true', 'user.coldbox.expires': 'never'} if host_config is None \
+            else host_config
+        (tmp / 'object.json').write_text(json.dumps({'config': host_config}))
         now = int(time.time())
         receipts = tmp / 'state' / 'receipts'
         receipts.mkdir(parents=True)
@@ -1941,6 +2703,9 @@ class Reap(unittest.TestCase):
             os.utime(receipts / name, (now - 31 * 86400, now - 31 * 86400))
         for name, receipt in (receipt_files or {}).items():
             cb.write_json(receipts / f'{name}.json', receipt)
+        for name, expires in (artifacts or {}).items():
+            (receipts / f'{name}.artifacts').mkdir()
+            cb.mark_folder(receipts / f'{name}.artifacts', expires)
         if rollback:
             cb.write_json(tmp / 'state' / 'base-rollback.json', rollback)
         rows = [{'name': 'cbx-1-a', 'config': {'user.coldbox.expires': str(now - 5)}},
@@ -1961,6 +2726,7 @@ class Reap(unittest.TestCase):
         fake.write_text('#!/bin/sh\n'
                         f'echo "$@" >> {tmp}/calls\n'
                         'case "$*" in\n'
+                        f'  *query*) cat {tmp}/object.json ;;\n'
                         f'  *list*) python3 -c "import json, pathlib, sys; gone = pathlib.Path(sys.argv[2]); '
                         f'gone = gone.read_text().split() if gone.exists() else []; '
                         f'print(json.dumps([r for r in json.load(open(sys.argv[1])) if r[\'name\'] not in gone]))" '
@@ -1986,9 +2752,179 @@ class Reap(unittest.TestCase):
         self.assertEqual(deletes, [f'--force-local --project {project} delete {name} --force'
                                    for name in ('cbx-1-a', *expected_deletes)])
         self.assertEqual(sorted(p.name for p in receipts.iterdir()),
-                         sorted(['cbx-new.json', 'cbx-new.artifacts', *(f'{name}.json' for name in receipt_files or {})]))
+                         sorted(['cbx-new.json', 'cbx-new.artifacts', *(f'{name}.json' for name in receipt_files or {}),
+                                 *(f'{name}.artifacts' for name, expires in (artifacts or {}).items()
+                                   if expires == 'never' or int(expires) > now)]))
         self.assertEqual((receipts / 'cbx-new.artifacts' / 'out' / 'report.txt').read_text(), 'saved')
         return result, calls, receipts
+
+    def test_reap_gives_coldbox_incus_objects_an_expiry_and_leaves_unmanaged_ones_alone(self):
+        mark = ' user.coldbox.managed=true user.coldbox.expires=never'
+        profile = '--force-local profile set coldbox --project coldbox' + mark
+        marks = lambda calls: [line for line in calls if ' set ' in line and ' config set ' not in line]
+        result, calls, _ = self.reap('#!/bin/sh\necho "[]"\n', host_config={'user.coldbox.managed': 'true'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(marks(calls),
+                         [f'--force-local {target}{mark}' for target in ('project set coldbox', 'network set coldboxbr0',
+                                                                          'storage set coldbox',
+                                                                          'network acl set coldbox-isolated')]
+                         + [profile])
+        self.assertFalse([line for line in calls if '-X' in line], calls)
+        result, calls, _ = self.reap('#!/bin/sh\necho "[]"\n', host_config={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(marks(calls), [profile])
+        result, calls, _ = self.reap('#!/bin/sh\necho "[]"\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marks(calls), calls)
+
+    def test_artifact_folders_get_lifecycle_xattrs_and_expired_ones_are_deleted(self):
+        now = int(time.time())
+        result, _, receipts = self.reap('#!/bin/sh\necho "[]"\n',
+                                        receipt_files={'cbx-due': {}, 'cbx-later': {}, 'cbx-kept': {}},
+                                        artifacts={'cbx-due': str(now - 5), 'cbx-later': str(now + 600),
+                                                   'cbx-kept': 'never'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(cb.folder_expiry(receipts / 'cbx-later.artifacts'), str(now + 600))
+        self.assertAlmostEqual(int(cb.folder_expiry(receipts / 'cbx-new.artifacts')), now + 30 * 86400, delta=60)
+
+    def test_keep_days_sets_how_long_a_marked_artifact_folder_stays(self):
+        now = int(time.time())
+        for keep, kept in ((0, True), (60, True), (30, False)):
+            with self.subTest(keep=keep):
+                tmp = Path(tempfile.mkdtemp())
+                receipts = tmp / 'state' / 'receipts'
+                (receipts / 'cbx-a.artifacts').mkdir(parents=True)
+                (receipts / 'cbx-a.json').write_text('{}')
+                cb.mark_folder(receipts / 'cbx-a.artifacts', now - 86400)
+                (tmp / 'incus').write_text('#!/bin/sh\ncase "$*" in *query*) echo "{}" ;; *acl*) cat > /dev/null ;; '
+                                           '*) echo "[]" ;; esac\n')
+                (tmp / 'incus').chmod(0o755)
+                env = dict(os.environ, PATH=f'{tmp}:{os.environ["PATH"]}', COLDBOX_STATE=str(tmp / 'state'))
+                result = subprocess.run([sys.executable, str(ROOT / 'coldbox'), 'reap', '--keep-days', str(keep)],
+                                        env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((receipts / 'cbx-a.artifacts').exists(), kept)
+
+    def test_reap_expires_terminal_submissions_without_changing_the_queue(self):
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        state = tmp / 'state'
+        submissions = state / 'receipts' / 'submissions'
+        submissions.mkdir(parents=True)
+        now = int(time.time())
+        old = now - 15 * 86400
+        expired = submissions / f'cbx-{old}-abcdef-test.json'
+        referenced = submissions / f'cbx-{old}-abcdea-test.json'
+        recent = submissions / f'cbx-{now}-abcdef-test.json'
+        result = dict(cause='queue_timeout', error='the submission timed out')
+        for path in (expired, referenced, recent):
+            cb.write_json(path, result)
+        for path in (expired, referenced):
+            os.utime(path, (old, old))
+        queue = submissions / 'queue.json'
+        cb.write_json(queue, [dict(id=referenced.stem, repo='me/app', sha=SHA, deadline=old)])
+        queue_bytes = queue.read_bytes()
+        (tmp / 'incus').write_text('#!/bin/sh\ncase "$*" in *query*) echo "{}" ;; *acl*) cat > /dev/null ;; '
+                                   '*) echo "[]" ;; esac\n')
+        (tmp / 'incus').chmod(0o755)
+        env = dict(os.environ, PATH=f'{tmp}:{os.environ["PATH"]}', COLDBOX_STATE=str(state))
+        command = [sys.executable, str(ROOT / 'coldbox'), 'reap', '--keep-days']
+
+        queue.write_text('{"unexpected": "queue format"}')
+        reaped = subprocess.run([*command, '14'], env=env, capture_output=True, text=True)
+        self.assertEqual(reaped.returncode, 0, reaped.stderr)
+        self.assertTrue(expired.exists())
+        self.assertEqual(queue.read_text(), '{"unexpected": "queue format"}')
+        queue.write_bytes(queue_bytes)
+        os.utime(queue, (old, old))
+
+        for keep, remains in (('0', True), ('14', False)):
+            with self.subTest(keep=keep):
+                reaped = subprocess.run([*command, keep], env=env, capture_output=True, text=True)
+                self.assertEqual(reaped.returncode, 0, reaped.stderr)
+                self.assertEqual(expired.exists(), remains)
+                self.assertEqual(json.loads(referenced.read_text()), result)
+                self.assertEqual(json.loads(recent.read_text()), result)
+                self.assertEqual(queue.read_bytes(), queue_bytes)
+                self.assertEqual(queue.stat().st_mtime, old)
+
+    def test_reap_keeps_expired_evidence_until_the_worker_and_vm_are_gone(self):
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        state = tmp / 'state'
+        receipts = state / 'receipts'
+        receipts.mkdir(parents=True)
+        name = 'cbx-1-active'
+        record = unfinished_receipt(name)
+        receipt = receipts / f'{name}.json'
+        log = receipts / f'{name}.log'
+        submit_log = receipts / f'{name}.submit.log'
+        artifacts = receipts / f'{name}.artifacts'
+        artifacts.mkdir()
+        report = artifacts / 'report.txt'
+        for path in (log, submit_log, report):
+            path.write_text('saved')
+        now = int(time.time())
+        old = now - 31 * 86400
+        cb.write_json(receipt, record)
+        for path in (receipt, log, submit_log):
+            os.utime(path, (old, old))
+        cb.mark_folder(artifacts, old)
+        workers = state / 'workers'
+        workers.mkdir()
+        worker = workers / str(os.getpid())
+        worker.write_text(json.dumps(['me/app', cb.process_start(os.getpid()), name, 'base']))
+        rows = tmp / 'vms.json'
+        rows.write_text('[]')
+        (tmp / 'incus').write_text('#!/bin/sh\ncase "$*" in *query*) echo "{}" ;; *acl*) cat > /dev/null ;; '
+                                   f'*list*) cat "{rows}" ;; esac\n')
+        (tmp / 'incus').chmod(0o755)
+        env = dict(os.environ, PATH=f'{tmp}:{os.environ["PATH"]}', COLDBOX_STATE=str(state))
+        reap = [sys.executable, str(ROOT / 'coldbox'), 'reap']
+
+        for owner in ('worker', 'vm', 'none'):
+            with self.subTest(owner=owner):
+                if owner == 'vm':
+                    rows.write_text(json.dumps([{'name': name, 'config': {cb.ADHOC: 'true',
+                                                                         cb.EXPIRES: str(now + 600)}}]))
+                    worker.unlink()
+                elif owner == 'none':
+                    rows.write_text('[]')
+                    record['vm']['destroyed'] = True
+                    record['verdict'] = 'idle'
+                    cb.write_json(receipt, record)
+                    os.utime(receipt, (old, old))
+                result = subprocess.run(reap, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if owner == 'none':
+                    self.assertEqual(list(receipts.iterdir()), [])
+                else:
+                    self.assertTrue(receipt.exists(), f'{owner}-owned receipt was pruned')
+                    self.assertEqual(json.loads(receipt.read_text()), record)
+                    for path in (log, submit_log, report):
+                        self.assertEqual(path.read_text(), 'saved')
+
+    def test_reap_skips_marks_but_still_deletes_by_age_where_user_xattrs_are_unsupported(self):
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        receipts = tmp / 'state' / 'receipts'
+        (receipts / 'cbx-new.artifacts').mkdir(parents=True)
+        (receipts / 'cbx-new.json').write_text('{}')
+        (receipts / 'cbx-gone.artifacts').mkdir()
+        (tmp / 'incus').write_text('#!/bin/sh\ncase "$*" in *query*) echo "{}" ;; *acl*) cat > /dev/null ;; '
+                                   '*) echo "[]" ;; esac\n')
+        (tmp / 'incus').chmod(0o755)
+        env = dict(os.environ, PATH=f'{tmp}:{os.environ["PATH"]}', COLDBOX_STATE=str(tmp / 'state'))
+        unsupported = ('import errno, os, runpy, sys\n'
+                       'def nope(*args): raise OSError(errno.ENOTSUP, "Operation not supported")\n'
+                       'os.getxattr = os.setxattr = nope\n'
+                       'sys.argv = ["coldbox", "reap"]\n'
+                       f'runpy.run_path({str(ROOT / "coldbox")!r}, run_name="__main__")\n')
+        result = subprocess.run([sys.executable, '-c', unsupported], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('FAILED', result.stderr)
+        self.assertIn('coldbox reap: skipped marking 1 artifact folder(s) with user.coldbox.managed and '
+                      'user.coldbox.expires, so they are deleted by age only: [Errno 95] Operation not supported\n',
+                      result.stderr)
+        self.assertTrue((receipts / 'cbx-new.artifacts').exists())
+        self.assertFalse((receipts / 'cbx-gone.artifacts').exists())
 
     def test_a_smoke_vm_left_by_an_interrupted_build_is_deleted_but_not_while_a_build_runs(self):
         smoke = [{'name': 'base-smoke', 'config': {'user.coldbox.expires': '0'}}]
@@ -2032,7 +2968,8 @@ class Reap(unittest.TestCase):
     def test_incus_never_reads_the_callers_stdin(self):
         tmp = Path(tempfile.mkdtemp())
         fake = tmp / 'incus'
-        fake.write_text(f'#!/bin/sh\ncase "$*" in *acl*) cat > /dev/null ;; *) cat >> {tmp}/stdin ;; esac\necho "[]"\n')
+        fake.write_text(f'#!/bin/sh\ncase "$*" in *acl*) cat > /dev/null ;; *) cat >> {tmp}/stdin ;; esac\n'
+                        'case "$*" in *query*) echo "{}" ;; *) echo "[]" ;; esac\n')
         fake.chmod(0o755)
         env = dict(os.environ, PATH=f'{tmp}:{os.environ["PATH"]}', COLDBOX_STATE=str(tmp / 'state'))
         result = subprocess.run([sys.executable, str(ROOT / 'coldbox'), 'reap'], env=env, input='x: y: z\n',
@@ -2167,6 +3104,14 @@ class BuildBase(unittest.TestCase):
         self.assertIn(('move', 'base-new', 'base-dev'), calls)
 
 
+    def test_the_base_has_no_background_apt_and_ships_the_packages_jobs_install(self):
+        script = cb.GUEST_SETUP.replace('\\\n', ' ')
+        install = next(line for line in script.splitlines() if line.startswith('apt-get install')).split()
+        masked = next(line for line in script.splitlines() if line.startswith('systemctl mask')).split()
+        self.assertTrue({'rsync', 'bubblewrap'} <= set(install))
+        self.assertEqual(set(masked[2:]), {'apt-daily.timer', 'apt-daily-upgrade.timer', 'apt-daily.service',
+                                           'apt-daily-upgrade.service', 'unattended-upgrades.service'})
+
     def test_records_guest_packages_before_stopping_the_base(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.multiple(
                 cb, STATE=Path(tmp), fetch_json=lambda url: None,
@@ -2233,7 +3178,9 @@ class BuildBase(unittest.TestCase):
         def build_base(exit_code):
             job = subprocess.CompletedProcess([], exit_code, stdout='', stderr='runuser: user runner does not exist\n')
             with mock.patch.multiple(cb, STATE=state, ic=ic, build_new_base=build, boot=boot,
+                                     query=lambda path: {'created_at': '2026-11-19T12:00:00Z'},
                                      destroy=lambda name: (instances.pop(name, None), True)[1]), \
+                    mock.patch.object(cb, 'run_base_smoke_job', return_value=(1, 0), create=True), \
                     mock.patch.object(cb.os, 'geteuid', return_value=0), \
                     mock.patch.object(cb.subprocess, 'run', return_value=job) as run:
                 result = quiet(cb.build_base, argparse.Namespace(rollback=False))
@@ -2262,6 +3209,63 @@ class BuildBase(unittest.TestCase):
         self.assertAlmostEqual(int(retire[0][4].split('=')[1]), time.time() + cb.ROLLBACK_WINDOW, delta=60)
         self.assertFalse((state / 'base-smoke-failed.json').exists())
         self.assertEqual(Status().healthy_status(state, [])[0], 0)
+
+    def test_base_promotion_requires_a_passing_fixture_and_teardown(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        candidate = '2026-11-19T12:00:00Z'
+        snapshot = f'/1.0/instances/base-new/snapshots/warm?project={cb.PROJECT}'
+        receipt = state / 'base-smoke.json'
+        for stdout, code, destroyed, promoted in [('1\n', 1, True, False), ('0\n', 0, True, False),
+                                                  ('unexpected\n', 0, True, False), ('1\n', 0, False, False),
+                                                  ('1\n', 0, True, True)]:
+            with self.subTest(stdout=stdout, code=code, destroyed=destroyed):
+                receipt.unlink(missing_ok=True)
+
+                def run(command, **kwargs):
+                    if 'python3' in command:
+                        return subprocess.CompletedProcess(command, code, stdout, 'guest output')
+                    return subprocess.CompletedProcess(command, 0, '', '')
+
+                def swap():
+                    self.assertTrue(promoted, 'a failed smoke job reached promotion')
+                    self.assertTrue(receipt.is_file(), 'promotion started without a smoke receipt')
+                    self.assertEqual(json.loads(receipt.read_text())['verdict'], 'pass')
+
+                with mock.patch.multiple(cb, STATE=state, ic=mock.DEFAULT, build_new_base=mock.DEFAULT,
+                                         query=mock.DEFAULT, boot=mock.DEFAULT, retire_live_base=mock.DEFAULT,
+                                         swap_base=mock.DEFAULT, destroy=mock.DEFAULT,
+                                         print_base_changes=mock.DEFAULT) as patched, \
+                        mock.patch.object(cb.os, 'geteuid', return_value=0), \
+                        mock.patch.object(cb.subprocess, 'run', side_effect=run):
+                    patched['build_new_base'].return_value = '2.340.0'
+                    patched['query'].return_value = {'created_at': candidate}
+                    patched['destroy'].side_effect = [True, destroyed, True]
+                    patched['swap_base'].side_effect = swap
+                    if promoted:
+                        status, output = quiet(cb.build_base, argparse.Namespace(rollback=False))
+                        self.assertEqual(status, 0)
+                        self.assertIn('smoke PASS base-new/warm snapshot_created_at=2026-11-19T12:00:00+00:00 '
+                                      'tests=1 destroyed=true\n', output)
+                    else:
+                        with self.assertRaises(SystemExit):
+                            quiet(cb.build_base, argparse.Namespace(rollback=False))
+                        patched['destroy'].assert_called_with('base-new')
+                    patched['query'].assert_called_once_with(snapshot)
+                    self.assertEqual(patched['swap_base'].called, promoted)
+                    self.assertEqual(patched['retire_live_base'].called, promoted)
+                result = json.loads(receipt.read_text())
+                self.assertEqual(result['base'], 'base-new/warm')
+                self.assertEqual(result['snapshot_created_at'], '2026-11-19T12:00:00+00:00')
+                self.assertEqual(result['tests'], int(stdout) if stdout.strip().isdigit() else 0)
+                self.assertEqual(result['destroyed'], destroyed)
+                self.assertEqual(result['verdict'], 'pass' if promoted else 'fail')
+                self.assertNotIn('guest output', receipt.read_text())
+
+    def test_bundled_smoke_job_runs_a_test(self):
+        smoke_job = getattr(cb, 'run_base_smoke_job', None)
+        self.assertIsNotNone(smoke_job, 'the base smoke check has no bundled job')
+        with mock.patch.object(cb, 'ic_exec', side_effect=lambda name, *command, **kwargs: command):
+            self.assertEqual(smoke_job('unused'), (1, 0))
 
     def test_sigterm_during_build_base_exits_through_its_cleanup(self):
         self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
@@ -2315,6 +3319,70 @@ class BuildBase(unittest.TestCase):
             self.assertEqual(archive.extractfile('./etc/coldbox/host').read(), b'build-host\n')
         self.assertEqual({(m.uid, m.gid) for m in members.values()}, {(0, 0)})
         self.assertEqual(members['./opt/tool/run'].mode & 0o777, 0o755)
+
+    def push_with_flaky_tar(self, *failures):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / 'guest/opt/tool').mkdir(parents=True)
+        (tmp / 'guest/opt/tool/run').write_text('new\n')
+        (tmp / 'bin').mkdir()
+        real_tar = shutil.which('tar')
+        script = ['#!/bin/sh', f'n=$(cat {tmp}/packs 2>/dev/null || echo 0); echo $((n + 1)) > {tmp}/packs']
+        for number, (code, message, *action) in enumerate(failures):
+            lines = ' '.join(f"'{line}'" for line in message.split('\n'))
+            fail = f'printf "tar: %s\\n" {lines} >&2; exit {code}' if code else ':'
+            script.append(f'if [ "$n" = {number} ]; then cd {tmp}/guest; {" ".join(action) or ":"}; {fail}; fi')
+        (tmp / 'bin/tar').write_text('\n'.join(script + [f'exec {real_tar} "$@"', '']))
+        (tmp / 'bin/tar').chmod(0o755)
+        (tmp / 'guest/opt/tool').chmod(0o755)
+        vm = tmp / 'vm'
+        (vm / 'opt/tool').mkdir(parents=True)
+        (vm / 'opt/tool').chmod(0o755)
+        (vm / 'var/lib/coldbox').mkdir(parents=True)
+        (vm / 'var/lib/coldbox/overlay-dirs').write_text('opt\nopt/tool\n')
+
+        def guest(name, *command, user):
+            command = [str(vm) if c == '/' else c for c in command]
+            if command[0] != 'tar':
+                return command
+            return ['sh', '-c', f'echo >> {tmp}/extracts; exec "$@"', 'sh', real_tar, *command[1:]]
+        with mock.patch.dict(os.environ, PATH=f'{tmp}/bin:{os.environ["PATH"]}'), \
+                mock.patch.multiple(cb, GUEST_FILES=tmp / 'guest', ic_exec=guest), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                cb.push_guest_files('cbx-job')
+            finally:
+                self.packs = int((tmp / 'packs').read_text())
+                self.extracts = len((tmp / 'extracts').read_text()) if (tmp / 'extracts').exists() else 0
+        return vm
+
+    def test_a_guest_dir_swapped_during_the_pack_is_packed_again_before_the_job_gets_it(self):
+        vm = self.push_with_flaky_tar((1, './opt: file changed as we read it'))
+        self.assertEqual((self.packs, self.extracts), (2, 1))
+        self.assertEqual((vm / 'opt/tool/run').read_text(), 'new\n')
+
+    def test_a_swap_that_changes_directory_modes_gives_the_job_the_new_modes(self):
+        for code, message in ((1, './opt: file changed as we read it'), (0, '')):
+            with self.subTest(code=code):
+                vm = self.push_with_flaky_tar((code, message, 'chmod 700 opt/tool'))
+                self.assertEqual((self.packs, self.extracts), (2, 1))
+                self.assertEqual(stat.S_IMODE(os.stat(vm / 'opt/tool').st_mode), 0o700)
+
+    def test_directory_modes_that_change_during_both_packs_fail_the_job(self):
+        with self.assertRaisesRegex(RuntimeError, 'changed while it was packed, twice'):
+            self.push_with_flaky_tar((0, '', 'chmod 700 opt/tool'), (0, '', 'chmod 750 opt/tool'))
+        self.assertEqual((self.packs, self.extracts), (2, 0))
+
+    def test_a_second_changed_pack_still_fails_the_job(self):
+        with self.assertRaises(subprocess.CalledProcessError) as failed:
+            self.push_with_flaky_tar((1, './opt: file changed as we read it'), (1, './opt: file changed as we read it'))
+        self.assertEqual((failed.exception.returncode, self.packs, self.extracts), (1, 2, 0))
+
+    def test_any_other_tar_failure_fails_the_job_without_a_second_pack(self):
+        for code, message in ((2, './opt: file changed as we read it'), (1, './opt/x: Cannot open: Permission denied'),
+                              (1, './opt: file changed as we read it\n./opt/x: File removed before we read it')):
+            with self.subTest(message=message), self.assertRaises(subprocess.CalledProcessError) as failed:
+                self.push_with_flaky_tar((code, message))
+            self.assertEqual((failed.exception.returncode, self.packs, self.extracts), (code, 1, 0))
 
     def test_guest_files_keep_the_vms_directory_symlinks(self):
         tmp = Path(tempfile.mkdtemp())
@@ -2614,7 +3682,8 @@ class Unregister(unittest.TestCase):
         (tmp / 'gh').chmod(0o755)
         (tmp / 'sudo').write_text('#!/bin/sh\nexit 0\n')
         (tmp / 'sudo').chmod(0o755)
-        env = dict(os.environ, PATH=f'{tmp}:{os.environ["PATH"]}', COLDBOX_STATE=str(tmp / 'state'))
+        env = dict(os.environ, PATH=f'{tmp}:{os.environ["PATH"]}', COLDBOX_STATE=str(tmp / 'state'),
+                   COLDBOX_ALLOW_PERSONAL_LOGIN='1')
         result = subprocess.run([sys.executable, str(ROOT / 'coldbox'), 'unregister', 'me/app'], env=env,
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2623,18 +3692,306 @@ class Unregister(unittest.TestCase):
         self.assertIn(f'deleted {len(ours)} coldbox runner registration(s) this host started', result.stdout)
 
 
+def runner_service(instance):
+    return f'coldbox-runner@{instance}.service'
+
+
 class Status(unittest.TestCase):
+    def test_status_audits_required_app_check_and_verify_workflow(self):
+        branch = 'release/current'
+        root = 'repos/me/app'
+        rules = f'{root}/rules/branches/release%2Fcurrent?per_page=100&page=1'
+        classic = f'{root}/branches/release%2Fcurrent/protection/required_status_checks'
+        workflow = f'{root}/contents/.github/workflows/verify.yml?ref=release%2Fcurrent'
+        rule = dict(type='required_status_checks', parameters=dict(required_status_checks=[
+            dict(context='coldbox verify', integration_id=42)]))
+        absent = cb.urllib.error.HTTPError(classic, 404, '', {}, io.BytesIO(b'{"message":"Branch not protected"}'))
+        denied = cb.urllib.error.HTTPError(classic, 403, '', {}, None)
+        unavailable = cb.urllib.error.HTTPError(workflow, 404, '', {}, None)
+        for error in (absent, denied, unavailable):
+            self.addCleanup(error.close)
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        registered = [dict(target='me/app', active='active', slots=0)]
+        for rulesets, protection, text, expected in (
+            ([rule], None, cb.WORKFLOW, 'ENFORCED'),
+            ([], dict(checks=[dict(context='coldbox verify', app_id=42)]), cb.WORKFLOW, 'ENFORCED'),
+            ([], absent, cb.WORKFLOW, "GAP; release/current does not require the Coldbox App check 'coldbox verify'"),
+            ([], dict(checks=[dict(context='coldbox verify', app_id=-1)]), cb.WORKFLOW,
+             "GAP; release/current does not require the Coldbox App check 'coldbox verify'"),
+            ([rule], None, cb.WORKFLOW.replace('- run: coldbox require-tests', '# - run: coldbox require-tests'),
+             'GAP; .github/workflows/verify.yml lacks an unconditional coldbox require-tests step in verify'),
+            ([rule], None, cb.WORKFLOW + '        continue-on-error: true\n',
+             'GAP; .github/workflows/verify.yml lacks an unconditional coldbox require-tests step in verify'),
+            ([rule], None, cb.WORKFLOW + '        if: false\n',
+             'GAP; .github/workflows/verify.yml lacks an unconditional coldbox require-tests step in verify'),
+            ([rule], None, cb.WORKFLOW.replace("    if: github.event_name != 'pull_request' || "
+                                              "github.event.pull_request.head.repo.full_name == github.repository",
+                                              '    if: false'),
+             'GAP; .github/workflows/verify.yml lacks an unconditional coldbox require-tests step in verify'),
+            ([rule], None, unavailable, 'UNVERIFIED; .github/workflows/verify.yml (Contents: read): '
+             'HTTP 404 (workflow missing or inaccessible)'),
+            ([], denied, cb.WORKFLOW, 'UNVERIFIED; classic branch protection (Administration: read): HTTP 403'),
+        ):
+            with self.subTest(expected=expected):
+                contents = (dict(type='file', encoding='base64', content=cb.base64.b64encode(text.encode()).decode())
+                            if isinstance(text, str) else text)
+                payloads = {rules: rulesets, classic: protection, workflow: contents}
+
+                def read(path, token):
+                    self.assertEqual(token, 'token')
+                    value = payloads[path]
+                    if isinstance(value, Exception):
+                        raise value
+                    return value
+
+                with mock.patch.multiple(cb, github_app_id=lambda: '42', app_request=read, supervisor_build=lambda *_: cb.build_id(),
+                                         batch_repos=lambda _: {'me/app': dict(visibility='private', default_branch=branch)}):
+                    code, output = self.healthy_status(state, [], registered, audit=True)
+                self.assertIn(f'  merge enforcement me/app: {expected}\n', output)
+                self.assertEqual(code, int(expected != 'ENFORCED'), output)
+
+    def test_fleet_status_distinguishes_build_drift_stale_queue_and_missing_peer(self):
+        unit = runner_service('me-app')
+        hosts = Path(self.enterContext(tempfile.TemporaryDirectory())) / 'ci-hosts.json'
+        hosts.write_text(json.dumps(dict(primary='primary', overflow=['drifted', 'stale', 'legacy', 'missing'])))
+
+        def run(argv, **_):
+            _, host, command = argv
+            if host == 'missing':
+                return subprocess.CompletedProcess(argv, 255, '', '')
+            if command == 'coldbox stats --json --since 24h':
+                return subprocess.CompletedProcess(argv, 0, '{"jobs": 0}', '')
+            self.assertEqual(command, 'coldbox status')
+            build = 'b' * 12 if host == 'drifted' else 'a' * 12
+            detail = {
+                'stale': ('  merge enforcement me/app: GAP; main does not require the Coldbox App check\n'
+                          '  queue health me/app: STALE; observed 2026-01-01T00:00:00Z; '
+                          f'inspect journalctl -u {unit}\n'),
+                'legacy': '  me/app                           active     burst only\n',
+            }.get(host, '')
+            return subprocess.CompletedProcess(argv, 0, f'coldbox 0.2.0 (build {build})\n{detail}', '')
+
+        with mock.patch.object(cb, 'CI_HOSTS', hosts), \
+                mock.patch.object(cb, 'ssh', lambda host, command: ['ssh', host, shlex.join(command)]), \
+                mock.patch.object(cb.subprocess, 'run', side_effect=run):
+            code, output = quiet(cb.main, ['status', '--hosts'])
+        self.assertEqual(code, 1, output)
+        self.assertIn('drifted: BUILD DRIFT; installed bbbbbbbbbbbb; primary primary has aaaaaaaaaaaa', output)
+        self.assertIn('stale: queue health me/app: STALE; observed 2026-01-01T00:00:00Z', output)
+        self.assertIn('stale: merge enforcement me/app: GAP; main does not require the Coldbox App check', output)
+        self.assertIn('legacy: merge enforcement me/app: UNVERIFIED', output)
+        self.assertIn('legacy: queue health me/app: UNREADABLE', output)
+        self.assertIn(f'journalctl -u {unit}', output)
+        self.assertIn('missing: UNREACHABLE', output)
+
+    def test_fleet_status_json_reports_drift_and_recovers_when_builds_match(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        hosts = state / 'ci-hosts.json'
+        hosts.write_text(json.dumps(dict(primary='primary', overflow=['peer'])))
+        builds = {'primary': 'a' * 12, 'peer': 'b' * 12}
+        stats_exit = 0
+
+        def run(argv, **kwargs):
+            _, host, command = argv
+            if host not in builds:
+                return subprocess.CompletedProcess(argv, 255, '', '')
+            if command == 'coldbox stats --json --since 24h':
+                code = stats_exit if host == 'peer' else 0
+                report = dict(schema_version=1, jobs=7, orphans=int(code == 1), unreadable_receipts=int(code == 2))
+                return subprocess.CompletedProcess(argv, code, json.dumps(report), '')
+            return subprocess.CompletedProcess(argv, 0, f'coldbox 0.2.0 (build {builds[host]})\n', '')
+
+        with mock.patch.object(cb, 'CI_HOSTS', hosts), \
+                mock.patch.object(cb, 'ssh', lambda host, command: ['ssh', host, shlex.join(command)]), \
+                mock.patch.object(cb.subprocess, 'run', side_effect=run):
+            for build, expected, verdict in (('b' * 12, 1, 'FAIL'), ('a' * 12, 0, 'PASS'),
+                                             (None, 2, 'INCOMPLETE')):
+                with self.subTest(verdict=verdict):
+                    if build is None:
+                        del builds['peer']
+                    else:
+                        builds['peer'] = build
+                    code, output = quiet(cb.main, ['status', '--hosts', '--json'])
+                    report = json.loads(output)
+                    self.assertEqual((code, report['schema_version'], report['verdict']), (expected, 1, verdict))
+                    primary, peer = report['hosts']
+                    self.assertEqual((primary['host'], peer['host']), ('primary', 'peer'))
+                    self.assertEqual(peer['build'], build or '-')
+                    self.assertEqual(any('BUILD DRIFT' in finding for finding in peer['health']), expected == 1)
+            builds['peer'] = builds['primary']
+            for stats_exit, verdict, jobs in ((1, 'FAIL', '7'), (2, 'INCOMPLETE', '7 (1 unreadable)')):
+                with self.subTest(stats_exit=stats_exit):
+                    code, output = quiet(cb.main, ['status', '--hosts', '--json'])
+                    peer = json.loads(output)['hosts'][1]
+                    self.assertEqual((code, peer['verdict'], peer['jobs_24h']), (stats_exit, verdict, jobs))
+
+    def test_active_queue_health_distinguishes_fresh_stalled_stale_unreadable_and_missing(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        target = dict(target='me/app', active='active', slots=0)
+        path = state / 'queues' / 'me' / 'app.json'
+        path.parent.mkdir(parents=True)
+        fresh = dict(queued=0, oldest_wait_seconds=0, stalled=False, observed_at=cb.now_iso())
+        monitor = argparse.Namespace(hosts=True)
+        with mock.patch.object(cb, 'CI_HOSTS', state / 'no-ci-hosts.json'), \
+                mock.patch.object(cb, 'supervisor_build', return_value=cb.build_id()) as loaded, \
+                mock.patch.object(cb, 'batch_repos', return_value={'me/app': {'visibility': 'private'}}):
+            code, output = self.healthy_status(state, [], [target], args=monitor)
+            self.assertEqual(code, 1, output)
+            self.assertIn('queue health me/app: MISSING', output)
+            for observation, health in (
+                (fresh, 'FRESH'),
+                ({**fresh, 'queued': 1, 'oldest_wait_seconds': 420, 'stalled': True}, 'STALLED'),
+                ({**fresh, 'observed_at': '2026-01-01T00:00:00Z'}, 'STALE'),
+                ({**fresh, 'queued': 'unknown'}, 'UNREADABLE'),
+            ):
+                with self.subTest(health=health):
+                    cb.write_json(path, observation)
+                    code, output = self.healthy_status(state, [], [target], args=monitor)
+                    self.assertEqual(code, int(health != 'FRESH'), output)
+                    self.assertIn(f'queue health me/app: {health}', output)
+            cb.write_json(path, fresh)
+            loaded.return_value = 'b' * 12
+            code, output = self.healthy_status(state, [], [target], args=monitor)
+            self.assertEqual(code, 1, output)
+            self.assertIn('supervisor me/app: build bbbbbbbbbbbb (stale)', output)
+
+    def test_status_reports_loaded_supervisor_builds_across_an_install_and_restart(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        installed = hashlib.sha256((ROOT / 'coldbox').read_bytes()).hexdigest()[:12]
+        old_build = '1' * 12
+        invocations = {name: str(index) * 32 for index, name in enumerate(('stale', 'current', 'legacy'), 1)}
+        registered = [dict(unit=f'coldbox-runner@{name}.service', target=name, active='active', slots=0)
+                      for name in invocations]
+
+        def systemctl(argv, **kwargs):
+            if argv[:2] == ['systemctl', 'show']:
+                name = argv[-1].removesuffix('.service').split('@')[1]
+                return subprocess.CompletedProcess(argv, 0, invocations[name] + '\n', '')
+            return subprocess.CompletedProcess(argv, 0, '', '')
+
+        with mock.patch.multiple(cb, STATE=state, ci_host=lambda: ('host', 'host'),
+                                 serve_slots=lambda _: 0, registrations=lambda: registered,
+                                 query=mock.Mock(side_effect=OSError), check_guest_drift=lambda _: None,
+                                 app_token=lambda: 'token'), mock.patch.object(cb.subprocess, 'run', systemctl):
+            with mock.patch.object(cb, 'build_id', return_value=old_build):
+                with mock.patch.dict(os.environ, INVOCATION_ID=invocations['stale']):
+                    cb.serve(argparse.Namespace(target='stale', worker=False, once=False, slots=0))
+            with mock.patch.dict(os.environ, INVOCATION_ID=invocations['current']):
+                cb.serve(argparse.Namespace(target='current', worker=False, once=False, slots=0))
+            _, output = quiet(cb.status, None)
+            self.assertIn(f'  supervisor stale: build {old_build} (stale)\n', output)
+            self.assertIn(f'  supervisor current: build {installed} (current)\n', output)
+            self.assertIn('  supervisor legacy: build unknown\n', output)
+
+            invocations['stale'] = '4' * 32
+            self.assertIn('  supervisor stale: build unknown\n', quiet(cb.status, None)[1])
+            with mock.patch.dict(os.environ, INVOCATION_ID=invocations['stale']):
+                cb.serve(argparse.Namespace(target='stale', worker=False, once=False, slots=0))
+            self.assertIn(f'  supervisor stale: build {installed} (current)\n', quiet(cb.status, None)[1])
+
     def test_a_host_without_gh_or_incus_gets_failures_not_a_crash(self):
         tmp = Path(tempfile.mkdtemp())
         (tmp / 'systemctl').write_text('#!/bin/sh\nexit 3\n')
         (tmp / 'systemctl').chmod(0o755)
-        with mock.patch.dict(os.environ, PATH=str(tmp)), mock.patch.object(cb, 'STATE', tmp):
+        with mock.patch.dict(os.environ, PATH=str(tmp), COLDBOX_ALLOW_PERSONAL_LOGIN='1'), mock.patch.object(cb, 'STATE', tmp):
             code, output = quiet(cb.status, None)
         self.assertEqual(code, 1)
         build = hashlib.sha256((ROOT / 'coldbox').read_bytes()).hexdigest()[:12]
         self.assertEqual(output.splitlines()[0], f'coldbox 0.2.0 (build {build})')
         self.assertIn('FAIL  GitHub auth: no GitHub App and gh is not installed', output)
         self.assertIn('FAIL  Coldbox is installed', output)
+
+    def test_status_hosts_prints_a_row_per_ci_host_and_counts_unreachable_as_incomplete(self):
+        hosts = Path(self.enterContext(tempfile.TemporaryDirectory())) / 'ci-hosts.json'
+        hosts.write_text(json.dumps(dict(primary='peer-a', overflow=['peer-b', 'peer-c'])))
+        status = {'peer-a': (0, 'aaaaaaaaaaaa', 'PASS  0 job VM(s) without a live worker\n'),
+                  'peer-b': (0, 'aaaaaaaaaaaa', 'PASS  0 job VM(s) without a live worker\n'),
+                  'peer-c': (0, 'aaaaaaaaaaaa', 'PASS  0 job VM(s) without a live worker\n')}
+        reachable, hung, no_stats, corrupt, cut = {'peer-a', 'peer-b', 'peer-c'}, set(), set(), set(), set()
+
+        def fake_run(argv, **_):
+            host, command = argv[1], argv[2]
+            if host in hung:
+                raise subprocess.TimeoutExpired(argv, 300)
+            if host not in reachable:
+                return subprocess.CompletedProcess(argv, 255, '', f'ssh: connect to host {host} port 22: timed out\n')
+            code, build, checks = status[host]
+            if command == 'coldbox stats --json --since 24h' and host in no_stats:
+                raise subprocess.TimeoutExpired(argv, 300)
+            if command == 'coldbox stats --json --since 24h':
+                return subprocess.CompletedProcess(argv, 255 if host in cut else 0,
+                                                   json.dumps(dict(jobs=18, unreadable_receipts=2 if host in corrupt else 0)), '')
+            self.assertEqual(command, 'coldbox status')
+            return subprocess.CompletedProcess(argv, code, f'coldbox 0.2.0 (build {build})\nPASS  x\n{checks}\nRunners\n'
+                                               f'\nRecent receipts\n  cbx-9-ab   pass   me/app   12s  '
+                                               '2026-11-12T20:01:00+00:00; queue waited 4 s\n  cbx-8-ab   pass\n', '')
+
+        def table():
+            with mock.patch.object(cb, 'CI_HOSTS', hosts), \
+                    mock.patch.object(cb.os, 'uname', return_value=argparse.Namespace(nodename='elsewhere')), \
+                    mock.patch.object(cb, 'ssh', lambda host, command: ['ssh', host, shlex.join(command)]), \
+                    mock.patch.object(cb.subprocess, 'run', side_effect=fake_run):
+                return quiet(cb.main, ['status', '--hosts'])
+
+        code, output = table()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output.splitlines(), [
+            'HOST   BUILD        VERDICT ORPHANS LAST RECEIPT              JOBS 24H',
+            'peer-a aaaaaaaaaaaa PASS    0       2026-11-12T20:01:00+00:00 18',
+            'peer-b aaaaaaaaaaaa PASS    0       2026-11-12T20:01:00+00:00 18',
+            'peer-c aaaaaaaaaaaa PASS    0       2026-11-12T20:01:00+00:00 18'])
+        status['peer-b'] = (1, 'aaaaaaaaaaaa', 'FAIL  2 job VM(s) without a live worker: cbx-1 cbx-2\n      fix: coldbox reap\n')
+        code, output = table()
+        self.assertEqual(code, 1, output)
+        self.assertIn('peer-b aaaaaaaaaaaa FAIL    2       2026-11-12T20:01:00+00:00 18\n', output)
+        status['peer-b'] = (0, 'aaaaaaaaaaaa', 'PASS  0 job VM(s) without a live worker\n')
+        reachable.discard('peer-c')
+        code, output = table()
+        self.assertEqual(code, 1, output)
+        self.assertIn('peer-c -            INCOMPLETE -       -                         -\n', output)
+        self.assertNotIn('FAIL', output)
+        reachable.add('peer-c')
+        hung.add('peer-a')
+        code, output = table()
+        self.assertEqual(code, 1, output)
+        self.assertIn('peer-a -            INCOMPLETE', output)
+        hung.clear()
+        no_stats.add('peer-c')
+        code, output = table()
+        self.assertEqual(code, 1, output)
+        self.assertIn('peer-c aaaaaaaaaaaa INCOMPLETE 0       2026-11-12T20:01:00+00:00 -\n', output)
+        no_stats.clear()
+        corrupt.add('peer-a')
+        code, output = table()
+        self.assertEqual(code, 0, output)
+        self.assertIn('peer-a aaaaaaaaaaaa PASS    0       2026-11-12T20:01:00+00:00 18 (2 unreadable)\n', output)
+        corrupt.clear()
+        cut.add('peer-b')
+        code, output = table()
+        self.assertEqual(code, 1, output)
+        self.assertIn('peer-b aaaaaaaaaaaa INCOMPLETE 0       2026-11-12T20:01:00+00:00 -\n', output)
+
+        cut.clear()
+        status['peer-a'] = (0, 'aaaaaaaaaaaa', '  supervisor owner/repo: build bbbbbbbbbbbb (stale)\n')
+        status['peer-b'] = (0, 'aaaaaaaaaaaa', '  supervisor owner/repo: build unknown\n')
+        code, output = table()
+        self.assertEqual(code, 1)
+        self.assertIn('  peer-a: supervisor owner/repo: build bbbbbbbbbbbb (stale)\n', output)
+        self.assertIn('  peer-b: supervisor owner/repo: build unknown\n', output)
+
+    def test_status_hosts_without_ci_hosts_is_plain_status(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / 'systemctl').write_text('#!/bin/sh\nexit 3\n')
+        (tmp / 'systemctl').chmod(0o755)
+        outputs = []
+        for args in (None, argparse.Namespace(hosts=True)):
+            with mock.patch.dict(os.environ, PATH=str(tmp)), mock.patch.object(cb, 'STATE', tmp), \
+                    mock.patch.object(cb, 'CI_HOSTS', tmp / 'missing'), \
+                    mock.patch.object(cb, 'ssh', side_effect=AssertionError('ssh without ci-hosts.json')):
+                outputs.append(quiet(cb.status, args))
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(outputs[1][0], 1)
+        self.assertRegex(outputs[1][1], r'^coldbox 0\.2\.0 \(build [0-9a-f]{12}\)\n')
 
     def test_status_shows_queue_age_state_and_receipt_duration(self):
         state = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -2693,19 +4050,61 @@ class Status(unittest.TestCase):
                 else:
                     self.assertIn(f'PASS  {line}', output)
 
-    def healthy_status(self, state, rows, registered=()):
+    def healthy_status(self, state, rows, registered=(), incus_config=None, args=None, audit=False):
         (state / 'systemctl').write_text('#!/bin/sh\nexit 0\n')
         (state / 'systemctl').chmod(0o755)
         built = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
-        incus = {'environment': {'server_version': '6.0.7'}, 'created_at': built, 'config': {},
+        incus = {'environment': {'server_version': '6.0.7'}, 'created_at': built,
+                 'config': incus_config or {'user.coldbox.managed': 'true', 'user.coldbox.expires': 'never'},
                  'space': {'used': 0, 'total': GIB}}
         kvm = lambda path: state if str(path) == '/dev/kvm' else Path(path)
-        with mock.patch.dict(os.environ, PATH=str(state)), mock.patch.object(cb, 'Path', kvm), \
-                mock.patch.multiple(cb, STATE=state, app_token=lambda: 'token',
-                                    registrations=lambda: [dict(r) for r in registered],
+        with contextlib.ExitStack() as stack, mock.patch.dict(os.environ, PATH=str(state)), mock.patch.object(cb, 'Path', kvm), \
+                mock.patch.multiple(cb, STATE=state, app_token=lambda *_: 'token',
+                                    registrations=lambda: [dict(unit=runner_service('fixture'), **r) for r in registered],
                                     ic=lambda *a, **k: json.dumps(rows) if 'list' in a else '2',
                                     query=lambda path: incus, vm_memory=lambda: GIB, host_memory=lambda: 8 * GIB):
-            return quiet(cb.status, None)
+            if not audit:
+                stack.enter_context(mock.patch.object(cb, 'merge_enforcement', return_value='ENFORCED', create=True))
+            else:
+                return quiet(cb.main, ['status'])
+            return quiet(cb.status, args)
+
+    def test_local_status_json_uses_health_checks_and_reports_read_errors(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        args = argparse.Namespace(hosts=False, json=True)
+        with mock.patch.object(cb, 'check_guest_drift'), mock.patch.object(cb, 'xattrs_supported', return_value=True):
+            for rows, expected, verdict in (([], 0, 'PASS'), (
+                [dict(name='cbx-1-ab', status='Running', config={cb.EXPIRES: '1', cb.MANAGED: 'true'})], 1, 'FAIL'
+            )):
+                with self.subTest(verdict=verdict):
+                    code, output = self.healthy_status(state, rows, args=args)
+                    report = json.loads(output)
+                    self.assertEqual((code, report['schema_version'], report['verdict']), (expected, 1, verdict))
+                    self.assertEqual(report['build'], cb.build_id())
+                    check = dict(ok=not rows, message=f'{len(rows)} job VM(s) without a live worker')
+                    if rows:
+                        check.update(message=check['message'] + ': cbx-1-ab', fix='coldbox reap')
+                    self.assertIn(check, report['checks'])
+        registration = dict(target='me/app', active='active', slots=0)
+        queue = state / 'queues' / 'me' / 'app.json'
+        queue.parent.mkdir(parents=True)
+        cb.write_json(queue, dict(queued=0, oldest_wait_seconds=0, stalled=False, observed_at=cb.now_iso()))
+        with mock.patch.multiple(cb, check_guest_drift=mock.Mock(), xattrs_supported=lambda _: True,
+                                 supervisor_build=lambda *_: cb.build_id(),
+                                 batch_repos=lambda _: {'me/app': {'visibility': 'private'}}):
+            code, output = self.healthy_status(state, [], [registration], args=args)
+        report = json.loads(output)
+        self.assertEqual((code, report['verdict']), (0, 'PASS'))
+        self.assertIsInstance(report['details'], list)
+        self.assertIn('  queue health me/app: FRESH; observed ' + json.loads(queue.read_text())['observed_at'],
+                      report['details'])
+        hosts = state / 'ci-hosts.json'
+        hosts.write_text('{')
+        with mock.patch.object(cb, 'CI_HOSTS', hosts):
+            code, output = quiet(cb.main, ['status', '--hosts', '--json'])
+        report = json.loads(output)
+        self.assertEqual((code, report['schema_version'], report['verdict']), (2, 1, 'INCOMPLETE'))
+        self.assertIn('CI host admission denied', report['error'])
 
     def test_status_fails_while_a_job_vm_has_no_live_worker_and_passes_once_it_has_one(self):
         state = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -2739,6 +4138,8 @@ class Status(unittest.TestCase):
         hosts.write_text(json.dumps(dict(primary='peer-a', overflow=[os.uname().nodename, 'peer-b'])))
         peer = lambda host, command: command[:-1] + [str(overlays / host / 'opt')]
         line = f"guest overlay {overlays / os.uname().nodename / 'opt'} matches peer-a peer-b"
+        self.enterContext(mock.patch.dict(os.environ))
+        os.environ.pop('SUDO_USER', None)
         with mock.patch.multiple(cb, CI_HOSTS=hosts, GUEST_FILES=overlays / os.uname().nodename, ssh=peer):
             code, output = self.healthy_status(state, [])
             self.assertEqual(code, 0, output)
@@ -2747,7 +4148,7 @@ class Status(unittest.TestCase):
             code, output = self.healthy_status(state, [])
             self.assertEqual(code, 1, output)
             self.assertIn(f'FAIL  {line}: differs on peer-b: opt/coldstack\n      fix: run sudo systemctl start '
-                          'coldbox-refresh.service on every CI host so all copy the same commits\n', output)
+                          'coldverify-guest-refresh.service on every CI host so all copy the same commits\n', output)
             self.assertEqual(output.count('FAIL'), 1, output)
             (overlays / 'peer-a' / 'opt' / 'coldverify' / 'sub' / 'cold').chmod(0o755)
             (overlays / 'peer-a' / 'opt' / '.hidden').mkdir()
@@ -2787,6 +4188,40 @@ class Status(unittest.TestCase):
         self.assertIn('PASS  0 Incus instance(s) in project coldbox without user.coldbox.managed=true and '
                       'user.coldbox.expires\n', output)
 
+    def test_status_fails_on_coldbox_incus_objects_and_artifact_folders_without_lifecycle_marks(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        code, output = self.healthy_status(state, [], incus_config={'user.coldbox.managed': 'true'})
+        self.assertEqual(code, 1, output)
+        self.assertIn('FAIL  5 Coldbox Incus object(s) without user.coldbox.managed=true and user.coldbox.expires=never: '
+                      'project coldbox, network coldboxbr0, storage pool coldbox, network ACL coldbox-isolated, '
+                      'profile coldbox/coldbox\n', output)
+        self.assertEqual(output.count('FAIL'), 1, output)
+        (state / 'receipts' / 'cbx-a.artifacts').mkdir(parents=True)
+        code, output = self.healthy_status(state, [])
+        self.assertEqual(code, 1, output)
+        self.assertIn('FAIL  1 artifact folder(s) without user.coldbox.managed=true and user.coldbox.expires xattrs: '
+                      'cbx-a.artifacts\n      fix: coldbox reap\n', output)
+        self.assertEqual(output.count('FAIL'), 1, output)
+        cb.mark_folder(state / 'receipts' / 'cbx-a.artifacts', 'never')
+        code, output = self.healthy_status(state, [])
+        self.assertEqual(code, 0, output)
+        self.assertIn('PASS  0 Coldbox Incus object(s) without user.coldbox.managed=true and '
+                      'user.coldbox.expires=never\n', output)
+        self.assertIn('PASS  0 artifact folder(s) without user.coldbox.managed=true and user.coldbox.expires xattrs\n',
+                      output)
+
+    def test_status_warns_once_instead_of_failing_where_user_xattrs_are_unsupported(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (state / 'receipts' / 'cbx-a.artifacts').mkdir(parents=True)
+        (state / 'receipts' / 'cbx-b.artifacts').mkdir()
+        with mock.patch.object(os, 'getxattr', side_effect=OSError(errno.ENOTSUP, 'Operation not supported')):
+            code, output = self.healthy_status(state, [])
+        self.assertEqual(code, 0, output)
+        self.assertNotIn('artifact folder(s)', output)
+        self.assertIn(f"WARN  {state / 'receipts'} has no user xattrs, so artifact folders are deleted by age only\n",
+                      output)
+        self.assertEqual(output.count('no user xattrs'), 1, output)
+
     def test_status_fails_on_a_receipt_left_with_vm_destroyed_false_and_no_live_worker(self):
         state = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (state / 'receipts').mkdir()
@@ -2823,15 +4258,15 @@ class Status(unittest.TestCase):
     def test_status_fails_slots_past_the_core_bound_or_the_large_vm_room(self):
         state = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for threads, slots, code in ((40, 2, 0), (40, 3, 1), (6, 1, 0), (6, 2, 1)):
-            with self.subTest(threads=threads, slots=slots), mock.patch.object(cb.os, 'cpu_count', lambda: threads):
+            with self.subTest(threads=threads, slots=slots), mock.patch.object(cb, 'host_cpus', lambda: threads):
                 self.assertEqual(self.healthy_status(state, [], [dict(target='myorg', active='active', slots=slots)])[0], code)
-        with mock.patch.object(cb.os, 'cpu_count', lambda: 6):
+        with mock.patch.object(cb, 'host_cpus', lambda: 6):
             stopped = dict(target='me/stopped', active='inactive', configured=True, slots=1)
             self.assertIn('FAIL  job VMs: 2 vCPU, 1 GiB each; 2 slot(s) registered',
                           self.healthy_status(state, [], [dict(target='myorg', active='active', slots=1), stopped])[1])
             _, output = self.healthy_status(state, [], [dict(target='myorg', active='active', slots=2)])
-        self.assertIn('FAIL  job VMs: 2 vCPU, 1 GiB each; 2 slot(s) registered, at most 1 leave room for one more VM '
-                      'within 2 job VMs (CPU threads less the reserve, 3 per VM) and for one large VM in 8 GiB RAM\n'
+        self.assertIn('FAIL  job VMs: 2 vCPU, 1 GiB each; 2 slot(s) registered, configured limit 1 slot(s) (not live room) '
+                      'so one more VM fits within the cap of 2 job VMs (CPU threads less the reserve, 3 per VM) and for one large VM in 8 GiB RAM\n'
                       '      fix: unregister a repo or register again with fewer --slots\n', output)
 
     def test_status_lists_visibility_and_fails_a_public_repo_registered_without_allow_public(self):
@@ -2874,6 +4309,99 @@ class Status(unittest.TestCase):
                                                           if r['target'] not in ('me/open', 'org/open', 'me/gone')])
         self.assertEqual(code, 0, output)
 
+    def test_status_looks_up_repos_at_most_eight_at_once_and_keeps_failed_lookups_in_place(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        targets = [f'me/repo{index:02}' for index in range(24)]
+        running, peak, lock = [0], [0], threading.Lock()
+
+        def github(path, *_args):
+            with lock:
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+            try:
+                time.sleep(0.2)
+                if path == 'repos/me/repo05':
+                    raise RuntimeError('gh api repos/me/repo05: HTTP 404')
+                if path == 'repos/me/repo17':
+                    raise cb.GitHubTransient('GitHub request timed out')
+                return dict(full_name=path.removeprefix('repos/'), visibility='private')
+            finally:
+                with lock:
+                    running[0] -= 1
+
+        registered = [dict(target=target, active='active', slots=0) for target in targets]
+        started = time.monotonic()
+        with mock.patch.object(cb, 'gh', github):
+            code, output = self.healthy_status(state, [], registered)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 24 * 0.2 / 2, output)
+        self.assertLessEqual(peak[0], 8)
+        self.assertEqual(code, 1, output)
+        failed = [line for line in output.splitlines() if line.startswith('FAIL')]
+        self.assertEqual(failed, ['FAIL  me/repo05: visibility unreadable from GitHub: gh api repos/me/repo05: HTTP 404',
+                                  'FAIL  me/repo17: visibility unreadable from GitHub: GitHub request timed out'])
+        rows = re.findall(r'^  (me/repo\d+) +active +burst only[^\n]*; (\w+)$', output, re.M)
+        self.assertEqual(rows, [(target, 'unknown' if target in ('me/repo05', 'me/repo17') else 'private')
+                                for target in targets])
+
+    def test_status_looks_up_each_owners_repos_in_one_github_call(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        targets = [f'me/repo{index:02}' for index in range(37)] + ['other/tool']
+        calls = []
+
+        def github(*args, body=None, path=''):
+            calls.append((args, path))
+            if args == ('graphql',):
+                names = re.findall(r'(r\d+): repository\(owner: "([^"]+)", name: "([^"]+)"\)', body['query'])
+                return dict(data={alias: None if name == 'repo09' else
+                                  dict(visibility='PUBLIC' if name == 'repo03' else 'PRIVATE', owner=dict(__typename='User'))
+                                  for alias, _owner, name in names})
+            return dict(full_name=args[0].removeprefix('repos/'), visibility='private')
+
+        registered = [dict(target=target, active='active', slots=0) for target in targets]
+        with mock.patch.object(cb, 'gh', github):
+            code, output = self.healthy_status(state, [], registered)
+        self.assertEqual(calls, [(('graphql',), 'users/me'), (('graphql',), 'users/other'), (('repos/me/repo09',), '')])
+        self.assertEqual(code, 1, output)
+        self.assertEqual([line for line in output.splitlines() if line.startswith('FAIL')],
+                         ['FAIL  me/repo03 is public and registered without --allow-public, so no jobs run'])
+        rows = re.findall(r'^  (\S+/\S+) +active +burst only[^\n]*; (\w+)$', output, re.M)
+        self.assertEqual(rows, [(target, 'public' if target == 'me/repo03' else 'private') for target in targets])
+
+    def test_under_sudo_peer_guest_overlays_are_read_as_the_invoking_user(self):
+        commands = []
+        run = lambda command, **kwargs: commands.append(command) or subprocess.CompletedProcess(command, 0, 'abc coldverify\n')
+        for euid, env, prefix in ((0, {'SUDO_USER': 'builder'}, ['runuser', '-u', 'builder', '--', 'ssh']),
+                                  (0, {}, ['ssh']), (1000, {'SUDO_USER': 'builder'}, ['ssh'])):
+            commands.clear()
+            with mock.patch.object(cb.os, 'geteuid', return_value=euid), \
+                    mock.patch.dict(cb.os.environ, env), mock.patch.object(cb.subprocess, 'run', run):
+                if 'SUDO_USER' not in env:
+                    cb.os.environ.pop('SUDO_USER', None)
+                self.assertEqual(cb.guest_digests('peer-a'), {'coldverify': 'abc'})
+                self.assertEqual(cb.guest_digests(os.uname().nodename), {'coldverify': 'abc'})
+            self.assertEqual(commands[0][:len(prefix)], prefix)
+            self.assertIn('peer-a', commands[0])
+            self.assertEqual(commands[1][0], 'bash')
+
+    def test_status_reads_ci_host_guest_overlays_at_once(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        hosts = state / 'ci-hosts.json'
+        hosts.write_text(json.dumps(dict(primary='peer-a', overflow=[os.uname().nodename, 'peer-b', 'peer-c'])))
+
+        def digests(host):
+            time.sleep(0.3)
+            if host == 'peer-b':
+                raise subprocess.TimeoutExpired('ssh', 60)
+            return {'coldstack': 'same'}
+
+        started = time.monotonic()
+        with mock.patch.multiple(cb, CI_HOSTS=hosts, guest_digests=digests):
+            code, output = self.healthy_status(state, [])
+        self.assertLess(time.monotonic() - started, 4 * 0.3 / 2, output)
+        self.assertIn(f"FAIL  guest overlay {cb.GUEST_FILES / 'opt'} matches peer-a peer-b peer-c: "
+                      'differs on peer-b: unreadable\n', output)
+
     def test_registrations_read_the_allow_public_opt_in_from_the_unit_drop_in(self):
         tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
         units = ''
@@ -2909,7 +4437,8 @@ class Status(unittest.TestCase):
         (tmp / 'systemctl').write_text('#!/bin/sh\nexit 3\n')
         (tmp / 'systemctl').chmod(0o755)
         with mock.patch.dict(os.environ, PATH=str(tmp)), mock.patch.object(cb, 'STATE', tmp), \
-                mock.patch.object(cb, 'registrations', lambda: [dict(target='me/app', active='active', slots=0)]):
+                mock.patch.object(cb, 'registrations', lambda: [
+                    dict(unit=runner_service('me-app'), target='me/app', active='active', slots=0)]):
             output = quiet(cb.status, None)[1]
         self.assertRegex(output, r'me/app +active +burst only')
 
@@ -3017,8 +4546,10 @@ class FakeGitHub:
             return {'runners': self.runners[chunk]}
         if '/jobs?' in path:
             return {'jobs': self.jobs[int(path.split('/runs/')[1].split('/')[0])][chunk]}
-        status = path.split('status=')[1].split('&')[0]
-        return {'workflow_runs': [run if isinstance(run, dict) else {'id': run} for run in self.runs.get(status, [])][chunk]}
+        status = path.split('status=', 1)[1].split('&')[0] if 'status=' in path else None
+        runs = self.runs.get(status, [])
+        return {'total_count': len(runs),
+                'workflow_runs': [run if isinstance(run, dict) else {'id': run} for run in runs[chunk]]}
 
     def forget_unused(self):
         pass
@@ -3034,6 +4565,50 @@ def queued_ago(*seconds):
 
 
 class QueuedJobs(unittest.TestCase):
+    def test_a_writer_rerun_from_a_fork_leaves_no_eligible_private_jobs(self):
+        fork_run = dict(id=1, status='queued', event='pull_request',
+                        head_repository={'full_name': 'fork/app'}, actor={'login': 'contributor'},
+                        triggering_actor={'login': 'me'})
+        jobs = {1: queued(1)}
+        github = FakeGitHub({'queued': [fork_run]}, jobs)
+        result, log = quiet(cb.queued_jobs, github, 'me/app', 0, ('me',))
+        self.assertEqual(result, (0, 0, {}))
+        self.assertIn('not scaling for run 1 on me/app: fork pull request', log)
+
+        same_repo_run = dict(fork_run, head_repository={'full_name': 'me/app'})
+        github = FakeGitHub({'queued': [same_repo_run]}, jobs)
+        result, _ = quiet(cb.queued_jobs, github, 'me/app', 0, ('me',))
+        self.assertEqual(result, (1, 0, {'default': 1}))
+
+    def test_recent_runs_recover_an_omitted_queued_job_once_with_bounded_lookups(self):
+        active = dict(id=1, status='queued', event='pull_request',
+                      head_repository={'full_name': 'me/app'}, actor={'login': 'me'})
+        omitted = dict(active, id=2)
+        fork = dict(active, id=3, head_repository={'full_name': 'fork/app'})
+        outsider = dict(active, id=4, actor={'login': 'stranger'})
+        completed = [dict(id=run_id, status='completed') for run_id in range(10, 210)]
+        github = FakeGitHub(
+            {'queued': [active], None: completed[:100] + [omitted, active, fork, outsider]
+             + completed[100:] + [dict(active, id=5)]},
+            {1: queued(1, ['coldbox-large']), 2: queued(1)},
+        )
+        with mock.patch.object(github, 'get', wraps=github.get) as get:
+            result, log = quiet(cb.queued_jobs, github, 'me/app', 0, ('me',))
+        self.assertEqual(result, (2, 0, {'default': 1, 'large': 1}))
+        self.assertIn('actions/runs? listing limited to 200 of 205 results', log)
+        recent_gets = [call.args[0] for call in get.call_args_list if '/runs?per_page=' in call.args[0]]
+        self.assertEqual(recent_gets, [
+            'repos/me/app/actions/runs?per_page=100&page=1',
+            'repos/me/app/actions/runs?per_page=100&page=2',
+        ])
+        jobs_gets = [call.args[0] for call in get.call_args_list if '/jobs?' in call.args[0]]
+        self.assertEqual(jobs_gets, [
+            'repos/me/app/actions/runs/1/jobs?per_page=100&page=1',
+            'repos/me/app/actions/runs/2/jobs?per_page=100&page=1',
+        ])
+        github.runs[None] = github.runs[None][:200]
+        self.assertNotIn('listing limited', quiet(cb.queued_jobs, github, 'me/app', 0, ('me',))[1])
+
     def test_queue_observation_records_oldest_and_alerts_once_then_clears(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(cb, 'STATE', Path(directory)):
             github = FakeGitHub({'queued': [1]}, {1: queued_ago(600, 30)})
@@ -3044,6 +4619,15 @@ class QueuedJobs(unittest.TestCase):
             self.assertEqual(observation['queued'], 2)
             self.assertGreaterEqual(observation['oldest_wait_seconds'], 600)
             self.assertIn('CLEARED', quiet(cb.observe_queue, FakeGitHub({}, {}), 'me/app')[1])
+
+    def test_queue_observation_preserves_job_identity_and_acceptance_time(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(cb, 'STATE', Path(directory)):
+            job = dict(queued_ago(60)[0], id=123)
+            quiet(cb.observe_queue, FakeGitHub({'queued': [1]}, {1: [job]}), 'me/app')
+            quiet(cb.observe_queue, FakeGitHub({}, {}), 'me/app')
+            observation = json.loads((Path(directory) / 'queues/me/app.json').read_text())
+            self.assertEqual(observation['queued'], 0)
+            self.assertEqual(observation['accepted_jobs'], [dict(id=123, created_at=job['created_at'])])
 
     def test_queue_count_is_read_only_and_returns_oldest_eligible_age(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(cb, 'STATE', Path(directory)), \
@@ -3088,10 +4672,790 @@ class QueuedJobs(unittest.TestCase):
         github = FakeGitHub({'pending': [1]}, {1: queued(1)})
         self.assertEqual(cb.queued_jobs(github, 'me/app'), (1, 0, {'default': 1}))
 
+    def test_a_run_seen_in_multiple_statuses_contributes_its_jobs_once(self):
+        held_run = dict(id=2, run_attempt=1, event='pull_request', head_repository={'full_name': 'fork/app'})
+        github = FakeGitHub(
+            {'queued': [held_run, dict(id=1, run_attempt=1)],
+             'in_progress': [dict(id=1, run_attempt=2)],
+             'pending': [dict(id=2, run_attempt=2)]},
+            {1: [dict(id=11, status='queued', labels=['coldbox']),
+                 dict(id=12, status='queued', labels=['coldbox-large'])],
+             2: [dict(id=21, status='queued', labels=['coldbox'])]},
+        )
+        with mock.patch.object(github, 'get', wraps=github.get) as get:
+            result, _ = quiet(cb.queued_jobs, github, 'me/app')
+        jobs_gets = [call.args[0] for call in get.call_args_list if '/jobs?' in call.args[0]]
+        self.assertEqual((result, jobs_gets), (
+            (3, 0, {'default': 2, 'large': 1}),
+            ['repos/me/app/actions/runs/1/jobs?per_page=100&page=1',
+             'repos/me/app/actions/runs/2/jobs?per_page=100&page=1'],
+        ))
+
     def test_only_jobs_queued_longer_than_the_delay_count(self):
         github = FakeGitHub({'queued': [1], 'in_progress': []}, {1: queued_ago(30, 200, 32)})
         self.assertEqual(cb.queued_jobs(github, 'me/app', 31)[0], 2)
         self.assertEqual(cb.queued_jobs(github, 'me/app')[0], 3)
+
+
+class VerifyCheck(unittest.TestCase):
+    HEAD, BASE, MERGE = 'a' * 40, 'b' * 40, 'c' * 40
+
+    def setUp(self):
+        self.api = {
+            'repos/me/app/actions/jobs/7': dict(name='verify', runner_name='cbx-1', runner_id=27, run_id=9,
+                                                head_sha=self.HEAD, status='completed', conclusion='success',
+                                                html_url='https://github.com/me/app/actions/runs/9/job/7'),
+            'repos/me/app/actions/runs/9': dict(event='pull_request', path='.github/workflows/verify.yml',
+                                                head_sha=self.HEAD,
+                                                pull_requests=[dict(number=3, base=dict(sha=self.BASE))]),
+            f'repos/me/app/git/commits/{self.HEAD}': dict(sha=self.HEAD, tree=dict(sha='d' * 40)),
+            f"repos/me/app/git/trees/{'d' * 40}": self.tree('d' * 40),
+            f'repos/me/app/git/trees/{self.BASE}': self.tree(self.BASE),
+            f'repos/me/app/git/commits/{self.MERGE}': dict(tree=dict(sha='f' * 40),
+                                                         parents=[dict(sha=self.BASE), dict(sha=self.HEAD)]),
+        }
+        self.posted = []
+
+    def test_reap_finishes_verification_after_a_disposable_worker_exits(self):
+        name = 'cbx-1'
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            path = state / 'receipts' / f'{name}.json'
+            self.api['repos/me/app/actions/runs?event=pull_request&per_page=100'] = dict(workflow_runs=[
+                dict(id=9, updated_at='9999-12-31T23:59:59+00:00')])
+            self.api['repos/me/app/actions/runs/9/attempts/1/jobs?per_page=100&page=1'] = dict(
+                jobs=[self.api['repos/me/app/actions/jobs/7']])
+
+            def worker():
+                cb.note_worker(os.getpid(), 'me/app', name, 'once')
+                cb.job('runner', name, 60, ['true'], 'me/app', extra=dict(runner_id=27))
+
+            with mock.patch.multiple(cb, STATE=state, HOST_CHECKS=state / 'no-checks',
+                                     boot=lambda *args: {}, ic=mock.DEFAULT, push_guest_files=mock.DEFAULT,
+                                     ic_exec=lambda *args, **kwargs: ['true'], host_cpus=lambda: 4,
+                                     runner_admission=lambda *args: dict(target='me/app', host='fixture'),
+                                     tee=lambda *args: os._exit(17)):
+                process = multiprocessing.get_context('fork').Process(target=worker)
+                process.start()
+                process.join(5)
+                self.assertEqual(process.exitcode, 17)
+            self.assertTrue((state / 'workers' / str(process.pid)).exists())
+            self.assertFalse(json.loads(path.read_text())['vm']['destroyed'])
+            rows = [dict(name=name, status='Stopped')]
+
+            def destroy(vm):
+                self.assertEqual(vm, name)
+                rows.clear()
+                return True
+
+            with mock.patch.multiple(cb, STATE=state, sync_acl=mock.DEFAULT, mark_host_objects=mock.DEFAULT,
+                                     ic=lambda *args: json.dumps(rows), destroy=destroy, gh=self.gh):
+                for _ in range(2):
+                    code, _ = quiet(cb.reap, cb.argparse.Namespace(keep_days=0))
+                    self.assertEqual(code, 0)
+            self.assertEqual(rows, [])
+            self.assertEqual(list(path.parent.glob('*.json')), [path])
+            saved = json.loads(path.read_text())
+            self.assertEqual((saved['vm']['destroyed'], saved['verdict'], saved['cause']),
+                             (True, 'incomplete', 'worker_interrupted'))
+            self.assertEqual(saved['verification'], dict(state='posted', check_id=51))
+            [(_, check)] = self.posted
+            self.assertEqual(check['conclusion'], 'failure')
+
+    def test_reap_confirms_an_accepted_check_after_the_worker_loses_the_response(self):
+        name, tree = 'cbx-1', 'd' * 40
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            path = state / 'receipts' / f'{name}.json'
+            path.parent.mkdir()
+            receipt = self.receipt(mode='runner', vm=dict(destroyed=True), verification=dict(state='pending'))
+            cb.write_json(path, receipt)
+            retries = []
+
+            def github(*args, body=None, _retries=None):
+                if args[:2] == ('-X', 'POST'):
+                    retries.append(_retries)
+                    self.posted.append((args[2], body))
+                    raise SystemExit(17)
+                if '/check-runs?' in args[0]:
+                    [(_, check)] = self.posted
+                    return dict(check_runs=[dict(check, id=51, external_id=tree, app=dict(id=123))])
+                return self.gh(*args, body=body)
+
+            with mock.patch.dict(os.environ, COLDBOX_GITHUB_APP_ID='123'), \
+                    mock.patch.multiple(cb, STATE=state, sync_acl=mock.DEFAULT, mark_host_objects=mock.DEFAULT,
+                                        ic=lambda *args: '[]', gh=github):
+                with self.assertRaises(SystemExit) as exited:
+                    cb.publish_verify('me/app', name, receipt)
+                self.assertEqual(exited.exception.code, 17)
+                self.assertEqual(json.loads(path.read_text())['verification']['state'], 'sending')
+                for _ in range(2):
+                    code, _ = quiet(cb.reap, cb.argparse.Namespace(keep_days=0))
+                    self.assertEqual(code, 0)
+            self.assertEqual(json.loads(path.read_text())['verification'], dict(state='posted', check_id=51))
+            self.assertEqual(len(self.posted), 1)
+            self.assertEqual(retries, [[0]])
+
+    def test_reap_records_why_a_direct_run_has_no_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            path = state / 'receipts' / 'cbx-1.json'
+            path.parent.mkdir()
+            cb.write_json(path, dict(unfinished_receipt('cbx-1', error=None), mode='local'))
+            with mock.patch.multiple(cb, STATE=state, sync_acl=mock.DEFAULT, mark_host_objects=mock.DEFAULT,
+                                     ic=lambda *args: '[]', gh=self.gh):
+                code, _ = quiet(cb.reap, cb.argparse.Namespace(keep_days=0))
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(path.read_text()).get('verification'),
+                             dict(state='not_posted', reason='no GitHub check applies to this run'))
+
+    @staticmethod
+    def tree(sha, workflows='1' * 40):
+        return dict(sha=sha, tree=[dict(path='.github', mode='040000', sha=workflows),
+                                   dict(path='coldbox.toml', mode='100644', sha='2' * 40),
+                                   dict(path='src', mode='040000', sha=sha)])
+
+    def gh(self, *args, body=None, _retries=None, _app_only=False):
+        if args[:2] == ('-X', 'POST'):
+            self.posted.append((args[2], body))
+            return {'id': 51}
+        if args[0] not in self.api:
+            raise RuntimeError(f'GET {args[0]}: HTTP 404')
+        return self.api[args[0]]
+
+    def test_receipt_cli_api_and_github_share_outcome_reasons(self):
+        self.addCleanup(cb.CLEANUP.clear)
+        cases = (
+            ('pass', 'Succeeded', '<testcase name="test"/>', None, [], 0),
+            ('test_failed', 'Failed', '<testcase name="test"><failure/></testcase>', None, [], 1),
+            ('test_failed', 'Failed', '<testcase name="test"><error/></testcase>', None, [], 1),
+            ('all_tests_skipped', 'Failed', '<testcase name="test"><skipped/></testcase>', None,
+             [dict(name='Run coldbox require-tests', conclusion='failure')], 125),
+            ('no_usable_tests', 'Failed', '', None, [dict(name='Run coldbox require-tests', conclusion='failure')], 125),
+            ('infra_error', None, '', 'disk quota exceeded', [], 125),
+            ('canceled', 'Canceled', '', None, [], 125),
+            ('unfinished', None, '', None, [], 125),
+        )
+        name = 'cbx-1-abcdef-fixture'
+        for reason, outcome, testcase, error, steps, exit_status in cases:
+            with self.subTest(reason=reason, testcase=testcase), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory)
+                self.posted.clear()
+                self.api['repos/me/app/actions/jobs/7'].update(runner_name=name)
+                github = dict(repo='me/app', sha=self.HEAD, job_id=7, steps=steps)
+                root = git_repo({'app.py': ''})
+                if testcase:
+                    (root / 'report.xml').write_text(f'<testsuite>{testcase}</testsuite>')
+                junit = json.dumps(dict(cb.junit_summary([root]), cold_verify=[]))
+
+                def run(command, **kwargs):
+                    if 'junit' in command and error:
+                        raise OSError(error)
+                    return subprocess.CompletedProcess(command, 0, junit if 'junit' in command else '')
+
+                def runner(command, log, stdin):
+                    log.write(b'Running job: verify\n')
+                    if outcome:
+                        log.write(f'Job verify completed with result: {outcome}\n'.encode())
+                    log.flush()
+                    return 0
+
+                with mock.patch.multiple(cb, STATE=state, boot=mock.DEFAULT, ic=mock.DEFAULT,
+                                         push_guest_files=mock.DEFAULT, ic_exec=lambda _, *args, **kw: args,
+                                         host_cpus=lambda: 4, runner_admission=lambda *a: dict(host='h'),
+                                         tee=runner, pull=lambda _, path: github if path.endswith('job.json') else None,
+                                         record_queue_wait=mock.DEFAULT, strict_receipt=lambda *a: self.receipt()['coldverify'],
+                                         vm_resources=lambda *a: {}, copy_artifacts=lambda *a: ([], True),
+                                         destroy=lambda _: True, gh=self.gh, incus_group_exec=mock.DEFAULT), \
+                        mock.patch.object(cb.subprocess, 'run', run):
+                    receipt, output = quiet(lambda: cb.job('runner', name, 60, ['true'], 'me/app',
+                                                           extra=dict(runner_id=27)))
+                    path = state / 'receipts' / f'{name}.json'
+                    saved = json.loads(path.read_text())
+                    self.assertEqual(saved.get('reason_code'), reason)
+                    self.assertEqual(output.splitlines()[-2:],
+                                     [f'coldbox: outcome [{reason}]',
+                                      f"coldbox: {saved['verdict'].upper()} receipt {path}"])
+                    code, payload = quiet(cb.main, ['api', 'receipt', name])
+                    self.assertEqual((code, json.loads(payload)), (exit_status, receipt))
+                    cb.verify_check('me/app', name, receipt)
+                [(_, check)] = self.posted
+                self.assertIn(f'[{reason}]', check['output']['summary'])
+                if reason in ('all_tests_skipped', 'no_usable_tests'):
+                    skipped = 1 if reason == 'all_tests_skipped' else 0
+                    self.assertIn(f'Tests run: 0, skipped: {skipped}.', check['output']['summary'])
+                self.assertEqual(json.loads(check['output']['text'])['reason_code'], reason)
+                self.assertEqual(check['conclusion'], 'success' if exit_status == 0 else 'failure')
+
+    def receipt(self, **changes):
+        receipt = dict(id='cbx-1', runner_id=27, repo='me/app', verdict='pass', job_name='verify',
+                       started_at='2026-11-13T10:00:00+00:00',
+                       github=dict(repo='me/app', run_id='9', job_id=7),
+                       coldverify=dict(result='PASS', reason='ok', commit=self.MERGE, tree='f' * 40))
+        receipt.update(changes)
+        return receipt
+
+    def publish(self, receipt, target='me/app'):
+        with mock.patch.object(cb, 'gh', self.gh):
+            _, log = quiet(cb.publish_verify, target, 'cbx-1', receipt)
+        return log
+
+    def check(self, receipt):
+        self.publish(receipt)
+        self.assertEqual(len(self.posted), 1)
+        path, body = self.posted[0]
+        self.assertEqual((path, body['name'], body['head_sha'], body['external_id'], body['status']),
+                         ('repos/me/app/check-runs', 'coldbox verify', self.HEAD, 'd' * 40, 'completed'))
+        return body['conclusion'], body['output']['summary']
+
+    def run_associated_suite(self, *, next_attempt=None, **changes):
+        checkout = git_repo({'app.py': 'print(42)\n'})
+        subprocess.run(['git', '-C', str(checkout), 'remote', 'add', 'origin',
+                        'https://github.com/me/app.git'], check=True)
+        suite = repo({'suite.json': '[{"argv":["python3","app.py"],"stdout":"42\\n"}]'}) / 'suite.json'
+        head = cb.git(checkout, 'rev-parse', 'HEAD').decode().strip()
+        tree = cb.git(checkout, 'rev-parse', 'HEAD^{tree}').decode().strip()
+        self.api['repos/me/app/actions/jobs/7'].update(id=7, head_sha=head, run_attempt=1)
+        self.api['repos/me/app/actions/runs/9'].update(id=9, head_sha=head, run_attempt=1,
+                                                       head_repository=dict(full_name='me/app'))
+        self.api['repos/me/app'] = dict(full_name='me/app', visibility='private')
+        self.api[f'repos/me/app/git/commits/{head}'] = dict(tree=dict(sha=tree))
+        self.api[f'repos/me/app/git/trees/{tree}'] = self.tree(tree)
+
+        def observed(mode, name, ttl, command, *, repo, sha, extra, **kwargs):
+            observation = dict(extra['suite_observation'], result='PASS', tests_ran=1)
+            observation.update(changes)
+            if next_attempt is not None:
+                self.api['repos/me/app/actions/runs/9']['run_attempt'] = next_attempt
+            return dict(extra, id=name, repo=repo, sha=sha, verdict='pass', suite_observation=observation)
+
+        def invoke():
+            try:
+                return cb.main(['run', '--offline', '--trusted-suite', str(suite), '--verify-job', '7', str(checkout)])
+            except SystemExit as error:
+                return error.code
+
+        with mock.patch.multiple(cb, incus_group_exec=mock.DEFAULT, gh=self.gh, app_token=lambda *a: 'app',
+                                 admit_or_wait=mock.DEFAULT, sizing=lambda *a: (0, ()), job=observed):
+            code, _ = quiet(invoke)
+        return code, head, tree
+
+    def test_a_host_observed_suite_publishes_for_the_selected_actions_job_and_tree(self):
+        code, head, tree = self.run_associated_suite()
+        self.assertEqual(code, 0)
+        [(path, check)] = self.posted
+        self.assertEqual((path, check['head_sha'], check['external_id'], check['conclusion']),
+                         ('repos/me/app/check-runs', head, tree, 'success'))
+        self.assertEqual(check['name'], 'coldbox verify (host suite)')
+        evidence = json.loads(check['output']['text'])
+        self.assertEqual((evidence['verify_job']['id'], evidence['verify_job']['run_attempt']), (7, 1))
+        self.assertEqual(evidence['suite_observation']['tests_ran'], 1)
+
+    def test_an_observation_for_a_different_suite_posts_a_failure_with_a_cause(self):
+        code, _, _ = self.run_associated_suite(suite_sha256='9' * 64)
+        self.assertEqual(code, 1)
+        [(_, check)] = self.posted
+        self.assertEqual((check['conclusion'], check['output']['summary']),
+                         ('failure', 'the host suite observation does not match the selected suite'))
+
+    def test_an_observation_with_unknown_provenance_posts_a_failure_with_a_cause(self):
+        code, _, _ = self.run_associated_suite(schema=None)
+        self.assertEqual(code, 1)
+        [(_, check)] = self.posted
+        self.assertEqual((check['conclusion'], check['output']['summary']),
+                         ('failure', 'the host suite observation has unknown provenance'))
+
+    def test_an_observation_for_a_different_revision_posts_a_failure_with_a_cause(self):
+        code, _, _ = self.run_associated_suite(tree='9' * 40)
+        self.assertEqual(code, 1)
+        [(_, check)] = self.posted
+        self.assertEqual((check['conclusion'], check['output']['summary']),
+                         ('failure', 'the host suite observation does not match the selected revision'))
+
+    def test_an_observation_with_no_test_execution_cannot_pass(self):
+        code, _, _ = self.run_associated_suite(tests_ran=0)
+        self.assertEqual(code, 1)
+        [(_, check)] = self.posted
+        self.assertEqual((check['conclusion'], check['output']['summary']),
+                         ('failure', 'the host suite observation recorded no executed tests'))
+
+    def test_a_legacy_success_cannot_satisfy_the_host_suite_check(self):
+        code, head, tree = self.run_associated_suite(result='FAIL')
+        self.assertEqual(code, 1)
+        self.publish(self.receipt(coldverify=dict(result='PASS', commit=head, tree=tree)))
+        self.assertEqual([(check['head_sha'], check['name'], check['conclusion']) for _, check in self.posted],
+                         [(head, 'coldbox verify (host suite)', 'failure'), (head, 'coldbox verify', 'success')])
+
+    def test_a_successful_suite_cannot_publish_success_for_a_superseded_attempt(self):
+        code, _, _ = self.run_associated_suite(next_attempt=2)
+        self.assertEqual(code, 1)
+        [(_, check)] = self.posted
+        self.assertEqual((check['conclusion'], check['output']['summary']),
+                         ('failure', 'the GitHub verify job attempt or head changed before publication'))
+
+    def test_a_pass_receipt_from_the_base_ci_config_posts_success_bound_to_the_head_tree(self):
+        self.assertEqual(self.check(self.receipt()), ('success', f"ColdVerify PASS for head tree {'d' * 40}"))
+        self.assertEqual(self.posted[0][1]['output']['title'], 'PASS')
+
+    def test_the_check_is_bound_to_the_head_commits_tree_not_the_commit_sha(self):
+        self.api[f'repos/me/app/git/trees/{self.HEAD}'] = self.tree(self.HEAD)
+        self.publish(self.receipt())
+        self.assertEqual(self.posted[0][1]['external_id'], 'd' * 40)
+        self.assertNotEqual(self.posted[0][1]['external_id'], self.HEAD)
+
+    def test_a_receipt_on_the_head_commit_itself_also_counts(self):
+        receipt = self.receipt(coldverify=dict(result='PASS', reason='ok', commit=self.HEAD, tree='d' * 40))
+        self.assertEqual(self.check(receipt)[0], 'success')
+
+    def test_a_job_without_a_github_runner_id_cannot_publish_success(self):
+        del self.api['repos/me/app/actions/jobs/7']['runner_id']
+        self.assertEqual(self.check(self.receipt()),
+                         ('failure', 'GitHub did not report the runner ID for this verify job'))
+
+    def test_a_host_receipt_without_a_runner_id_cannot_publish_success(self):
+        self.assertEqual(self.check(self.receipt(runner_id=None)),
+                         ('failure', 'the host receipt did not record a registered runner ID'))
+
+    def test_a_job_for_another_runner_id_cannot_publish_success(self):
+        self.api['repos/me/app/actions/jobs/7']['runner_id'] = 28
+        self.assertEqual(self.check(self.receipt()),
+                         ('failure', 'the GitHub verify job ran on a different runner ID'))
+
+    def test_a_job_for_another_head_cannot_publish_success(self):
+        self.api['repos/me/app/actions/jobs/7']['head_sha'] = '9' * 40
+        self.assertEqual(self.check(self.receipt()),
+                         ('failure', 'the GitHub verify job head does not match the workflow run head'))
+
+    def test_a_job_that_github_reports_as_failed_cannot_publish_success(self):
+        self.api['repos/me/app/actions/jobs/7']['conclusion'] = 'failure'
+        self.assertEqual(self.check(self.receipt()),
+                         ('failure', 'GitHub did not report a successful verify job (completed, failure)'))
+
+    def test_a_pass_receipt_for_another_tree_cannot_publish_success(self):
+        receipt = self.receipt(coldverify=dict(result='PASS', reason='ok', commit=self.MERGE, tree='9' * 40))
+        self.assertEqual(self.check(receipt),
+                         ('failure', 'the ColdVerify receipt tree does not match its commit'))
+
+    def test_a_pass_receipt_without_a_tree_cannot_publish_success(self):
+        receipt = self.receipt(coldverify=dict(result='PASS', reason='ok', commit=self.HEAD))
+        self.assertEqual(self.check(receipt),
+                         ('failure', 'the ColdVerify receipt tree could not be verified against its commit'))
+
+    def test_a_pr_that_changes_its_workflows_gets_failure_saying_so(self):
+        self.api[f"repos/me/app/git/trees/{'d' * 40}"] = self.tree('d' * 40, workflows='9' * 40)
+        conclusion, summary = self.check(self.receipt())
+        self.assertEqual(conclusion, 'failure')
+        self.assertIn("the PR changes .github, so this job did not run the base branch's CI config", summary)
+
+    def test_a_pr_that_adds_coldbox_toml_gets_failure(self):
+        base = self.api[f'repos/me/app/git/trees/{self.BASE}']
+        base['tree'] = [item for item in base['tree'] if item['path'] != 'coldbox.toml']
+        conclusion, summary = self.check(self.receipt())
+        self.assertEqual(conclusion, 'failure')
+        self.assertIn('the PR changes coldbox.toml', summary)
+
+    def test_a_missing_receipt_gets_a_failure_that_says_it_is_missing(self):
+        conclusion, summary = self.check(self.receipt(coldverify=None))
+        self.assertEqual(conclusion, 'failure')
+        self.assertIn('the verify job left no ColdVerify receipt at .cold/verify-receipt.json', summary)
+        self.assertIn('strict ColdVerify must run inside the verify job', summary)
+
+    def test_a_job_cut_short_gets_a_failure_naming_why(self):
+        conclusion, summary = self.check(self.receipt(verdict='incomplete', cause='ttl', error='TTL reached'))
+        self.assertEqual(conclusion, 'failure')
+        self.assertIn('the Coldbox job ended incomplete (ttl)', summary)
+
+    def test_a_coldverify_fail_or_incomplete_is_failure_with_its_reason(self):
+        receipt = self.receipt(coldverify=dict(result='INCOMPLETE', reason='no repro', commit=self.MERGE))
+        self.assertEqual(self.check(receipt), ('failure', 'ColdVerify INCOMPLETE: no repro'))
+
+    def test_a_receipt_for_another_commit_is_failure(self):
+        other = '3' * 40
+        self.api[f'repos/me/app/git/commits/{other}'] = dict(parents=[dict(sha=self.BASE), dict(sha='4' * 40)])
+        for commit in (other, '5' * 40, None, 'HEAD'):
+            self.posted.clear()
+            receipt = self.receipt(coldverify=dict(result='PASS', reason='ok', commit=commit))
+            conclusion, summary = self.check(receipt)
+            self.assertEqual(conclusion, 'failure')
+            self.assertIn(f'the ColdVerify receipt is for commit {commit}, not the head', summary)
+
+    def test_every_reason_is_listed(self):
+        self.api['repos/me/app/actions/runs/9']['pull_requests'] = []
+        conclusion, summary = self.check(self.receipt(verdict='fail', coldverify=None))
+        self.assertEqual(conclusion, 'failure')
+        self.assertEqual(summary.count('; '), 2)
+        self.assertIn('GitHub lists no pull request for this run', summary)
+
+    def test_nothing_is_posted_for_jobs_that_are_not_a_pull_request_verify_job(self):
+        cases = [('repos/me/app/actions/jobs/7', 'name', 'lint'),
+                 ('repos/me/app/actions/jobs/7', 'runner_name', 'cbx-other'),
+                 ('repos/me/app/actions/runs/9', 'event', 'push'),
+                 ('repos/me/app/actions/runs/9', 'path', '.github/workflows/other.yml')]
+        for path, key, value in cases:
+            self.setUp()
+            self.api[path][key] = value
+            self.publish(self.receipt())
+            self.assertEqual(self.posted, [], (path, key, value))
+
+    def test_a_dynamic_run_path_with_a_ref_still_counts(self):
+        self.api['repos/me/app/actions/runs/9']['path'] = '.github/workflows/verify.yml@refs/pull/3/merge'
+        self.assertEqual(self.check(self.receipt())[0], 'success')
+
+    def test_a_repo_the_host_does_not_serve_is_never_asked_about(self):
+        log = self.publish(self.receipt(repo='other/app'))
+        self.assertEqual(self.posted, [])
+        self.assertIn('could not tell which repository verify job cbx-1 ran for', log)
+
+    def test_an_org_target_serves_its_own_repos(self):
+        self.publish(self.receipt(), target='me')
+        self.assertEqual(self.posted[0][1]['conclusion'], 'success')
+        self.posted.clear()
+        self.assertIn('could not tell', self.publish(self.receipt(), target='you'))
+        self.assertEqual(self.posted, [])
+
+    def test_a_verify_job_with_no_job_record_is_found_by_its_runner_name(self):
+        self.api['repos/me/app/actions/runs?event=pull_request&per_page=100'] = dict(workflow_runs=[
+            dict(id=8, run_attempt=1, updated_at='2026-11-13T09:00:00Z'),
+            dict(id=9, run_attempt=2, updated_at='2026-11-13T10:05:00Z')])
+        self.api['repos/me/app/actions/runs/9/attempts/2/jobs?per_page=100&page=1'] = dict(jobs=[
+            dict(name='lint', runner_name='cbx-2'), self.api['repos/me/app/actions/jobs/7']])
+        del self.api['repos/me/app/actions/jobs/7']
+        self.assertEqual(self.check(self.receipt(github=None, coldverify=None))[0], 'failure')
+        self.assertIn('left no ColdVerify receipt', self.posted[0][1]['output']['summary'])
+
+    def test_a_verify_job_github_does_not_list_is_logged_not_raised(self):
+        self.api['repos/me/app/actions/runs?event=pull_request&per_page=100'] = dict(workflow_runs=[
+            dict(id=8, run_attempt=1, updated_at='2026-11-13T09:00:00Z')])
+        self.assertIn('coldbox verify not posted for cbx-1: GitHub lists no pull request job that ran on cbx-1',
+                      self.publish(self.receipt(github=None)))
+        self.assertEqual(self.posted, [])
+
+    def test_an_api_error_or_a_job_that_is_not_verify_is_logged_or_skipped(self):
+        self.assertEqual(self.publish(self.receipt(job_name='lint', github={})), '')
+        del self.api['repos/me/app/actions/runs/9']
+        self.assertIn('coldbox verify not posted for cbx-1: GET repos/me/app/actions/runs/9: HTTP 404',
+                      self.publish(self.receipt()))
+        self.assertEqual(self.posted, [])
+
+    def test_serve_posts_the_check_for_the_job_it_just_ran(self):
+        handler = cb.signal.getsignal(cb.signal.SIGTERM)
+        self.addCleanup(cb.signal.signal, cb.signal.SIGTERM, handler)
+        args = cb.argparse.Namespace(target='me/app', slots=1, ttl=60, allow_public=False, once=True, worker=False,
+                                     idle=0, name='cbx-1', size='default')
+        receipt, state = self.receipt(), tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        with mock.patch.multiple(cb, guard=lambda *a: None, admit=mock.DEFAULT, cache_folder=lambda *a: None,
+                                 STATE=Path(state.name), runner_admission=lambda *a: dict(host='h'),
+                                 job=lambda *a, **k: receipt,
+                                 gh=lambda *a, **k: {'runner': {'id': 7}, 'encoded_jit_config': 'c'}), \
+                mock.patch.object(cb, 'publish_verify') as publish:
+            quiet(cb.serve, args)
+        publish.assert_called_once_with('me/app', 'cbx-1', receipt)
+
+    def test_completed_verify_job_posts_the_host_receipt_on_its_head(self):
+        tree = 'd' * 40
+        run = self.api['repos/me/app/actions/runs/9']
+        run.update(run_attempt=1, head_repository=dict(full_name='me/app'))
+        run['pull_requests'][0]['head'] = dict(sha=self.HEAD)
+        self.api['repos/me/app/actions/jobs/7']['run_attempt'] = 1
+        cases = ((0, 'PASS', 'success', self.HEAD), (1, 'FAIL', 'failure', self.HEAD),
+                 (2, 'INCOMPLETE', 'failure', self.HEAD), (0, 'PASS', 'success', self.BASE))
+        for code, verdict, conclusion, payload_head in cases:
+            with self.subTest(verdict=verdict, payload_head=payload_head), tempfile.TemporaryDirectory() as directory:
+                self.posted.clear()
+                body = dict(name='coldverify receipt', head_sha=payload_head, external_id=tree, status='completed',
+                            conclusion=conclusion, output=dict(title=f'{verdict} for tree {tree}', summary='host proof',
+                                                               text=json.dumps(dict(result=verdict))))
+                receipt = self.receipt(mode='runner', vm=dict(destroyed=True), verification=dict(state='pending'))
+                state = Path(directory)
+                (state / 'receipts').mkdir()
+                cli = subprocess.CompletedProcess([], code, stdout=json.dumps(body))
+                receipt['coldverify'] = None
+
+                def launch(argv, **options):
+                    self.assertTrue(options['start_new_session'])
+                    cb.publish_coldverify(*json.loads(argv[-1]))
+                    return mock.Mock()
+
+                with mock.patch.dict(os.environ, COLDBOX_COLDVERIFY_HOST='verifier'), \
+                        mock.patch.object(cb, 'STATE', state), \
+                        mock.patch.object(cb, 'COLDVERIFY_CHILDREN', [], create=True), \
+                        mock.patch.object(cb, 'gh', wraps=self.gh) as gh, \
+                        mock.patch.object(cb.subprocess, 'Popen', side_effect=launch) as child, \
+                        mock.patch.object(cb, 'run_coldverify', return_value=cli, create=True) as invoke:
+                    quiet(cb.publish_verify, 'me/app', 'cbx-1', receipt)
+                child.assert_called_once()
+                self.assertEqual(self.posted[0][1]['conclusion'], 'failure')
+                if payload_head == self.HEAD:
+                    self.assertEqual(self.posted[1:], [('repos/me/app/check-runs', body)])
+                    gh.assert_any_call('-X', 'POST', 'repos/me/app/check-runs', body=body, _retries=[0], _app_only=True)
+                else:
+                    self.assertEqual(self.posted[1:], [])
+                invoke.assert_called_once_with('verifier', 'me/app', 3, self.BASE, self.HEAD, tree)
+
+    def test_runner_drain_waits_for_the_receipt_worker(self):
+        for signum in (cb.signal.SIGTERM, cb.signal.SIGUSR1):
+            self.addCleanup(cb.signal.signal, signum, cb.signal.getsignal(signum))
+        child = mock.Mock()
+
+        def worker(args, primary):
+            cb.COLDVERIFY_CHILDREN.append(child)
+            cb.signal.raise_signal(cb.signal.SIGTERM)
+
+        args = cb.argparse.Namespace(worker=True, once=True, slots=1)
+        with mock.patch.multiple(cb, COLDVERIFY_CHILDREN=[], ACTIVE_LOG=None, serve_worker=worker,
+                                 ci_host=lambda: (None, True)), self.assertRaises(SystemExit) as stopped:
+            cb.serve(args)
+        self.assertEqual(stopped.exception.code, 143)
+        child.wait.assert_called_once_with()
+
+    def test_a_manifest_that_returns_a_verdict_starts_no_suite(self):
+        reply = subprocess.CompletedProcess([], 2, stdout=b'incomplete check payload')
+        with mock.patch.object(cb.subprocess, 'run', return_value=reply) as transport, \
+                mock.patch.object(cb, 'repo_token') as token:
+            result = cb.run_coldverify('verifier', 'me/app', 3, self.BASE, self.HEAD, 'd' * 40)
+        self.assertEqual((result.returncode, result.stdout), (2, b'incomplete check payload'))
+        self.assertEqual(transport.call_args.args[0][-1], 'manifest')
+        transport.assert_called_once()
+        token.assert_not_called()
+
+    def test_host_receipt_uses_fresh_offline_runs_and_sends_their_observations(self):
+        source = git_repo({'test_app.py': 'base'})
+        base = cb.git(source, 'rev-parse', 'HEAD').decode().strip()
+        (source / 'test_app.py').write_text('head')
+        cb.git(source, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qam', 'head')
+        head, tree = cb.git(source, 'rev-parse', 'HEAD', 'HEAD^{tree}').decode().splitlines()
+        manifest = dict(base=base, proof=[dict(name='test_app.py::App.test_change', argv=['proof'])],
+                        suite=[dict(name='test_app.py', argv=['suite'])])
+        subprocess_run = subprocess.run
+        observed = []
+        sent = []
+
+        def execute(command, **options):
+            if command[0] == 'ssh':
+                sent.append(command[-1])
+                self.assertEqual(command[-7:-1], ['verifier', 'host-receipt', 'me/app', '3', base, head])
+                if command[-1] == 'manifest':
+                    return subprocess.CompletedProcess(command, 0, json.dumps(manifest).encode())
+                self.assertEqual(json.loads(options['input']), dict(base=observed[0], head=observed[1]))
+                return subprocess.CompletedProcess(command, 0, b'check payload')
+            if command[0] == 'git' and 'fetch' in command:
+                return subprocess_run(command[:-3] + [str(source), base, head], **options)
+            return subprocess_run(command, **options)
+
+        def observe(mode, name, ttl, command, *, sha, archive, offline, extra, **options):
+            self.assertTrue(offline)
+            self.assertEqual(archive, cb.git(source, 'archive', '--format=tar', sha))
+            observation = extra['suite_observation']
+            key, codes = ('base_exit', (1, 0)) if sha == base else ('head_exit', (0, 0))
+            for row, code in zip(observation['tests'], codes):
+                row[key] = code
+            receipt = dict(id=name, sha=sha, verdict='fail' if sha == base else 'pass', vm=dict(destroyed=True), **extra)
+            observed.append(receipt)
+            return receipt
+
+        with mock.patch.multiple(cb, repo_token=lambda _: 'contents-token', admit_or_wait=mock.DEFAULT,
+                                 sizing=lambda *a: (None, ()), job=observe), \
+                mock.patch.object(cb.subprocess, 'run', execute):
+            result = cb.run_coldverify('verifier', 'me/app', 3, base, head, tree)
+        self.assertEqual(result.stdout, b'check payload')
+        self.assertEqual(sent, ['manifest', 'receipt'])
+        self.assertEqual([receipt['sha'] for receipt in observed], [base, head])
+        self.assertNotEqual(observed[0]['id'], observed[1]['id'])
+        self.assertEqual(observed[1]['suite_observation']['tests'], [
+            dict(name='test_app.py::App.test_change', group='proof', base_exit=1, head_exit=0),
+            dict(name='test_app.py', group='suite', base_exit=0, head_exit=0),
+        ])
+
+    def host_receipt_replay(self, change=None, *, manifest_claim=True):
+        source = git_repo({'test_app.py': 'base'})
+        base = cb.git(source, 'rev-parse', 'HEAD').decode().strip()
+        (source / 'test_app.py').write_text('head')
+        cb.git(source, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qam', 'head')
+        head, tree = cb.git(source, 'rev-parse', 'HEAD', 'HEAD^{tree}').decode().splitlines()
+        claim = 'This change fixes the test.'
+        suite = dict(base=base, proof=[dict(name='test_app.py::App.test_change', argv=['proof'])],
+                     suite=[dict(name='test_app.py', argv=['suite'])])
+        if manifest_claim:
+            suite['claim'] = dict(sha256=hashlib.sha256(claim.encode()).hexdigest(), builders=['builder'])
+        manifest = json.dumps(suite).encode()
+        recipe, environment = hashlib.sha256(manifest).hexdigest(), '3' * 64
+        payload = dict(result='PASS', commit=head, tree=tree, pull_request=3, claim=claim, builders=['builder'],
+                       command=['coldverify', '--host-receipt', '3', base, head],
+                       repro=dict(base=base, head=head, backend='coldbox'),
+                       risk=dict(tier='normal', matched=[], signoff=None),
+                       fingerprint=dict(tree=tree, recipe=recipe, environment=None))
+        check = dict(name='coldverify receipt', head_sha=head, external_id=tree, status='completed',
+                     conclusion='success', output=dict(title='PASS', summary='Host proof', text=json.dumps(payload)))
+        prior = json.loads(json.dumps(payload))
+        prior['fingerprint']['environment'] = environment
+        old = dict(check, id=41, app=dict(id=5687456))
+        if change:
+            change(old, prior)
+        old['output'] = dict(check['output'], text=json.dumps(prior))
+        self.api.update({
+            'repos/me/app/actions/runs/9': dict(head_sha=head, run_attempt=2),
+            f'repos/me/app/commits/{head}/check-runs?check_name=coldverify+receipt&app_id=5687456&filter=all&per_page=100&page=1':
+                dict(check_runs=[old]),
+        })
+        subprocess_run = subprocess.run
+        invocations = []
+
+        def execute(command, **options):
+            if command[0] == 'ssh':
+                invocations.append(command[-1])
+                output = manifest if command[-1] == 'manifest' else json.dumps(check).encode()
+                return subprocess.CompletedProcess(command, 0, output)
+            if command[0] == 'git' and 'fetch' in command:
+                return subprocess_run(command[:-3] + [str(source), base, head], **options)
+            return subprocess_run(command, **options)
+
+        def suite(*args):
+            invocations.extend(['base VM', 'head VM'])
+            return (dict(vm=dict(destroyed=True)),) * 2
+
+        with mock.patch.multiple(cb, gh=self.gh, repo_token=lambda _: 'contents-token',
+                                 github_app_id=lambda: '5687456', run_paired_trusted_suite=suite), \
+                mock.patch.object(cb, 'coldverify_environment', return_value=environment, create=True), \
+                mock.patch.object(cb.subprocess, 'run', execute):
+            _, self.replay_log = quiet(cb.publish_coldverify, 'verifier', 'me/app', 9, 2, 3, base, head, tree)
+        [(_, posted)] = self.posted
+        return posted, invocations
+
+    def test_unchanged_normal_risk_host_receipt_reuses_a_trusted_pass(self):
+        posted, invocations = self.host_receipt_replay()
+        self.assertEqual(invocations, ['manifest'])
+        self.assertEqual(posted['conclusion'], 'success')
+        self.assertEqual(posted['details_url'], 'https://github.com/me/app/runs/41')
+        self.assertIn(posted['details_url'], posted['output']['summary'])
+
+    def test_host_receipt_runs_fresh_when_a_reuse_input_does_not_match(self):
+        for change in (
+                lambda check, prior: check['app'].update(id=15368),
+                lambda check, prior: check.update(conclusion='failure'),
+                lambda check, prior: check.update(external_id='1' * 40),
+                lambda check, prior: prior['repro'].update(base='2' * 40),
+                lambda check, prior: prior['fingerprint'].update(recipe='4' * 64),
+                lambda check, prior: prior['fingerprint'].update(environment='5' * 64),
+                lambda check, prior: prior['fingerprint'].update(environment=None),
+                lambda check, prior: prior.update(claim=prior['claim'] + ' Changed claim.'),
+                lambda check, prior: prior.update(builders=['another-builder']),
+                lambda check, prior: prior['risk'].update(tier='high')):
+            with self.subTest(change=change.__code__.co_firstlineno):
+                self.posted.clear()
+                posted, invocations = self.host_receipt_replay(change)
+                self.assertEqual(invocations, ['manifest', 'base VM', 'head VM', 'receipt'])
+                self.assertNotIn('details_url', posted)
+                self.assertEqual(json.loads(posted['output']['text'])['fingerprint']['environment'], '3' * 64)
+
+    def test_host_receipt_reuses_when_the_manifest_claim_matches(self):
+        posted, invocations = self.host_receipt_replay()
+        self.assertEqual(invocations, ['manifest'])
+        self.assertEqual(posted['details_url'], 'https://github.com/me/app/runs/41')
+
+    def test_host_receipt_runs_fresh_when_the_manifest_claim_differs(self):
+        posted, invocations = self.host_receipt_replay(
+            lambda check, prior: prior.update(claim=prior['claim'] + ' Changed claim.'))
+        self.assertEqual(invocations, ['manifest', 'base VM', 'head VM', 'receipt'])
+        self.assertNotIn('details_url', posted)
+        self.assertEqual(json.loads(posted['output']['text'])['fingerprint']['environment'], '3' * 64)
+
+    def test_host_receipt_runs_fresh_and_logs_a_missing_manifest_claim(self):
+        posted, invocations = self.host_receipt_replay(manifest_claim=False)
+        self.assertIn('fresh: no trusted claim source', self.replay_log)
+        self.assertEqual(invocations, ['manifest', 'base VM', 'head VM', 'receipt'])
+        self.assertNotIn('details_url', posted)
+
+    def test_a_runner_job_keeps_the_strict_receipt_for_the_check(self):
+        github = dict(repo='me/app', sha='abc', run_id='9', run_attempt='1')
+        strict = dict(result='PASS', commit=self.MERGE)
+
+        def pull(name, path):
+            return github if path.endswith('/job.json') else strict if path.endswith('/verify-receipt.json') else None
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.multiple(cb, STATE=Path(directory), boot=lambda *a: None, ic=lambda *a: None,
+                                    ic_exec=lambda *a, **kw: ['false' if a[1] == 'coldbox' else 'true'],
+                                    tee=lambda *a: 0, pull=pull, destroy=lambda name: True,
+                                    runner_admission=lambda *a: dict(host='h'), record_queue_wait=lambda *a: None):
+            receipt, _ = quiet(cb.job, 'runner', 'cbx-1', 60, ['true'], 'me/app')
+        self.assertEqual((receipt['coldverify']['result'], receipt['coldverify']['commit']), ('PASS', self.MERGE))
+
+    def test_runner_counts_the_strict_run_instead_of_a_nested_pytest_fixture(self):
+        for count, saved in ((3881, None), (0, None), (3881, 'old'), (3881, 'tracked')):
+            with self.subTest(count=count, saved=saved), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                fixture = root / 'junit' / '2562' / '0.xml'
+                fixture.parent.mkdir(parents=True)
+                fixture.write_text('<testsuite><testcase name="fixture"><skipped/></testcase></testsuite>')
+                checkout = root / 'app' / 'app'
+                strict = checkout / '.cold' / 'verify-receipt.json'
+                strict.parent.mkdir(parents=True)
+                strict.write_text(json.dumps(dict(result='PASS', commit=self.MERGE, run=dict(tests_ran=count))))
+                marker = root / 'started'
+                marker.touch()
+                os.utime(marker, (2, 2))
+                os.utime(strict, (1, 1) if saved == 'old' else (3, 3))
+                subprocess.run(['git', '-C', str(checkout), 'init', '-q'], check=True)
+                if saved == 'tracked':
+                    subprocess.run(['git', '-C', str(checkout), 'add', '-f', str(strict)], check=True)
+
+                def pull(name, path):
+                    if path.endswith('/job.json'):
+                        return dict(repo='me/app', sha=self.MERGE)
+                    if path == '/opt/actions-runner/_work/app/app/.cold/verify-receipt.json':
+                        return json.loads(strict.read_text())
+                    return None
+
+                def execute(name, *command, **kwargs):
+                    if command[:2] == ('coldbox', 'junit'):
+                        return [sys.executable, str(ROOT / 'coldbox'), 'junit', str(root / 'junit')]
+                    if command[:2] == ('bash', '-c'):
+                        return [*command[:4], str(checkout), command[-2], str(marker)]
+                    return ['true']
+
+                def runner(command, log, data=None):
+                    log.write(b'Job verify completed with result: Succeeded\n')
+                    log.flush()
+                    return 0
+
+                self.addCleanup(cb.CLEANUP.clear)
+                with mock.patch.multiple(cb, STATE=root, boot=lambda *a: None, ic=lambda *a: None, ic_exec=execute,
+                                         tee=runner, pull=pull, destroy=lambda name: True,
+                                         runner_admission=lambda *a: dict(host='h'), record_queue_wait=lambda *a: None):
+                    receipt, _ = quiet(cb.job, 'runner', 'cbx-1', 60, ['true'], 'me/app')
+                self.assertEqual((receipt['tests_ran'], receipt['tests_source'], receipt['verdict']),
+                                 (0, 'junit', 'incomplete') if saved else
+                                 (count, 'cold-verify', 'pass' if count else 'incomplete'))
+
+    def test_a_verify_job_cut_off_before_it_completed_keeps_its_name_and_is_not_idle(self):
+        def runner(command, out, data=None):
+            out.write(b'Running job: verify\n')
+            out.flush()
+            return 124
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.multiple(cb, STATE=Path(directory), boot=lambda *a: None, ic=lambda *a: None,
+                                    ic_exec=lambda *a, **kw: ['false' if a[1] == 'coldbox' else 'true'],
+                                    tee=runner, pull=lambda *a: None, destroy=lambda name: True,
+                                    runner_admission=lambda *a: dict(host='h')), \
+                mock.patch.object(cb.time, 'time', side_effect=itertools.count(0, 100)):
+            receipt, _ = quiet(cb.job, 'runner', 'cbx-1', 60, ['true'], 'me/app')
+        self.assertEqual((receipt['job_name'], receipt['error'], receipt['verdict']),
+                         ('verify', 'TTL reached', 'incomplete'))
+
+    def test_the_strict_receipt_is_read_from_the_runner_checkout(self):
+        guest = dict(result='PASS', reason='ok', commit=self.MERGE, tree='f' * 40, builders=['x'], pull_request=3,
+                     run={'big': 'x' * 100})
+        with mock.patch.object(cb, 'pull', return_value=guest) as pull:
+            found = cb.strict_receipt('cbx-1', 'me/app')
+        pull.assert_called_once_with('cbx-1', '/opt/actions-runner/_work/app/app/.cold/verify-receipt.json')
+        self.assertEqual(found, {key: guest[key] for key in cb.STRICT_FIELDS})
+        with mock.patch.object(cb, 'pull', side_effect=ValueError('bad json')):
+            self.assertIsNone(cb.strict_receipt('cbx-1', 'me/app'))
+        with mock.patch.object(cb, 'pull', return_value=[1]):
+            self.assertIsNone(cb.strict_receipt('cbx-1', 'me/app'))
+        with mock.patch.object(cb, 'pull') as pull:
+            self.assertIsNone(cb.strict_receipt('cbx-1', 'me/..'))
+        pull.assert_not_called()
 
 
 class QueueDuration(unittest.TestCase):
@@ -3160,7 +5524,7 @@ class HostCpuLoad(unittest.TestCase):
         samples = ['cpu 100 0 20 100 0 0 0 0 80 0\n',
                    'cpu 150 0 30 130 10 0 0 0 140 0\n']
         with mock.patch.object(cb.Path, 'read_text', side_effect=samples), \
-                mock.patch.object(cb.time, 'sleep'), mock.patch.object(cb.os, 'cpu_count', return_value=10):
+                mock.patch.object(cb.time, 'sleep'), mock.patch.object(cb, 'host_cpus', return_value=10):
             self.assertEqual(cb.host_cpu_load(), 7.0)
 
     def test_invalid_samples_fail_closed(self):
@@ -3169,13 +5533,13 @@ class HostCpuLoad(unittest.TestCase):
                         ('cpu 1 0 0 1 0 0 0 0\n', 'cpu 1 0 0 1 0 0 0 0\n'),
                         ('cpu 2 0 0 2 0 0 0 0\n', 'cpu 1 0 0 3 0 0 0 0\n')):
             with self.subTest(samples=samples), mock.patch.object(cb.Path, 'read_text', side_effect=samples), \
-                    mock.patch.object(cb.time, 'sleep'), mock.patch.object(cb.os, 'cpu_count', return_value=10), \
+                    mock.patch.object(cb.time, 'sleep'), mock.patch.object(cb, 'host_cpus', return_value=10), \
                     mock.patch.object(cb.os, 'getloadavg', return_value=(12, 0, 0)):
                 self.assertEqual(cb.host_cpu_load(), 12)
 
     def test_invalid_samples_use_cpu_count_when_raw_load_is_lower(self):
         with mock.patch.object(cb.Path, 'read_text', side_effect=OSError()), \
-                mock.patch.object(cb.os, 'cpu_count', return_value=10), \
+                mock.patch.object(cb, 'host_cpus', return_value=10), \
                 mock.patch.object(cb.os, 'getloadavg', return_value=(3, 0, 0)):
             self.assertEqual(cb.host_cpu_load(), 10)
 
@@ -3184,6 +5548,7 @@ class Autoscale(unittest.TestCase):
     def setUp(self):
         self.state = Path(tempfile.mkdtemp())
         self.started = []
+        self.real_storage_room = cb.storage_room
         test = self
 
         class Child:
@@ -3204,12 +5569,12 @@ class Autoscale(unittest.TestCase):
 
         for name, value in dict(STATE=self.state, registrations=lambda: [dict(active='active', slots=1, target='x/y')] * 3,
                                 vm_memory=lambda: 16 * GIB, host_vms=lambda: set(), query=lambda path: [],
-                                storage_refusal=lambda: None,
+                                storage_room=lambda workers: (100, None),
                                 host_memory=lambda field='MemTotal': (247 if field == 'MemTotal' else 210) * GIB).items():
             patcher = mock.patch.object(cb, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        for patcher in (mock.patch.object(cb.subprocess, 'Popen', Child), mock.patch.object(cb.os, 'cpu_count', lambda: 40),
+        for patcher in (mock.patch.object(cb.subprocess, 'Popen', Child), mock.patch.object(cb, 'host_cpus', lambda: 40),
                         mock.patch.object(cb.os, 'getloadavg', lambda: (7.0, 7.0, 7.0)),
                         mock.patch.object(cb, 'host_cpu_load', lambda: 7.0)):
             patcher.start()
@@ -3240,10 +5605,200 @@ class Autoscale(unittest.TestCase):
         log = quiet(cb.autoscale, FakeGitHub({'queued': [1]}, {1: queued_ago(600)}), self.args, [])[1]
         self.assertIn('oldest waited 600 s', log)
 
+    def test_a_direct_submission_waits_for_cpu_memory_and_disk_beside_mixed_bursts(self):
+        github = FakeGitHub({'queued': [1]}, {1: queued(1) + queued(1, ('self-hosted', 'coldbox-large'))})
+        cpu, available, used = 34, 210, 10
+        pids = iter((101, 102))
+        ready = self.state / 'ready'
+        ready.mkdir()
+        receipts = self.state / 'receipts'
+        submissions = receipts / 'submissions'
+        submissions.mkdir(parents=True)
+        request = dict(id='cbx-1-direct', repo='me/direct', sha=SHA, deadline=time.time() + 600)
+        queue = submissions / 'queue.json'
+        cb.write_json(queue, [request])
+        args = argparse.Namespace(path=None, command=[], offline=False, name=request['id'], ttl=600,
+                                  repo=request['repo'], sha=SHA, receipts=receipts, memory=None, cpus=None)
+
+        def query(path):
+            if path == f'/1.0/storage-pools/{cb.POOL}/resources':
+                return dict(space=dict(total=200 * GIB, used=used * GIB))
+            return []
+
+        retries = iter(((7, 46, 90, False), (7, 210, 141, False), (7, 210, 90, True)))
+        live, exited = set(), set()
+
+        def wait(_):
+            nonlocal cpu, available, used
+            self.assertEqual(json.loads(queue.read_text()), [request])
+            self.assertEqual({w.name for w in cb.live_workers(self.state / 'workers')}, live)
+            cpu, available, used, finish = next(retries)
+            if finish:
+                finished = bursts[0]
+                live.remove(finished.name)
+                exited.add(str(finished.pid))
+                finished.poll = lambda: 0
+                self.scale(FakeGitHub({}, {}), bursts)
+
+        child = cb.subprocess.Popen
+
+        def spawn(argv):
+            burst = child(argv)
+            burst.pid = next(pids)
+            return burst
+
+        with mock.patch.multiple(cb, process_start=lambda pid: None if str(pid) in exited else str(pid),
+                                 RESERVE=self.state / 'reserve',
+                                 vm_shape=lambda size: (32 * GIB, {}) if size == 'large' else (None, {}),
+                                 host_cpu_load=lambda: cpu, host_vms=lambda: set(live),
+                                 host_memory=lambda field='MemTotal': (247 if field == 'MemTotal' else available) * GIB,
+                                 storage_room=self.real_storage_room, query=query, vm_disk=lambda: 40 * GIB,
+                                 submission_worker=lambda path: True, stop_on_signals=lambda: None,
+                                 repo_token=lambda repo: None), \
+                mock.patch.object(cb, 'job', return_value={'verdict': 'pass'}), \
+                mock.patch.object(cb.time, 'sleep', side_effect=wait):
+            with mock.patch.object(cb.subprocess, 'Popen', side_effect=spawn):
+                bursts = self.scale(github)
+            self.assertEqual([burst.size for burst in bursts], ['default', 'large'])
+            live.update(burst.name for burst in bursts)
+            self.assertEqual(self.real_storage_room(cb.live_workers(self.state / 'workers'))[0], 2)
+            for name in live:
+                (ready / name).touch()
+            def sample_cpu():
+                with (self.state / 'autoscale.lock').open() as lock, self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return cpu
+
+            cpu, used = 40, 90
+            with mock.patch.object(cb, 'host_cpu_load', side_effect=sample_cpu):
+                status, log = quiet(cb.run_repo, args)
+
+        self.assertEqual(status, 0)
+        self.assertIn('no room for a job VM: load', log)
+        self.assertIn('no room for a job VM: memory', log)
+        self.assertIn('below one 40 GiB root disk plus a 20 GiB reserve', log)
+        self.assertEqual(json.loads(queue.read_text()), [])
+        self.assertFalse((self.state / 'workers' / '101').exists())
+
+    def test_stall_witness_uses_the_same_pass_without_changing_dispatch(self):
+        runs_path = 'repos/me/app/actions/runs?status={}&per_page=100&page=1'
+        runner_path = 'repos/me/app/actions/runners?per_page=100&page=1'
+        calls = ['repos/me/app', *(runs_path.format(status) for status in ('queued', 'in_progress', 'pending')),
+                 'repos/me/app/actions/runs?per_page=100&page=1',
+                 'repos/me/app/actions/runs/41/jobs?per_page=100&page=1', runner_path]
+        spawned = 'cbx-1767226200-abcdef-ci'
+        expected = [
+            f'coldbox: stall witness size=default eligible=1 run=41 job=51 attempt=2 age_s=600'
+            f' queued=2 idle=0 result=dispatch room=1/6/2 stopping=0 storage=0 ramp=0 spawned={spawned}'
+            ' association=capacity-only',
+            'coldbox: stall witness size=large eligible=1 run=41 job=54 age_s=480'
+            ' queued=1 idle=0 result=dispatch room=0/6/2 stopping=0 storage=0 ramp=0 spawned=-'
+            ' association=capacity-only',
+            'coldbox: stall witness size=small eligible=1 run=41 job=53 age_s=540'
+            ' queued=1 idle=1 result=covered spawned=- association=capacity-only',
+        ]
+
+        def pass_once(scenario, journal):
+            jobs = [dict(id=51, run_attempt=2, created_at='2026-01-01T00:00:00Z', labels=['coldbox']),
+                    dict(id=52, created_at='2026-01-01T00:04:00Z', labels=['coldbox']),
+                    dict(id=True if scenario == 'bad-id' else 53, created_at='2026-01-01T00:01:00Z',
+                         labels=['coldbox-small']),
+                    dict(id=54, run_attempt='private-payload', created_at='2026-01-01T00:02:00Z',
+                         labels=['coldbox-large'], name='private-payload'),
+                    dict(id=55, created_at='2025-12-31T23:00:00Z', labels=['private-payload'])]
+            for row in jobs:
+                row['status'] = 'queued'
+            held_run = dict(id=42, event='pull_request', head_repository={'full_name': 'fork/app'})
+            idle = dict(name='cbx-1-idle', busy=False, status='online', labels=[{'name': 'coldbox-small'}])
+            github = FakeGitHub({'queued': [41, held_run]}, {41: jobs}, [idle])
+            read = github.get
+            popen = cb.subprocess.Popen
+            state = self.state / f'{scenario}-{journal}'
+            self.started.clear()
+            bursts, stdout, stderr = [], io.StringIO(), io.StringIO()
+
+            def get(path):
+                if scenario == 'listing-failure' and path == runner_path:
+                    raise RuntimeError('runner listing unavailable')
+                return read(path)
+
+            journal_gate = (mock.patch.object(cb, 'journal_stderr', return_value=True, create=True)
+                            if journal else contextlib.nullcontext())
+            with journal_gate, mock.patch.object(github, 'get', side_effect=get) as api, \
+                    mock.patch.object(github, 'forget_unused') as forget, \
+                    mock.patch.object(cb, 'STATE', state), \
+                    mock.patch.object(cb.time, 'time', return_value=1767226200), \
+                    mock.patch.object(cb, 'now_iso', return_value='2026-01-01T00:10:00+00:00'), \
+                    mock.patch.object(cb, 'new_id', return_value=spawned), \
+                    mock.patch.object(cb, 'vm_shape', return_value=(None, {})), \
+                    mock.patch.object(cb, 'host_setting', return_value=0), \
+                    mock.patch.object(cb, 'host_room', side_effect=[dict(ceiling=1, memory=6, load=2),
+                                                                   dict(ceiling=0, memory=6, load=2)]), \
+                    mock.patch.object(cb, 'host_load', return_value=(0, 0)), \
+                    mock.patch.dict(os.environ, {'COLDBOX_QUEUE_STALL_SECONDS': '300',
+                                                 'INVOCATION_ID': 'fixture', 'JOURNAL_STREAM': '0:0'}), \
+                    mock.patch.object(cb.subprocess, 'Popen', side_effect=(
+                        OSError('spawn failed') if scenario == 'spawn-failure' else popen)), \
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                try:
+                    result = cb.autoscale(github, self.args, bursts)
+                except (OSError, RuntimeError) as error:
+                    result = type(error), str(error)
+            self.assertEqual(api.call_args_list, [mock.call(path) for path in calls])
+            self.assertEqual(forget.call_count, int(scenario != 'listing-failure'))
+            self.assertEqual(stdout.getvalue(), '')
+            old, witness = [], []
+            for line in stderr.getvalue().splitlines(keepends=True):
+                (witness if line.startswith('coldbox: stall witness ') else old).append(line)
+            snapshot = (state / 'queues/me/app.json').read_bytes()
+            effects = result, ''.join(old), snapshot, list(self.started), [burst.name for burst in bursts]
+            return effects, [line.rstrip('\n') for line in witness]
+
+        for scenario, lines, result in (
+            ('dispatch', expected, cb.AUTOSCALE_SECONDS),
+            ('bad-id', expected[:2], cb.AUTOSCALE_SECONDS),
+            ('listing-failure', [], (RuntimeError, 'runner listing unavailable')),
+            ('spawn-failure', [], (OSError, 'spawn failed')),
+        ):
+            with self.subTest(scenario=scenario):
+                baseline, disabled_log = pass_once(scenario, False)
+                enabled, witness_log = pass_once(scenario, True)
+                self.assertEqual(enabled, baseline)
+                self.assertEqual(enabled[0], result)
+                self.assertEqual(disabled_log, [])
+                self.assertEqual(witness_log, lines)
+
+    def test_stall_witness_requires_verified_private_visibility(self):
+        self.args.allow_public = True
+        run = dict(id=41, event='push', actor={'login': 'me'})
+        idle = dict(name='cbx-1-idle', busy=False, status='online', labels=[{'name': 'coldbox'}])
+        expected = ('coldbox: stall witness size=default eligible=1 run=41 job=51 age_s=600'
+                    ' queued=1 idle=1 result=covered spawned=- association=capacity-only')
+        for visibility in ('private', 'public', 'internal', None):
+            log = io.StringIO()
+            repo = dict(full_name='me/app', owner={'type': 'User'})
+            if visibility is not None:
+                repo['visibility'] = visibility
+            with self.subTest(visibility=visibility), contextlib.redirect_stderr(log), \
+                    mock.patch.object(cb, 'journal_stderr', return_value=True, create=True), \
+                    mock.patch.object(cb.time, 'time', return_value=1767226200), \
+                    mock.patch.dict(os.environ, {'COLDBOX_QUEUE_STALL_SECONDS': '300'}):
+                job = dict(queued_ago(600)[0], id=51)
+                github = FakeGitHub({'queued': [run]}, {41: [job]}, [idle], repo=repo)
+                if visibility is None:
+                    with self.assertRaisesRegex(KeyError, 'visibility'):
+                        cb.autoscale(github, self.args, [])
+                else:
+                    self.assertEqual(cb.autoscale(github, self.args, []), cb.AUTOSCALE_SECONDS)
+                    self.assertIn('1 queued job(s); oldest waited 600 s', log.getvalue())
+                witnesses = [line for line in log.getvalue().splitlines() if line.startswith('coldbox: stall witness ')]
+                self.assertEqual(witnesses, [expected] if visibility == 'private' else [])
+        self.assertEqual(self.started, [])
+
     def test_a_pool_without_room_starts_no_burst_and_reports_no_vm_room(self):
         full = 'coldbox: storage pool coldbox has 30 GiB free, below one 40 GiB root disk plus a 10 GiB reserve'
         github = FakeGitHub({'queued': [1], 'in_progress': []}, {1: queued(3)})
-        with mock.patch.object(cb, 'storage_refusal', lambda: full):
+        with mock.patch.object(cb, 'storage_room', lambda workers: (0, full)):
             log = quiet(cb.autoscale, github, self.args, [])[1]
             self.assertEqual(cb.vm_room(), (0, 0))
         self.assertEqual(self.started, [])
@@ -3252,10 +5807,273 @@ class Autoscale(unittest.TestCase):
         self.assertGreater(cb.vm_room()[1], 0)
         self.assertEqual(len(self.scale(github)), 3)
 
+    def test_a_burst_batch_reserves_each_disk_and_counts_old_worker_records(self):
+        github = FakeGitHub({'queued': [1], 'in_progress': []}, {1: queued(3)})
+        folder = self.state / 'workers'
+        folder.mkdir()
+        (folder / str(os.getppid())).write_text(json.dumps(
+            ['me/other', cb.process_start(os.getppid()), 'cbx-legacy', 'once']))
+
+        def query(path):
+            if path == f'/1.0/storage-pools/{cb.POOL}/resources':
+                return dict(space=dict(total=100 * GIB, used=10 * GIB))
+            return []
+
+        with mock.patch.multiple(cb, storage_room=self.real_storage_room, query=query, vm_disk=lambda: 40 * GIB):
+            self.assertEqual(cb.vm_room(), (1, 2))
+            self.assertEqual(len(self.scale(github)), 1)
+            (self.state / 'ready').mkdir()
+            (self.state / 'ready' / 'cbx-legacy').touch()
+            self.assertEqual(cb.vm_room(), (2, 3))
+
+    def test_a_ceiling_blocked_queue_reclaims_the_oldest_idle_slot_and_starts_one_burst(self):
+        self.args.target = 'me/coldcleaner'
+        donor = 'me/coldverify'
+        now = cb.at('2026-11-18T01:05:41+00:00')
+        receipts, ready = self.state / 'receipts', self.state / 'ready'
+        receipts.mkdir()
+        ready.mkdir()
+        workers = []
+        vms = {f'cbx-1-other-{n}' for n in range(6)}
+        for name in vms:
+            (ready / name).touch()
+        for n, started in enumerate((now - 30, now - 210, now - 240)):
+            name = f'cbx-{int(started)}-burst'
+            workers.append((101 + n, 'me/other', name, 'burst'))
+            vms.add(name)
+            marker = ready / name
+            marker.touch()
+            os.utime(marker, (now - 10, now - 10))
+        runners = []
+        for runner_id, target, age, busy in (
+            (1, donor, 3600, False), (2, donor, 17406, False),
+            (3, donor, 18000, True), (4, self.args.target.upper(), 19000, False),
+        ):
+            name = f'cbx-{int(now - age)}-slot'
+            vms.add(name)
+            workers.append((200 + runner_id, target, name, 'base'))
+            (receipts / f'{name}.log').write_text('Listening for Jobs\n')
+            (receipts / f'{name}.json').write_text(json.dumps(dict(mode='runner', repo=target, runner_id=runner_id,
+                job_started_at=datetime.fromtimestamp(now - age, timezone.utc).isoformat())))
+            runners.append(dict(id=runner_id, name=name, busy=busy, status='offline' if runner_id == 4 else 'online'))
+
+        github = FakeGitHub({'queued': [1]}, {1: queued(8)}, runners[:3])
+        def get(path):
+            if path == 'repos/me/coldcleaner':
+                return dict(full_name=path.removeprefix('repos/'), visibility='private')
+            if path.casefold().startswith('repos/me/coldcleaner/actions/runners?'):
+                return dict(runners=[runners[3]])
+            return FakeGitHub.get(github, path)
+
+        events = []
+
+        def delete(*args, **kwargs):
+            with (self.state / 'autoscale.lock').open() as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            github.runners.remove(runners[1])
+            events.append(args)
+
+        def release(pid, sig):
+            self.assertFalse(self.started)
+            with (self.state / 'autoscale.lock').open() as lock, self.assertRaises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            events.append((pid, sig))
+            vms.remove(runners[1]['name'])
+
+        with mock.patch.multiple(cb, vm_memory=lambda: 12 * GIB,
+                                 host_memory=lambda field='MemTotal': (247 if field == 'MemTotal' else 216) * GIB,
+                                 host_cpu_load=lambda: 27.0, host_vms=lambda: set(vms),
+                                 process_start=lambda pid: str(pid), RESERVE=self.state / 'reserve'), \
+                mock.patch.object(cb.os, 'getloadavg', return_value=(27.0, 0, 0)), \
+                mock.patch.object(cb.time, 'time', return_value=now), \
+                mock.patch.object(cb, 'gh', side_effect=delete), mock.patch.object(cb.os, 'kill', side_effect=release), \
+                mock.patch.object(github, 'get', side_effect=get):
+            github.jobs[1] = queued_ago(*([1880] * 8))
+            for pid, target, name, kind in workers:
+                cb.note_worker(pid, target, name, kind)
+            bursts = []
+            _, log = quiet(cb.autoscale, github, self.args, bursts)
+
+        self.assertIn('8 queued job(s) and 0 idle runner(s) on me/coldcleaner', log)
+        self.assertEqual(events, [
+            ('-X', 'DELETE', 'repos/me/coldverify/actions/runners/2'),
+            (202, cb.signal.SIGUSR1),
+        ])
+        self.assertNotIn(runners[1]['name'], vms)
+        self.assertEqual([argv[2:5] for argv in self.started], [['serve', 'me/coldcleaner', '--worker']])
+        self.assertEqual(len(bursts), 1)
+
     def test_measured_host_cap_restricts_actual_burst_starts(self):
         (self.state / 'ramp-cap.json').write_text(json.dumps(dict(limit=2, expires=time.time()+60)))
         self.scale(FakeGitHub({'queued': [1], 'in_progress': []}, {1: queued(5)}))
         self.assertEqual(len(self.started), 2)
+
+    def reclaim_slot(self, runner_id):
+        worker = argparse.Namespace(pid=100 + runner_id, target='me/donor', name=f'cbx-{runner_id}-slot',
+                                    kind='base', writers=None, memory=None)
+        reserve = self.state / 'reserve'
+        reserve.write_text('37\n')
+        self.enterContext(mock.patch.object(cb, 'RESERVE', reserve))
+        self.enterContext(mock.patch.object(cb, 'process_start', side_effect=str))
+        cb.note_worker(worker.pid, worker.target, worker.name, worker.kind)
+        receipts = self.state / 'receipts'
+        receipts.mkdir(exist_ok=True)
+        (receipts / f'{worker.name}.json').write_text(json.dumps(dict(
+            mode='runner', repo=worker.target, runner_id=runner_id, job_started_at='2026-11-18T00:00:00+00:00')))
+        return worker, dict(id=runner_id, name=worker.name, busy=False, status='online')
+
+    def test_reclaim_leaves_the_donor_when_post_reclaim_room_is_zero(self):
+        worker, runner = self.reclaim_slot(2)
+        github = FakeGitHub({'queued': [1]}, {1: queued(1)}, [runner])
+
+        def wake(slot):
+            vms.remove(slot.name)
+            return True
+
+        ready = self.state / 'ready'
+        ready.mkdir()
+        marker = ready / worker.name
+        marker.touch()
+        os.utime(marker, (0, 0))
+        (self.state / 'receipts' / f'{worker.name}.log').write_text('Listening for Jobs\n')
+        for axis in ('ceiling', 'load', 'memory'):
+            vms = {worker.name}
+            cb.note_worker(worker.pid, worker.target, worker.name, worker.kind)
+            def memory(field='MemTotal'):
+                if field == 'MemTotal':
+                    return (16 if observed and axis == 'ceiling' else 247) * GIB
+                return (8 if observed and axis == 'memory' else 210) * GIB
+
+            def list_runners(path):
+                nonlocal observed
+                if path.startswith('repos/me/app/actions/runners?'):
+                    return dict(runners=[])
+                if path.startswith('repos/me/donor/actions/runners?'):
+                    observed = True
+                return FakeGitHub.get(github, path)
+
+            observed = False
+            with self.subTest(axis=axis), \
+                    mock.patch.object(cb, 'host_vms', side_effect=lambda: set(vms)), \
+                    mock.patch.object(cb.os, 'getloadavg', return_value=(0, 0, 0)), \
+                    mock.patch.object(cb, 'host_cpu_load', side_effect=lambda: 40 if observed and axis == 'load' else 0), \
+                    mock.patch.object(cb, 'host_memory', side_effect=memory), \
+                    mock.patch.object(github, 'get', side_effect=list_runners), \
+                    mock.patch.object(cb, 'gh') as delete, mock.patch.object(cb, 'wake_slot', side_effect=wake):
+                self.scale(github)
+                self.assertEqual(delete.call_count, 0)
+                self.assertEqual(vms, {worker.name})
+                self.assertEqual(self.started, [])
+
+    def test_reclaim_leaves_the_donor_if_disk_room_disappears_during_lookup(self):
+        worker, runner = self.reclaim_slot(2)
+        github = FakeGitHub({'queued': [1]}, {1: queued(1)}, [runner])
+        (self.state / 'receipts' / f'{worker.name}.log').write_text('Listening for Jobs\n')
+        used = 10
+        get = github.get
+
+        def lookup(path):
+            nonlocal used
+            if path.startswith('repos/me/app/actions/runners?'):
+                return dict(runners=[])
+            if path.startswith('repos/me/donor/actions/runners?'):
+                used = 51
+            return get(path)
+
+        def query(path):
+            if path == f'/1.0/storage-pools/{cb.POOL}/resources':
+                return dict(space=dict(total=100 * GIB, used=used * GIB))
+            return []
+
+        (self.state / 'ready').mkdir()
+        ready = self.state / 'ready' / worker.name
+        ready.touch()
+        os.utime(ready, (0, 0))
+        with mock.patch.multiple(cb, storage_room=self.real_storage_room, query=query, vm_disk=lambda: 40 * GIB,
+                                 host_vms=lambda: {worker.name}), \
+                mock.patch.object(github, 'get', side_effect=lookup), mock.patch.object(cb, 'gh') as delete, \
+                mock.patch.object(cb, 'wake_slot') as wake:
+            self.assertEqual(self.scale(github), [])
+        self.assertEqual(used, 51)
+        delete.assert_not_called()
+        wake.assert_not_called()
+
+    def test_only_one_supervisor_can_claim_a_donor(self):
+        worker, runner = self.reclaim_slot(2)
+        github = FakeGitHub({}, {}, [runner])
+        vms = {worker.name}
+
+        def delete(*args, **kwargs):
+            if request.call_count == 1:
+                self.assertIsNone(cb.reclaim(github, 'me/other', [worker], 16 * GIB, 16 * GIB))
+            else:
+                raise RuntimeError('runner already claimed')
+
+        def wake(slot):
+            vms.remove(slot.name)
+            return True
+
+        with mock.patch.object(cb, 'host_vms', side_effect=lambda: set(vms)), \
+                mock.patch.object(cb, 'gh', side_effect=delete) as request, \
+                mock.patch.object(cb, 'wake_slot', side_effect=wake):
+            self.assertEqual(cb.reclaim(github, self.args.target, [worker], 16 * GIB, 16 * GIB), worker)
+        request.assert_called_once_with('-X', 'DELETE', 'repos/me/donor/actions/runners/2', _retries=[0])
+
+    def test_a_busy_or_transient_runner_delete_refusal_leaves_the_slot_for_the_next_poll(self):
+        worker, runner = self.reclaim_slot(2)
+        github = FakeGitHub({}, {}, [runner])
+        for error in (RuntimeError('HTTP 422: Runner is still running a job'),
+                      cb.GitHubTransient('timed out'), OSError('connection failed')):
+            with self.subTest(error=type(error).__name__):
+                vms = {worker.name}
+
+                def wake_slot(slot):
+                    vms.remove(slot.name)
+                    return True
+
+                with mock.patch.object(cb, 'host_vms', return_value=vms), \
+                        mock.patch.object(cb, 'gh', side_effect=[error, None]) as delete, \
+                        mock.patch.object(cb, 'wake_slot', side_effect=wake_slot) as wake:
+                    self.assertIsNone(cb.reclaim(github, self.args.target, [worker], 12 * GIB, 12 * GIB))
+                    wake.assert_not_called()
+                    self.assertEqual(cb.reclaim(github, self.args.target, [worker], 12 * GIB, 12 * GIB), worker)
+                    wake.assert_called_once_with(worker)
+                expected = mock.call('-X', 'DELETE', 'repos/me/donor/actions/runners/2', _retries=[0])
+                self.assertEqual(delete.call_args_list, [expected, expected])
+
+    def test_an_orphaned_donor_blocks_reclaim_only_until_its_vm_goes_away(self):
+        orphan, _ = self.reclaim_slot(2)
+        worker, runner = self.reclaim_slot(3)
+        github = FakeGitHub({}, {}, [runner])
+        vms = {orphan.name, worker.name}
+
+        def wake_slot(slot):
+            vms.remove(slot.name)
+            return True
+
+        with mock.patch.object(cb, 'host_vms', return_value=vms), \
+                mock.patch.object(cb, 'gh') as delete, mock.patch.object(cb, 'wake_slot', side_effect=wake_slot) as wake:
+            self.assertIsNone(cb.reclaim(github, self.args.target, [worker], 12 * GIB, 12 * GIB))
+            delete.assert_not_called()
+            wake.assert_not_called()
+            vms.remove(orphan.name)
+            (self.state / 'workers' / str(orphan.pid)).unlink()
+            self.assertEqual(cb.reclaim(github, self.args.target, [worker], 12 * GIB, 12 * GIB), worker)
+        delete.assert_called_once_with('-X', 'DELETE', 'repos/me/donor/actions/runners/3', _retries=[0])
+        wake.assert_called_once_with(worker)
+
+    def test_a_skipped_wake_does_not_report_a_reclaimed_slot(self):
+        worker, runner = self.reclaim_slot(2)
+        github = FakeGitHub({}, {}, [runner])
+        record = self.state / 'workers' / str(worker.pid)
+        with mock.patch.object(cb, 'host_vms', return_value={worker.name}), \
+                mock.patch.object(cb, 'gh', side_effect=lambda *args, **kwargs: record.unlink()) as delete, \
+                mock.patch.object(cb.os, 'kill') as signal_worker, \
+                mock.patch.object(cb.time, 'sleep') as wait:
+            self.assertIsNone(cb.reclaim(github, self.args.target, [worker], 12 * GIB, 12 * GIB))
+        delete.assert_called_once_with('-X', 'DELETE', 'repos/me/donor/actions/runners/2', _retries=[0])
+        signal_worker.assert_not_called()
+        wait.assert_not_called()
 
     def test_backed_up_repo_gets_a_one_job_burst_runner_per_queued_job_beyond_idle_runners(self):
         idle = {'name': 'cbx-1-a', 'busy': False, 'status': 'online'}
@@ -3303,7 +6121,7 @@ class Autoscale(unittest.TestCase):
         self.assertEqual(log.getvalue(), 'coldbox: queue on me/app: 3 queued job(s); oldest waited 0 s\n'
                                          'coldbox: 3 queued job(s) and 0 idle runner(s) on me/app; oldest waited 0 s; started 0 burst '
                                          'runner(s); host has 0 busy and 0 warm job VM(s) and load 44.0 on 40 CPU '
-                                         "threads; raw load 44.0; booting 0; room {'ceiling': 13, 'memory': 11, 'load': -4}; "
+                                         "threads; raw load 44.0; booting 0; room {'ceiling': 13, 'memory': 11, 'load': -1}; "
                                          f'VM memory {16 * GIB}; stopping False; declined by load\n')
 
     def test_every_host_role_counts_raw_load(self):
@@ -3316,7 +6134,7 @@ class Autoscale(unittest.TestCase):
             self.assertEqual(len(self.started), 0)
 
     def test_a_cpu_starved_primary_starts_no_burst_though_its_cpu_sample_shows_idle_ticks(self):
-        for raw, started in ((105.6, 0), (59.0, 0), (34.0, 3)):
+        for raw, started in ((105.6, 0), (59.0, 0), (34.0, 2)):
             self.started.clear()
             with self.subTest(raw=raw), mock.patch.object(cb.os, 'getloadavg', return_value=(raw, 0, 0)), \
                     mock.patch.object(cb, 'host_cpu_load', return_value=31.0):
@@ -3332,7 +6150,9 @@ class Autoscale(unittest.TestCase):
         folder = self.state / 'workers'
         folder.mkdir()
         record = folder / str(os.getppid())
-        for name, expected in ((f'cbx-{int(time.time())}-b', 1), ('cbx-1-b', 2)):
+        (self.state / 'receipts').mkdir()
+        (self.state / 'receipts' / 'cbx-1-b.log').write_text('Listening for Jobs\n')
+        for name, expected in ((f'cbx-{int(time.time())}-b', 0), ('cbx-1-b', 1)):
             for leftover in folder.iterdir():
                 leftover.unlink()
             record.write_text(json.dumps(['other/repo', cb.process_start(os.getppid()), name, 'burst']))
@@ -3362,7 +6182,7 @@ class Autoscale(unittest.TestCase):
             with self.subTest(free=free), mock.patch.object(cb, 'live_workers', lambda folder: workers), \
                     mock.patch.object(cb, 'host_vms', lambda: {worker.name for worker in workers}), \
                     mock.patch.object(cb, 'vm_memory', lambda: 12 * GIB), \
-                    mock.patch.object(cb, 'host_cpu_load', lambda: 30.0), mock.patch.object(cb.os, 'cpu_count', lambda: 100), \
+                    mock.patch.object(cb, 'host_cpu_load', lambda: 30.0), mock.patch.object(cb, 'host_cpus', lambda: 100), \
                     mock.patch.object(cb, 'host_memory',
                                       lambda field='MemTotal': (247 if field == 'MemTotal' else free) * GIB):
                 self.assertEqual(cb.host_load(workers), (5, 2))
@@ -3378,7 +6198,7 @@ class Autoscale(unittest.TestCase):
         for worker in workers:
             (receipts / f'{worker.name}.log').write_text('')
         with mock.patch.object(cb, 'live_workers', lambda folder: workers), \
-                mock.patch.object(cb, 'vm_memory', lambda: 12 * GIB), mock.patch.object(cb.os, 'cpu_count', lambda: 100), \
+                mock.patch.object(cb, 'vm_memory', lambda: 12 * GIB), mock.patch.object(cb, 'host_cpus', lambda: 100), \
                 mock.patch.object(cb, 'host_memory', lambda field='MemTotal': (247 if field == 'MemTotal' else 196) * GIB):
             self.assertFalse(any(cb.starting(worker.name, time.time()) for worker in workers))
             self.scale(FakeGitHub({'queued': [1], 'in_progress': []}, {1: queued(5)}))
@@ -3425,7 +6245,7 @@ class Autoscale(unittest.TestCase):
     def test_every_job_vm_at_its_full_limit_leaves_the_floor_and_host_share_on_each_ci_host(self):
         for host, threads, total, vm in (('host-a', 40, 259615292 * 1024, 12 * GIB), ('host-b', 40, 259615292 * 1024, 16 * GIB),
                                          ('host-c', 24, 193434316 * 1024, 16 * GIB), ('host-d', 24, 193434292 * 1024, 16 * GIB)):
-            with self.subTest(host=host), mock.patch.object(cb.os, 'cpu_count', lambda: threads), \
+            with self.subTest(host=host), mock.patch.object(cb, 'host_cpus', lambda: threads), \
                     mock.patch.object(cb, 'host_memory', lambda field='MemTotal': total):
                 ceiling = cb.host_room([], vm, vm, 0, 0)['ceiling']
                 self.assertGreater(ceiling, 0)
@@ -3449,7 +6269,7 @@ class Autoscale(unittest.TestCase):
         guard.assert_not_called()
 
     def test_register_leaves_ceiling_room_for_one_large_vm_beside_every_slot(self):
-        with mock.patch.object(cb, 'host_memory', lambda field='MemTotal': 247 * GIB), mock.patch.object(cb.os, 'cpu_count', lambda: 100), \
+        with mock.patch.object(cb, 'host_memory', lambda field='MemTotal': 247 * GIB), mock.patch.object(cb, 'host_cpus', lambda: 100), \
                 mock.patch.object(cb, 'vm_memory', lambda: 12 * GIB), \
                 mock.patch.object(cb, 'registrations', lambda: []), \
                 mock.patch.object(cb, 'guard') as guard, mock.patch.object(cb, 'instance', lambda target: 'me-new'), \
@@ -3488,7 +6308,7 @@ class Autoscale(unittest.TestCase):
 
     def test_register_refuses_more_vms_than_cpu_threads(self):
         args = argparse.Namespace(target='me/new', slots=5, allow_public=False, allow_forks=False)
-        with mock.patch.object(cb.os, 'cpu_count', lambda: 4), \
+        with mock.patch.object(cb, 'host_cpus', lambda: 4), \
                 mock.patch.object(cb, 'host_memory', lambda field='MemTotal': 1024 * GIB), \
                 mock.patch.object(cb, 'guard') as guard, self.assertRaises(SystemExit) as refused:
             cb.register(args)
@@ -3582,11 +6402,10 @@ class Autoscale(unittest.TestCase):
         self.assertIn(['Environment', 'COLDBOX_ALLOW_PUBLIC=1'], [line.split('=', 1) for line in dropin.splitlines()])
         self.assertIn('Jobs triggered by me (write access) run at once', out)
 
-    def test_register_refuses_public_with_forks_and_never_takes_the_opt_in_from_the_environment(self):
-        args = argparse.Namespace(target='me/app', slots=1, allow_public=True, allow_forks=True)
-        with mock.patch.object(cb, 'guard') as guard, self.assertRaisesRegex(SystemExit, 'cannot be combined'):
-            cb.register(args)
-        guard.assert_not_called()
+    def test_there_is_no_fork_opt_in_and_register_never_takes_the_public_opt_in_from_the_environment(self):
+        for cmd in ('register', 'serve'):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                cb.main([cmd, 'me/app', '--allow-forks'])
         seen = {}
         with mock.patch.dict(os.environ, COLDBOX_ALLOW_PUBLIC='1'), mock.patch.object(cb, 'incus_group_exec'), \
                 mock.patch.object(cb, 'register', lambda a: seen.setdefault('register', a.allow_public)), \
@@ -3686,6 +6505,31 @@ class Autoscale(unittest.TestCase):
                 self.assertEqual(len(self.started), room)
                 self.assertEqual(cb.vm_room(), (busy, busy + room))
                 self.assertEqual(cb.admit('x/y', 'cbx-1-burst', 'once'), bool(room))
+
+    def test_quick_admissions_count_vms_still_booting_against_the_load(self):
+        workers = []
+        with mock.patch.object(cb, 'live_workers', lambda folder, prune=True: workers), \
+                mock.patch.object(cb.os, 'getloadavg', lambda: (26.0, 26.0, 26.0)):
+            for n in range(40):
+                name = f'cbx-1-b{n}'
+                if not cb.admit('x/y', name, 'once'):
+                    break
+                workers.append(argparse.Namespace(pid=100 + n, target='x/y', name=name, kind='once',
+                                                  writers=None, memory=None))
+            self.assertEqual(len(workers), 5)
+            (self.state / 'ready').mkdir()
+            for worker in workers:
+                (self.state / 'ready' / worker.name).touch()
+            self.assertFalse(cb.admit('x/y', 'cbx-1-next', 'once'))
+            for worker in workers:
+                os.utime(self.state / 'ready' / worker.name, (time.time() - cb.STARTING_SECONDS - 1,) * 2)
+            self.assertTrue(cb.admit('x/y', 'cbx-1-next', 'once'))
+
+    def test_one_pass_starts_only_the_bursts_the_idle_threads_hold(self):
+        with mock.patch.object(cb.os, 'getloadavg', lambda: (26.0, 26.0, 26.0)), \
+                mock.patch.object(cb, 'host_cpu_load', lambda: 26.0):
+            self.scale(FakeGitHub({'queued': [1], 'in_progress': []}, {1: queued(10)}))
+        self.assertEqual(len(self.started), 5)
 
     def test_warm_slots_past_the_busy_ceiling_start_while_real_ram_is_free(self):
         with mock.patch.object(cb, 'registrations', lambda: [dict(active='active', slots=20, target='x/y')]):
@@ -3885,6 +6729,143 @@ class Autoscale(unittest.TestCase):
                 cb.register(argparse.Namespace(target=target, slots=slots, allow_public=False, allow_forks=False))
             guard.assert_not_called()
 
+    def register_dropin(self, args):
+        commands = []
+        with mock.patch.dict(os.environ), mock.patch.object(cb, 'guard'), \
+                mock.patch.object(cb, 'instance', lambda target: 'me-new'), \
+                mock.patch.object(cb.subprocess, 'run', lambda command, **kw: commands.append((command, kw))):
+            code, output = quiet(cb.register, args)
+            personal = os.environ.get('COLDBOX_ALLOW_PERSONAL_LOGIN')
+        self.assertEqual(code, 0)
+        return next(kw['input'] for c, kw in commands if c[1] == 'tee'), output, personal
+
+    def test_register_without_slots_serves_on_demand_on_an_8_gib_host(self):
+        small = dict(host_memory=lambda field='MemTotal': 8 * GIB, vm_memory=lambda: 4 * GIB,
+                     host_cpus=lambda: 4, registrations=lambda: [])
+        with mock.patch.multiple(cb, **small):
+            with mock.patch.object(cb, 'guard'), self.assertRaises(SystemExit) as refused:
+                cb.register(argparse.Namespace(target='me/new', slots=1, allow_public=False, allow_forks=False))
+            self.assertIn('Lower --slots to at most 0', str(refused.exception))
+            dropin, output, _ = self.register_dropin(argparse.Namespace(target='me/new', slots=None,
+                                                                        allow_public=False, allow_forks=False))
+            self.assertIn('Environment=COLDBOX_SLOTS=0', dropin)
+            self.assertIn('burst only', output)
+            with self.assertRaises(SystemExit) as org:
+                cb.register(argparse.Namespace(target='myorg', slots=None, allow_public=False, allow_forks=False))
+            self.assertIn('Lower --slots to at most 0', str(org.exception))
+        dropin, _, _ = self.register_dropin(argparse.Namespace(target='me/new', slots=None, allow_public=False,
+                                                               allow_forks=False))
+        self.assertIn('Environment=COLDBOX_SLOTS=1', dropin)
+
+    def test_a_bare_register_keeps_an_already_registered_repos_slots_on_a_full_host(self):
+        registered = [dict(target='me/new', slots=1, configured=True, active='active'),
+                      dict(target='me/busy', slots=1, configured=True, active='active')]
+        full = dict(host_memory=lambda field='MemTotal': 8 * GIB, vm_memory=lambda: 4 * GIB,
+                    host_cpus=lambda: 4, registrations=lambda: registered)
+        with mock.patch.multiple(cb, **full):
+            dropin, output, _ = self.register_dropin(argparse.Namespace(target='me/new', slots=None,
+                                                                        allow_public=False, allow_forks=False))
+        self.assertIn('Environment=COLDBOX_SLOTS=1', dropin)
+        self.assertIn('1 job VM slot(s)', output)
+
+    def test_register_leaves_slots_unset_unless_given_even_when_given_the_old_default(self):
+        seen = []
+        with mock.patch.dict(os.environ, COLDBOX_SLOTS='3'), mock.patch.object(cb, 'incus_group_exec'), \
+                mock.patch.object(cb, 'register', lambda a: seen.append(a.slots)):
+            cb.main(['register', 'me/app'])
+            cb.main(['register', 'me/app', '--slots', '1'])
+        self.assertEqual(seen, [None, 1])
+
+    def test_register_records_the_personal_login_opt_in_only_when_asked(self):
+        args = argparse.Namespace(target='me/new', slots=0, allow_public=False, allow_forks=False)
+        with mock.patch.dict(os.environ, COLDBOX_ALLOW_PERSONAL_LOGIN='1'):
+            dropin, _, personal = self.register_dropin(args)
+        self.assertNotIn('COLDBOX_ALLOW_PERSONAL_LOGIN', dropin)
+        self.assertIsNone(personal)
+        args.allow_personal_login = True
+        dropin, _, personal = self.register_dropin(args)
+        self.assertIn(['Environment', 'COLDBOX_ALLOW_PERSONAL_LOGIN=1'], [line.split('=', 1) for line in dropin.splitlines()])
+        self.assertEqual(personal, '1')
+
+    def test_without_an_app_github_calls_refuse_the_personal_login_unless_opted_in(self):
+        calls = []
+        run = lambda command, **kw: calls.append(command) or argparse.Namespace(returncode=0, stdout='"personal"\n')
+        with mock.patch.object(cb, 'app_token', lambda *a, **k: None), mock.patch.object(cb.subprocess, 'run', run):
+            with mock.patch.dict(os.environ):
+                os.environ.pop('COLDBOX_ALLOW_PERSONAL_LOGIN', None)
+                for call in (lambda: cb.gh_env('repos/me/app'), lambda: cb.GitHub().get('repos/me/app'),
+                             lambda: cb.gh('repos/me/app')):
+                    with self.assertRaises(RuntimeError) as refused:
+                        call()
+                    self.assertIn('no GitHub App on this host', str(refused.exception))
+            self.assertEqual(calls, [])
+            with mock.patch.dict(os.environ, COLDBOX_ALLOW_PERSONAL_LOGIN='1'):
+                self.assertIsNone(cb.gh_env('repos/me/app'))
+                self.assertEqual(cb.gh('repos/me/app'), 'personal')
+        self.assertEqual(calls, [['gh', 'api', 'repos/me/app']])
+
+    def test_unregister_without_an_app_refuses_before_touching_the_service(self):
+        calls = []
+        with mock.patch.object(cb, 'app_token', lambda *a, **k: None), mock.patch.dict(os.environ), \
+                mock.patch.object(cb.subprocess, 'run', lambda command, **kw: calls.append(command)):
+            os.environ.pop('COLDBOX_ALLOW_PERSONAL_LOGIN', None)
+            with self.assertRaisesRegex(RuntimeError, 'no GitHub App on this host'):
+                cb.unregister(argparse.Namespace(target='me/app'))
+        self.assertEqual(calls, [])
+
+    def test_unregister_with_an_app_stops_the_service_before_asking_github(self):
+        events = []
+        tokens = iter(['early', 'fresh'])
+
+        def gh_env(path):
+            events.append('auth')
+            return {'GH_TOKEN': next(tokens)}
+
+        def run(command, **kw):
+            events.append(command[2] if command[0] == 'sudo' else kw['env']['GH_TOKEN'])
+            return argparse.Namespace(returncode=0, stdout='', stderr='')
+        with mock.patch.object(cb, 'gh_env', gh_env), mock.patch.object(cb, 'instance', lambda target: 'me-app'), \
+                mock.patch.object(cb, 'github_app_id', lambda: '1'), mock.patch.object(cb.subprocess, 'run', run):
+            cb.APP_KEY.touch()
+            self.addCleanup(cb.APP_KEY.unlink, missing_ok=True)
+            quiet(cb.unregister, argparse.Namespace(target='me/app'))
+        self.assertEqual(events, ['disable', '-rf', 'daemon-reload', 'auth', 'early'])
+
+    def test_register_takes_slots_from_the_flag_then_the_environment_then_the_host(self):
+        args = lambda slots: argparse.Namespace(target='me/new', slots=slots, allow_public=False, allow_forks=False)
+        with mock.patch.dict(os.environ, COLDBOX_SLOTS='0'):
+            self.assertIn('Environment=COLDBOX_SLOTS=0', self.register_dropin(args(None))[0])
+            self.assertIn('Environment=COLDBOX_SLOTS=1', self.register_dropin(args(1))[0])
+
+    def test_register_refuses_a_host_that_cannot_run_one_job_vm(self):
+        for small in (dict(host_cpus=lambda: 2), dict(host_memory=lambda field='MemTotal': 4 * GIB, vm_memory=lambda: 2 * GIB)):
+            with self.subTest(small=sorted(small)), mock.patch.multiple(cb, registrations=lambda: [], **small), \
+                    mock.patch.object(cb, 'guard') as guard, self.assertRaises(SystemExit) as refused:
+                cb.register(argparse.Namespace(target='me/new', slots=None, allow_public=False, allow_forks=False))
+            self.assertIn('this host cannot run one job VM', str(refused.exception))
+            guard.assert_not_called()
+
+    def test_personal_gh_api_calls_target_github_com(self):
+        seen = []
+        run = lambda command, **kw: seen.append(kw['env']['GH_HOST']) or argparse.Namespace(returncode=0, stdout='{}')
+        with mock.patch.object(cb, 'app_token', lambda *a, **k: None), mock.patch.object(cb.subprocess, 'run', run), \
+                mock.patch.dict(os.environ, COLDBOX_ALLOW_PERSONAL_LOGIN='1', GH_HOST='ghe.example.com'):
+            cb.gh('repos/me/app')
+        self.assertEqual(seen, ['github.com'])
+
+    def test_the_personal_token_is_read_for_github_com_only(self):
+        seen = {}
+
+        def run(command, **kw):
+            seen.update(command=command, host=kw['env'].get('GH_HOST'))
+            return argparse.Namespace(stdout='personal\n')
+        with mock.patch.object(cb, 'app_token', lambda *a, **k: None), mock.patch.object(cb.subprocess, 'run', run), \
+                mock.patch.dict(os.environ, COLDBOX_ALLOW_PERSONAL_LOGIN='1', GH_HOST='ghe.example.com'), \
+                mock.patch.object(cb.urllib.request, 'urlopen', side_effect=OSError('offline')), \
+                contextlib.suppress(OSError):
+            cb.GitHub().get('repos/me/app')
+        self.assertEqual(seen, {'command': ['gh', 'auth', 'token'], 'host': 'github.com'})
+
     def test_primary_probe_counts_each_job_once_and_every_new_reservation(self):
         arriving = argparse.Namespace(pid=2, target='me/app', name='cbx-2-b', kind='burst', writers=None)
         with mock.patch.object(cb, 'live_workers', return_value=[arriving]), \
@@ -3925,7 +6906,7 @@ class Autoscale(unittest.TestCase):
 
     def test_primary_probe_measures_cpu_memory_and_booting_admission(self):
         self.assertEqual(self.primary_probe(80)['ramp_room'], self.primary_probe(80)['vm_ceiling'])
-        self.assertAlmostEqual(self.primary_probe(80)['busy_cpus'], os.cpu_count() * 0.2)
+        self.assertAlmostEqual(self.primary_probe(80)['busy_cpus'], cb.host_cpus() * 0.2)
         cap = self.state / 'ramp-cap.json'
         cap.write_text(json.dumps(dict(limit=0, expires=time.time()+60)))
         self.assertEqual((self.primary_probe(80)['ramp_room'], self.primary_probe(80)['reserve']), (0, 0))
@@ -4053,12 +7034,23 @@ class Autoscale(unittest.TestCase):
                            self.workflow_run(3, 'workflow_dispatch', 'me')])
         self.assertEqual(len(self.started), 3)
 
-    def test_public_opt_in_holds_an_outside_fork_pull_request_until_github_approval(self):
+    def test_public_opt_in_never_scales_a_fork_pull_request_even_after_github_approval(self):
         waiting = self.workflow_run(1, 'pull_request', 'stranger', head='stranger/app')
         self.scale_public([], awaiting_approval=[waiting])
         self.assertEqual(self.started, [])
-        self.scale_public([waiting])
+        log = self.scale_public([waiting, self.workflow_run(2, 'pull_request', 'me', head='me/app-fork')])
+        self.assertEqual(self.started, [])
+        self.assertIn(f'not scaling for run 1 on me/app: {cb.FORK_REFUSED}', log)
+
+    def test_a_private_repo_never_scales_a_fork_pull_request(self):
+        runs = [self.workflow_run(1, 'pull_request', 'me', head='me/app-fork'), self.workflow_run(2, 'push', 'me')]
+        github = FakeGitHub({'queued': runs, 'in_progress': []}, {1: queued(1), 2: queued(1)})
+        runs.append({'id': 3, 'event': 'pull_request', 'head_repository': None, 'actor': {'login': 'me'}})
+        github.jobs[3] = queued(1)
+        log = quiet(cb.autoscale, github, self.args, [])[1]
         self.assertEqual(len(self.started), 1)
+        self.assertIn(f'not scaling for run 1 on me/app: {cb.FORK_REFUSED}', log)
+        self.assertIn(f'not scaling for run 3 on me/app: {cb.FORK_REFUSED}', log)
 
     def test_public_opt_in_never_scales_an_outside_users_job_that_github_does_not_gate(self):
         log = self.scale_public([self.workflow_run(1, 'pull_request_target', 'stranger', head='stranger/app'),
@@ -4140,8 +7132,9 @@ class Autoscale(unittest.TestCase):
             quiet(cb.autoscale, github, self.args, [])
         self.assertEqual(deleted, [('-X', 'DELETE', 'repos/me/app/actions/runners/1')])
 
-    def test_a_writer_re_running_an_outside_run_counts_as_the_writer(self):
-        self.scale_public([self.workflow_run(1, 'pull_request_target', 'stranger', head='stranger/app', rerun_by='me')])
+    def test_a_writer_re_running_an_outside_run_counts_as_the_writer_unless_it_is_from_a_fork(self):
+        self.scale_public([self.workflow_run(1, 'issue_comment', 'stranger', rerun_by='me'),
+                           self.workflow_run(2, 'pull_request_target', 'stranger', head='stranger/app', rerun_by='me')])
         self.assertEqual(len(self.started), 1)
 
     def test_public_repo_without_the_opt_in_or_without_github_approval_is_not_scaled(self):
@@ -4206,7 +7199,8 @@ class ConditionalRequests(unittest.TestCase):
                 return body
             raise cb.urllib.error.HTTPError(request.full_url, 304, 'Not Modified', headers(), io.BytesIO())
 
-        with mock.patch.object(cb.urllib.request, 'urlopen', urlopen):
+        with mock.patch.object(cb.urllib.request, 'urlopen', urlopen), \
+                mock.patch.dict(os.environ, COLDBOX_ALLOW_PERSONAL_LOGIN='1'):
             first = github.get('repos/me/app/actions/runs?status=queued')
             second = github.get('repos/me/app/actions/runs?status=queued')
         self.assertEqual(sent, [None, 'W/"abc"'])
@@ -4215,7 +7209,8 @@ class ConditionalRequests(unittest.TestCase):
     def test_every_request_stops_while_quota_is_low_until_the_reset(self):
         github = cb.GitHub()
         github.note(headers(remaining='120'))
-        with mock.patch.object(cb.urllib.request, 'urlopen') as urlopen:
+        with mock.patch.object(cb.urllib.request, 'urlopen') as urlopen, \
+                mock.patch.object(cb, 'app_token', lambda *a, **k: 'token'):
             with self.assertRaises(RuntimeError):
                 github.get('repos/me/app')
         urlopen.assert_not_called()
@@ -4261,6 +7256,110 @@ class BurstIdle(unittest.TestCase):
     def test_released_burst_receipt_reads_idle(self):
         receipt = dict(mode='runner', error=cb.IDLE_RELEASED, vm=dict(destroyed=True))
         self.assertEqual(cb.verdict(receipt), 'idle')
+
+
+class GuestRefresh(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(cb, 'CLEANUP', cb.threading.Event())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def polls(self, count):
+        return mock.Mock(**{'wait.side_effect': [False] * count + [True], 'is_set.return_value': False})
+
+    def test_a_guest_refresh_releases_the_idle_slot_and_preps_a_fresh_one(self):
+        fingerprints = iter(['old', 'new'])
+        released = cb.threading.Event()
+        jobs = []
+
+        def slot_job(*args, **kwargs):
+            jobs.append(kwargs['on_ready'])
+            if len(jobs) == 1:
+                if kwargs['on_ready']:
+                    kwargs['on_ready']()
+                self.assertTrue(released.wait(5))
+                return dict(mode='runner', error=cb.IDLE_RELEASED, vm=dict(destroyed=True))
+            cb.DRAINING.set()
+            return dict(mode='runner', job_seconds=1)
+
+        args = argparse.Namespace(target='me/app', slots=1, worker=True, once=False, idle=0, ttl=600, name=None,
+                                  allow_public=False, allow_forks=False, size='default')
+        for signum in (cb.signal.SIGTERM, cb.signal.SIGUSR1):
+            self.addCleanup(cb.signal.signal, signum, cb.signal.getsignal(signum))
+        self.addCleanup(cb.DRAINING.clear)
+        deleted = []
+        with mock.patch.multiple(cb, ci_host=lambda: ('host', 'host'), runner_admission=lambda *a: {},
+                                 guard=lambda *a: None, admit=lambda *a: True, job=slot_job, GUEST_POLL_SECONDS=0.01,
+                                 publish_verify=lambda *a: None, cache_folder=lambda *a: None,
+                                 guest_fingerprint=lambda: next(fingerprints, 'new'),
+                                 gh=lambda *a, **kw: deleted.append(a[-1]) if 'DELETE' in a else
+                                 {'runner': {'id': 7}, 'encoded_jit_config': 'c'}, create=True), \
+                mock.patch.object(cb.os, 'kill', side_effect=lambda *a: released.set()) as kill, \
+                mock.patch.object(cb.time, 'sleep') as sleep:
+            self.assertEqual(quiet(cb.serve, args)[0], 143)
+        kill.assert_called_once_with(os.getpid(), cb.signal.SIGUSR1)
+        self.assertEqual(len(jobs), 2)
+        self.assertIn('repos/me/app/actions/runners/7', deleted)
+        sleep.assert_not_called()
+
+    def test_a_guest_refresh_leaves_a_running_job_alone(self):
+        def busy(*args):
+            raise RuntimeError('HTTP 422: Runner is still running a job')
+
+        gh = mock.Mock(side_effect=busy)
+        with mock.patch.multiple(cb, gh=gh, guest_fingerprint=lambda: 'new'), \
+                mock.patch.object(cb.os, 'kill') as kill, mock.patch.object(cb.threading, 'Timer') as timer:
+            cb.watch_guest('me/app', 7, 'old', self.polls(3))
+        gh.assert_called_once()
+        kill.assert_not_called()
+        timer.assert_not_called()
+
+    def test_a_release_that_returns_after_its_vm_ended_signals_nothing(self):
+        stop = cb.threading.Event()
+        with mock.patch.object(cb, 'gh', side_effect=lambda *a: stop.set()), \
+                mock.patch.object(cb.os, 'kill') as kill:
+            cb.release_idle('me/app', 7, stop)
+        kill.assert_not_called()
+
+    def test_a_vm_that_ends_while_its_release_is_signalling_gets_no_late_signal(self):
+        stop, order = cb.threading.Event(), []
+
+        def end_vm():
+            with cb.RELEASING:
+                stop.set()
+            order.append('ended')
+
+        def kill(*args):
+            completion_thread = cb.threading.Thread(target=end_vm)
+            completion_thread.start()
+            completion_thread.join(0.2)
+            order.append('signal')
+
+        with mock.patch.object(cb, 'gh'), mock.patch.object(cb.os, 'kill', side_effect=kill):
+            cb.release_idle('me/app', 7, stop)
+        self.assertTrue(stop.wait(5))
+        self.assertEqual(order[0], 'signal')
+
+    def test_a_swapped_overlay_directory_changes_the_fingerprint(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(cb, 'GUEST_FILES', Path(root)):
+            opt = Path(root, 'opt')
+            (opt / 'coldverify').mkdir(parents=True)
+            (opt / 'coldverify' / 'COMMIT').write_text('old\n')
+            before = cb.guest_fingerprint()
+            self.assertEqual(cb.guest_fingerprint(), before)
+            Path(root, 'next').mkdir()
+            Path(root, 'next', 'COMMIT').write_text('new\n')
+            os.rename(opt / 'coldverify', Path(root, 'previous'))
+            os.rename(Path(root, 'next'), opt / 'coldverify')
+            self.assertNotEqual(cb.guest_fingerprint(), before)
+
+    def test_an_unchanged_guest_overlay_leaves_the_slot_alone(self):
+        gh = mock.Mock()
+        with mock.patch.multiple(cb, gh=gh, guest_fingerprint=lambda: 'same'), \
+                mock.patch.object(cb.os, 'kill') as kill:
+            cb.watch_guest('me/app', 7, 'same', self.polls(3))
+        gh.assert_not_called()
+        kill.assert_not_called()
 
 
 class RunnerRelease(unittest.TestCase):
@@ -4310,7 +7409,7 @@ def job(*a, **kw):
     while not (root / 'finish').exists():
         time.sleep(.01)
     (root / 'completed').write_text('old')
-    return {'verdict': 'pass', 'job_seconds': 1}
+    return {'verdict': 'pass', 'job_seconds': 1, 'vm': {'destroyed': True}}
 cb.job = job
 cb.serve(argparse.Namespace(target='owner/repo', worker=True, slots=1, ttl=60,
     allow_public=False, allow_forks=False, once=False, idle=0, name=None, size='default'))
@@ -4344,6 +7443,28 @@ cb.serve(argparse.Namespace(target='owner/repo', worker=True, slots=1, ttl=60,
 
     def test_replace_during_guard_is_seen_before_first_registration(self):
         self.assert_reload_before_registration(True)
+
+    def test_worker_reload_releases_disk_reservation_before_exec(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        installed = state / 'coldbox'
+        installed.write_text("print('new worker')\n")
+        worker_record = state / 'workers' / str(os.getpid())
+        args = argparse.Namespace(target='owner/repo', worker=True, slots=1, ttl=60,
+                                  allow_public=False, once=False, idle=0, name=None, size='default')
+
+        def admit(target, name, kind, writers, memory):
+            cb.note_worker(os.getpid(), target, name, kind, writers, memory)
+            return True
+
+        def exec_worker(*_):
+            self.assertFalse(worker_record.exists(), 'worker left an in-flight disk reservation at reload')
+            raise SystemExit(0)
+
+        with mock.patch.object(cb, 'STATE', state), mock.patch.object(cb, '__file__', str(installed)), \
+                mock.patch.object(cb.signal, 'signal'), mock.patch.object(cb, 'guard', return_value=None), \
+                mock.patch.object(cb, 'admit', side_effect=admit), mock.patch.object(cb.os, 'execv', side_effect=exec_worker):
+            with self.assertRaises(SystemExit):
+                cb.serve(args)
 
     def assert_reload_before_registration(self, during_guard):
         with tempfile.TemporaryDirectory() as folder:
@@ -4617,7 +7738,7 @@ class Slots(unittest.TestCase):
             def wait(self):
                 return 0
 
-        args = cb.argparse.Namespace(target='me/repo', slots=3, ttl=60, allow_public=False, allow_forks=True,
+        args = cb.argparse.Namespace(target='me/repo', slots=3, ttl=60, allow_public=False,
                                      once=True, worker=False, idle=0)
         original, handlers = cb.subprocess.Popen, (cb.signal.getsignal(cb.signal.SIGINT),
                                                   cb.signal.getsignal(cb.signal.SIGTERM))
@@ -4629,7 +7750,7 @@ class Slots(unittest.TestCase):
             cb.signal.signal(cb.signal.SIGINT, handlers[0])
             cb.signal.signal(cb.signal.SIGTERM, handlers[1])
         self.assertEqual(len(started), 3)
-        self.assertEqual(started[0][2:], ['serve', 'me/repo', '--worker', '--ttl', '60', '--slots', '1', '--allow-forks', '--once'])
+        self.assertEqual(started[0][2:], ['serve', 'me/repo', '--worker', '--ttl', '60', '--slots', '1', '--once'])
 
     def test_supervisor_forwards_each_stop_only_once_even_while_waiting(self):
         children = []
@@ -4781,6 +7902,170 @@ class ServeOnce(unittest.TestCase):
         patched['admit'].assert_called_once_with('me/repo', mock.ANY, 'once', None, None)
 
 
+class Toolcache(unittest.TestCase):
+    DIGEST = 'a' * 64
+
+    def manifest(self, tool):
+        def build(version, stable=True, platform_version=None):
+            extra = {'platform_version': platform_version} if platform_version else {}
+            name = f'{tool}-{version}-linux-x64.tar.gz'
+            return dict(version=version, stable=stable,
+                        release_url=f'https://github.com/actions/{tool}-versions/releases/tag/{version}-1',
+                        files=[dict(filename=f'{tool}-{version}-darwin-x64.tar.gz', platform='darwin', arch='x64',
+                                    download_url='mac'),
+                               dict(filename=name, platform='linux', arch='x64', download_url=f'https://dl/{name}',
+                                    **extra)])
+        if tool == 'python':
+            return [build('3.13.0-rc.1', stable=False, platform_version='26.04'), build('3.12.16', platform_version='24.04'),
+                    build('3.12.15', platform_version='26.04')]
+        return [build('26.13.1'), build('24.22.3'), build('24.22.2'), build('22.19.0')]
+
+    def fetch(self, url):
+        if url == cb.RUNNER_RELEASES:
+            return None
+        tool = re.search(r'actions/(\w+)-versions', url)[1]
+        if url.endswith('versions-manifest.json'):
+            return self.manifest(tool)
+        version = url.rsplit('/', 1)[1].rsplit('-', 1)[0]
+        return dict(assets=[dict(name=f'{tool}-{version}-linux-x64.tar.gz', digest='sha256:' + self.DIGEST)])
+
+    def resolve(self, text, release='26.04'):
+        path = Path(self.enterContext(tempfile.TemporaryDirectory())) / 'toolcache'
+        path.write_text(text)
+        with mock.patch.multiple(cb, TOOLCACHE=path, fetch_json=self.fetch):
+            return cb.toolchains(release)
+
+    def test_resolves_each_line_to_the_newest_stable_build_for_the_guest_with_its_release_digest(self):
+        self.assertEqual(self.resolve('node 24\nnode 22.19.0\n\npython 3.12\n'), [
+            ('node', '24', '24.22.3', 'https://dl/node-24.22.3-linux-x64.tar.gz', self.DIGEST),
+            ('node', '22.19.0', '22.19.0', 'https://dl/node-22.19.0-linux-x64.tar.gz', self.DIGEST),
+            ('Python', '3.12', '3.12.15', 'https://dl/python-3.12.15-linux-x64.tar.gz', self.DIGEST)])
+        self.assertEqual(self.resolve(''), [])
+
+    def test_a_bad_line_or_an_unknown_version_or_digest_fails(self):
+        for text in ('node\n', 'ruby 3\n', 'node 24 22\n', 'node latest\n', 'node 2.4.x\n'):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, 'expected "node|python|go VERSION"'):
+                self.resolve(text)
+        for text in ('node 2\n', 'node 24.2\n', 'python 3.13\n'):
+            with self.subTest(text=text), self.assertRaisesRegex(RuntimeError, 'no stable linux x64 build'):
+                self.resolve(text)
+        self.DIGEST = 'not-a-digest'
+        with self.assertRaisesRegex(RuntimeError, 'no sha256 for node-24.22.3-linux-x64.tar.gz'):
+            self.resolve('node 24\n')
+
+    def build(self, text, tool_setup_fails=False):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = state / 'toolcache'
+        if text is not None:
+            path.write_text(text)
+        calls, runs = [], []
+        self.calls = calls
+
+        def run(command, **kwargs):
+            runs.append((command, kwargs))
+            if kwargs.get('input') == cb.TOOL_SETUP.encode() and tool_setup_fails:
+                raise subprocess.CalledProcessError(1, command)
+            return subprocess.CompletedProcess(command, 0, stdout='26.04\n' if 'os-release' in str(command) else 'gh 2\n')
+
+        with mock.patch.multiple(cb, STATE=state, TOOLCACHE=path, fetch_json=self.fetch,
+                                 runner_release=lambda _: ('2.340.0', 'u', 'd'), wait_ready=lambda *a, **k: None,
+                                 push_guest_files=lambda name: None, seed_cloud_init_on_create_only=lambda name: None,
+                                 destroy=lambda name: calls.append(('destroy', name)) or True,
+                                 ic=lambda *a, **k: calls.append(a)), \
+                mock.patch.object(cb.subprocess, 'run', side_effect=run), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            try:
+                self.runner = cb.build_new_base()
+            finally:
+                self.output = out.getvalue()
+        return state, calls, [command for command, kwargs in runs if kwargs.get('input') == cb.TOOL_SETUP.encode()]
+
+    def test_listed_toolchains_are_installed_logged_and_inventoried(self):
+        state, calls, setup = self.build('node 24\npython 3.12\n')
+        self.assertEqual(setup, [cb.ic_exec('base-new', 'bash', '-s',
+                                            'node', '24.22.3', 'https://dl/node-24.22.3-linux-x64.tar.gz', self.DIGEST,
+                                            'Python', '3.12.15', 'https://dl/python-3.12.15-linux-x64.tar.gz',
+                                            self.DIGEST, user=None)])
+        self.assertIn(f'coldbox build-base: toolcache node 24 -> 24.22.3 sha256 {self.DIGEST}\n', self.output)
+        self.assertIn(f'coldbox build-base: toolcache Python 3.12 -> 3.12.15 sha256 {self.DIGEST}\n', self.output)
+        self.assertEqual((state / 'base-packages.txt').read_text(),
+                         'gh 2\ntoolcache/node/24 24.22.3\ntoolcache/Python/3.12 3.12.15\n')
+        self.assertIn(('snapshot', 'create', 'base-new', 'warm'), calls)
+        self.assertEqual(self.runner, '2.340.0')
+        self.assertIn(('config', 'set', 'base-new', 'user.coldbox.runner=2.340.0'), calls)
+
+    def test_a_missing_or_empty_list_installs_nothing(self):
+        for text in (None, '', '\n'):
+            with self.subTest(text=text):
+                state, calls, setup = self.build(text)
+                self.assertEqual(setup, [])
+                self.assertEqual((state / 'base-packages.txt').read_text(), 'gh 2\n')
+
+    def test_a_failed_download_or_verify_destroys_the_candidate(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.build('node 24\n', tool_setup_fails=True)
+        self.assertEqual(self.calls[-1], ('destroy', 'base-new'))
+        self.assertNotIn(('snapshot', 'create', 'base-new', 'warm'), self.calls)
+
+    def test_a_prefix_moving_to_a_new_patch_is_printed_as_a_change(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (state / 'base-packages.prev.txt').write_text('gh 2\ntoolcache/node/24 24.22.2\n')
+        (state / 'base-packages.txt').write_text('gh 2\ntoolcache/node/24 24.22.3\n')
+        with mock.patch.object(cb, 'STATE', state), contextlib.redirect_stdout(io.StringIO()) as out:
+            cb.print_base_changes('2.340.0', '2.340.0')
+        self.assertIn('toolcache/node/24: 24.22.2 -> 24.22.3\n', out.getvalue())
+
+    def test_the_tool_setup_script_verifies_and_lays_out_the_cache_as_setup_actions_expect(self):
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (tmp / 'src/bin').mkdir(parents=True)
+        (tmp / 'src/bin/node').write_text('#!/bin/sh\n')
+        archive = tmp / 'node.tgz'
+        with tarfile.open(archive, 'w:gz') as tar:
+            tar.add(tmp / 'src/bin', arcname='bin')
+        stubs = tmp / 'stubs'
+        stubs.mkdir()
+        (stubs / 'curl').write_text(f'#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done\ncp {archive} "$2"\n')
+        (stubs / 'chown').write_text('#!/bin/sh\n')
+        for stub in stubs.iterdir():
+            stub.chmod(0o755)
+        cache = tmp / 'cache'
+        script = cb.TOOL_SETUP.replace('/opt/hostedtoolcache', str(cache)).replace('/tmp/tool', str(tmp / 'work'))
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        env = dict(os.environ, PATH=f'{stubs}:{os.environ["PATH"]}')
+
+        def run(sha):
+            return subprocess.run(['bash', '-s', 'node', '24.22.3', 'https://dl/node.tgz', sha], input=script,
+                                  text=True, capture_output=True, env=env)
+        self.assertNotEqual(run('b' * 64).returncode, 0)
+        self.assertFalse((cache / 'node/24.22.3').exists())
+        self.assertEqual(run(digest).returncode, 0)
+        self.assertTrue((cache / 'node/24.22.3/x64/bin/node').is_file())
+        self.assertTrue((cache / 'node/24.22.3/x64.complete').is_file())
+
+    def test_smoke_fails_when_a_listed_toolchain_is_missing_from_the_snapshot(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (state / 'base-packages.txt').write_text('gh 2\ntoolcache/node/24 24.22.3\n')
+        runs = []
+
+        def run(command, **kwargs):
+            runs.append(command)
+            missing = '/opt/hostedtoolcache/node/24.22.3/x64.complete\n' if 'for f' in str(command) else ''
+            return subprocess.CompletedProcess(command, 0, stdout=missing, stderr='')
+
+        with mock.patch.multiple(cb, STATE=state, boot=lambda *a, **k: None, destroy=lambda name: True,
+                                 query=lambda path: {'created_at': '2026-11-19T12:00:00Z'}), \
+                mock.patch.object(cb, 'run_base_smoke_job', return_value=(1, 0), create=True), \
+                mock.patch.object(cb.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, r"toolchains missing from base-new/warm: "
+                                        r"\['/opt/hostedtoolcache/node/24.22.3/x64.complete'\]"):
+                cb.smoke_base()
+            self.assertEqual(runs[-1][-2:], ['sh', '/opt/hostedtoolcache/node/24.22.3/x64.complete'])
+            (state / 'base-packages.txt').write_text('gh 2\n')
+            runs.clear()
+            cb.smoke_base()
+            self.assertEqual(len(runs), 1)
+
+
 class SwapBase(unittest.TestCase):
     def swap(self, instances, failing_move=None):
         def ic(*args, **kwargs):
@@ -4903,6 +8188,7 @@ class HostMemoryAdmission(unittest.TestCase):
         self.owned = set()
         self.adhoc = {}
         self.pool = dict(total=100 * GIB, used=10 * GIB)
+        self.usage = {}
         patches = dict(STATE=self.state, vm_memory=lambda: 4 * GIB, vm_disk=lambda: 40 * GIB,
                        host_memory=lambda field='MemTotal': (23 if field == 'MemTotal' else 20) * GIB // 2, host_vms=lambda: self.owned,
                        registrations=lambda: [], CI_HOSTS=self.state / 'no-ci-hosts.json',
@@ -4914,14 +8200,19 @@ class HostMemoryAdmission(unittest.TestCase):
         patcher = mock.patch.object(cb, 'query', side_effect=self.instances)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for name, value in (('cpu_count', 8), ('getloadavg', (0.0, 0.0, 0.0))):
-            patcher = mock.patch.object(cb.os, name, return_value=value)
+        for target, name, value in ((cb, 'host_cpus', 8), (cb.os, 'getloadavg', (0.0, 0.0, 0.0))):
+            patcher = mock.patch.object(target, name, return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
     def instances(self, path):
         if path == f'/1.0/storage-pools/{cb.POOL}/resources':
             return dict(space=self.pool)
+        if '/state?project=' in path:
+            usage = self.usage.get(path.split('/')[3])
+            if usage is None:
+                raise subprocess.CalledProcessError(1, 'incus')
+            return dict(memory=dict(usage=usage))
         self.assertEqual(path, '/1.0/instances?recursion=1&all-projects=true')
         return self.rows
 
@@ -4936,14 +8227,139 @@ class HostMemoryAdmission(unittest.TestCase):
         self.pool['used'] = 50 * GIB
         self.assertEqual(quiet(cb.admit, 'repo', 'cbx-new', 'once'), (True, ''))
 
+    def test_admission_reclaims_a_disk_reservation_when_the_owner_is_gone(self):
+        self.pool['used'] = 50 * GIB
+        with subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'],
+                              stdin=subprocess.PIPE) as owner:
+            cb.note_worker(owner.pid, 'repo', 'cbx-abandoned', 'base')
+            reservation = self.state / 'workers' / str(owner.pid)
+            owner.communicate(timeout=5)
+
+        self.assertEqual(quiet(cb.admit, 'repo', 'cbx-new', 'once'), (True, ''))
+        self.assertFalse(reservation.exists())
+
+    def test_admission_keeps_a_live_workers_disk_reservation_before_its_vm_exists(self):
+        self.pool['used'] = 50 * GIB
+        owner = os.getppid()
+        cb.note_worker(owner, 'repo', 'cbx-booting', 'base')
+        reservation = self.state / 'workers' / str(owner)
+        original = reservation.read_bytes()
+
+        with mock.patch.multiple(cb, host_memory=lambda field='MemTotal': 64 * GIB, RESERVE=self.state / 'reserve'):
+            admitted, log = quiet(cb.admit, 'repo', 'cbx-new', 'once')
+        self.assertFalse(admitted)
+        self.assertIn('after 1 worker disk commitment(s)', log)
+        self.assertEqual(reservation.read_bytes(), original)
+
+    def test_concurrent_starts_cannot_both_spend_the_last_disk_above_the_reserve(self):
+        self.pool['used'] = 50 * GIB
+        ctx = multiprocessing.get_context('fork')
+        start, finish = ctx.Event(), ctx.Event()
+        results = ctx.Queue()
+
+        def starter(name):
+            start.wait()
+            admitted, log = quiet(cb.admit, 'repo', name, 'once')
+            results.put((name, os.getpid(), admitted, log))
+            if admitted and finish.wait(10):
+                raise SystemExit(1)
+
+        with mock.patch.object(cb, 'host_memory', return_value=64 * GIB):
+            workers = [ctx.Process(target=starter, args=(name,)) for name in ('cbx-first', 'cbx-second')]
+            for worker in workers:
+                worker.start()
+            start.set()
+            try:
+                accepted, refused = sorted((results.get(timeout=10) for _ in workers), key=lambda row: not row[2])
+                self.assertEqual([accepted[2], refused[2]], [True, False])
+                self.assertIn('storage pool', refused[3])
+                self.assertIn('10 GiB reserve', refused[3])
+                self.assertFalse((self.state / 'workers' / str(refused[1])).exists())
+                self.owned.add(accepted[0])
+                self.assertFalse(quiet(cb.admit, 'repo', 'cbx-third', 'once')[0])
+            finally:
+                finish.set()
+                for worker in workers:
+                    worker.join(timeout=12)
+                    if worker.is_alive():
+                        worker.terminate()
+                        worker.join()
+                results.close()
+
+            self.assertEqual(sorted(worker.exitcode for worker in workers), [0, 1])
+            self.assertTrue((self.state / 'workers' / str(accepted[1])).exists())
+            self.owned.clear()
+            self.pool['used'] += 1
+            self.assertFalse(quiet(cb.admit, 'repo', 'cbx-after-failure', 'once')[0])
+            self.assertFalse((self.state / 'workers' / str(accepted[1])).exists())
+            self.pool['used'] -= 1
+            self.assertTrue(quiet(cb.admit, 'repo', 'cbx-after-reconcile', 'once')[0])
+
     def vm(self, name='bootstrap', project='default', memory='8GiB', status='Running', **extra):
         return dict(name=name, project=project, type='virtual-machine', status=status,
                     config={}, expanded_config={'limits.memory': memory}, **extra)
+
+    def run_repo_at_ceiling(self, frees_after):
+        running = self.state / 'workers' / str(os.getppid())
+        cb.note_worker(os.getppid(), 'me/other', 'cbx-1-running', 'once', None, 6 * GIB)
+        clock, sleeps, jobs = [0.0], [], []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+            if len(sleeps) == frees_after:
+                running.unlink()
+
+        def job(*args, **kw):
+            jobs.append(kw['repo'])
+            return dict(verdict='pass')
+
+        with mock.patch.object(cb.time, 'sleep', sleep), mock.patch.object(cb.time, 'monotonic', lambda: clock[0]), \
+                mock.patch.multiple(cb, job=job, repo_token=lambda repo: '', host_cpu_load=lambda: 0.0), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            try:
+                code = cb.main(['run', '--repo', 'me/app', '--sha', SHA])
+            except SystemExit as refused:
+                code = str(refused)
+        return code, sleeps, jobs, err.getvalue()
+
+    def test_run_at_a_ceiling_of_one_waits_for_the_running_job_then_starts(self):
+        code, sleeps, jobs, err = self.run_repo_at_ceiling(frees_after=3)
+        self.assertEqual((code, jobs), (0, ['me/app']))
+        self.assertEqual(sleeps, [cb.AUTOSCALE_SECONDS] * 3)
+        self.assertEqual(err.count('at its job VM ceiling; waiting'), 3)
+
+    def test_run_at_the_ceiling_gives_up_after_the_bounded_wait(self):
+        code, sleeps, jobs, _ = self.run_repo_at_ceiling(frees_after=None)
+        self.assertEqual(code, 'coldbox: the host is at its job VM ceiling; try again when a job finishes')
+        self.assertEqual((jobs, sum(sleeps)), ([], cb.RUN_WAIT_SECONDS))
+        self.assertFalse((self.state / 'workers' / str(os.getpid())).exists())
 
     def test_foreign_vm_blocks_admission(self):
         self.rows = [self.vm()]
         self.assertFalse(cb.admit('repo', 'cbx-new', 'once'))
         self.assertFalse((self.state / 'workers' / str(os.getpid())).exists())
+
+    def bench_admits(self, usage):
+        self.rows = [self.vm(f'bench-{n}', 'bench', '16GiB') for n in range(6)]
+        self.usage = {row['name']: usage for row in self.rows}
+        with mock.patch.object(cb, 'host_memory', lambda field='MemTotal': (130 if field == 'MemTotal' else 100) * GIB):
+            return cb.admit('repo', 'cbx-new', 'once')
+
+    def test_foreign_vms_count_their_real_memory_use_not_their_limit(self):
+        self.assertTrue(self.bench_admits(2 * GIB))
+
+    def test_foreign_vms_really_using_their_limit_leave_no_room(self):
+        self.assertFalse(self.bench_admits(16 * GIB))
+
+    def test_a_foreign_vm_whose_use_cannot_be_read_counts_its_limit(self):
+        self.assertFalse(self.bench_admits(None))
+        self.assertFalse(self.bench_admits(0))
+
+    def test_only_vms_outside_the_coldbox_project_count_their_real_use(self):
+        self.rows = [self.vm('bench-0', 'bench', '16GiB'), self.vm('cbx-stray', cb.PROJECT, '16GiB')]
+        self.usage = {'bench-0': 2 * GIB, 'cbx-stray': GIB}
+        self.assertEqual(cb.additional_vm_memory([], 4 * GIB, set()), 18 * GIB)
 
     def test_a_foreign_vm_reserves_its_limit_from_available_memory_while_the_ceiling_has_room(self):
         self.rows = [self.vm(memory='30GiB')]
@@ -5190,6 +8606,7 @@ class AdhocVm(unittest.TestCase):
         fake.write_text('#!/bin/sh\n'
                         f'echo "$@" >> {tmp}/calls\n'
                         'case "$*" in\n'
+                        '  *query*) echo "{}" ;;\n'
                         f'  *" list "*) cat {tmp}/rows.json ;;\n'
                         '  *" exec "*) cat; exit 7 ;;\n'
                         '  *info*) echo "Error: Failed to fetch instance: Instance not found" >&2; exit 1 ;;\n'
@@ -5237,6 +8654,35 @@ class AdhocVm(unittest.TestCase):
             code, out = quiet(cb.main, ['vm', 'up'])
         self.assertEqual((code, destroyed), (125, ['cbx-9-z']))
         self.assertIn('Refusing unsafe VM', out)
+
+    def test_up_pushes_the_host_guest_overlay_after_boot_like_a_job_vm(self):
+        calls = []
+        with mock.patch.multiple(cb, admit=lambda *a: True, new_id=lambda: 'cbx-9-z',
+                                 boot=lambda name, *a: calls.append(('boot', name)),
+                                 push_guest_files=lambda name, *, managed=False: calls.append(('overlay', name))):
+            self.assertEqual(quiet(cb.main, ['vm', 'up']), (0, 'cbx-9-z\n'))
+        self.assertEqual(calls, [('boot', 'cbx-9-z'), ('overlay', 'cbx-9-z')])
+
+    def test_up_whose_overlay_push_fails_destroys_the_vm_and_prints_no_name(self):
+        destroyed = []
+
+        def fail(name, *, managed=False):
+            raise subprocess.CalledProcessError(2, ['incus', 'exec', name, '--', 'tar'])
+        with mock.patch.multiple(cb, admit=lambda *a: True, new_id=lambda: 'cbx-9-z', boot=lambda *a: None,
+                                 push_guest_files=fail, destroy=destroyed.append):
+            code, out = quiet(cb.main, ['vm', 'up'])
+        self.assertEqual((code, destroyed), (125, ['cbx-9-z']))
+        self.assertIn('returned non-zero exit status 2', out)
+        self.assertNotIn('cbx-9-z\n', out)
+
+    def test_up_refuses_an_image_the_host_owner_did_not_list(self):
+        with mock.patch.object(cb, 'VM_ALLOW', Path(tempfile.mkdtemp()) / 'vm-allow', create=True), \
+                mock.patch.multiple(cb, admit=mock.DEFAULT, boot=mock.DEFAULT) as mocks, \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as refused:
+            cb.main(['vm', 'up', '--here', '--image', 'cp-net/ready'])
+        self.assertIn('image cp-net/ready is not listed in', str(refused.exception.code))
+        mocks['admit'].assert_not_called()
+        mocks['boot'].assert_not_called()
 
     def test_up_is_refused_at_the_host_ceiling(self):
         with mock.patch.multiple(cb, admit=lambda *a: False, boot=mock.DEFAULT) as mocks:
@@ -5319,7 +8765,7 @@ class WaitReady(unittest.TestCase):
         return [args for args in calls if 'start' in args]
 
     def test_restarts_a_vm_that_stops_before_its_agent_is_ready(self):
-        starts = self.wait(['Running'] + ['Stopped'] * 32 + ['Running', 'Ready'])
+        starts = self.wait(['Running'] + ['Stopped'] * 210 + ['Running', 'Ready'])
         self.assertEqual(starts, [['incus', '--force-local', '--project', 'coldbox', 'start', 'cbx-1-a']])
 
     def test_gives_up_on_a_vm_that_keeps_stopping_instead_of_waiting_for_the_ttl(self):
@@ -5334,6 +8780,28 @@ class WaitReady(unittest.TestCase):
     def test_leaves_a_vm_alone_while_incus_briefly_reports_it_stopped(self):
         self.assertEqual(self.wait(['Running'] + ['Stopped'] * 5 + ['Running', 'Ready']), [])
 
+    def ready_at(self, seconds):
+        clock, polls = [0.0], []
+
+        def run(args, **_kwargs):
+            polls.append(clock[0])
+            return subprocess.CompletedProcess(args, 0 if clock[0] >= seconds else 1)
+
+        with mock.patch.object(cb.subprocess, 'run', run), \
+                mock.patch.object(cb, 'query', lambda _path: {'status': 'Running'}), \
+                mock.patch.object(cb.time, 'sleep', lambda s: clock.__setitem__(0, clock[0] + s)), \
+                mock.patch.object(cb.time, 'time', lambda: clock[0]):
+            cb.wait_ready('cbx-1-a', 3600, network=False)
+        return clock[0] - seconds, polls
+
+    def test_notices_a_booted_agent_within_a_fifth_of_a_second(self):
+        late, _ = self.ready_at(20.5)
+        self.assertLess(late, 0.2)
+
+    def test_polls_a_slow_boot_about_once_a_second_after_the_first_half_minute(self):
+        _, polls = self.ready_at(200.0)
+        self.assertLessEqual(len([t for t in polls if t >= 31]), 170)
+
 
 class AdhocRun(unittest.TestCase):
     VM = json.dumps({'type': 'virtual-machine', 'status': 'Running', 'expanded_config': {},
@@ -5346,6 +8814,8 @@ class AdhocRun(unittest.TestCase):
                   'loader.exec_module(cb)\n'
                   'cb.GUEST_FILES = cb.STATE / "missing-guest-files"\n'
                   'cb.host_memory = lambda field="MemTotal": 64 * 2**30\n'
+                  'cb.os.getloadavg = lambda: (0.0, 0.0, 0.0)\n'
+                  'cb.host_cpu_load = lambda: 0.0\n'
                   'sys.exit(cb.main(sys.argv[2:]))\n')
 
     def argv(self, *args):
@@ -5357,13 +8827,14 @@ class AdhocRun(unittest.TestCase):
         fake = tmp / 'incus'
         fake.write_text('#!/bin/sh\n'
                         f'echo "$@" >> {tmp}/calls\n'
+                        'case "$FAKE_PULL_HUP $*" in 1*" file pull "*) kill -HUP $PPID ;; esac\n'
                         'case "$*" in\n'
                         f'  *" exec "*{cb.ARTIFACTS}*) cd {artifacts or tempfile.mkdtemp()} && exec tar -c . ;;\n'
                         '  *" exec "*)\n'
                         '    while [ "$1" != "--" ]; do shift; done; shift\n'
                         '    [ "$1" = runuser ] && shift 4\n'
                         '    [ "$1" = python3 ] && [ -n "$FAKE_GUEST" ] && exec python3 -c "$FAKE_GUEST"\n'
-                        '    case "$1" in touch|cloud-init) exit 0 ;; coldbox) exit 1 ;; esac\n'
+                        '    case "$1" in touch) cat > /dev/null; exit 0 ;; cloud-init) exit 0 ;; coldbox) exit 1 ;; esac\n'
                         '    exec "$@" ;;\n'
                         '  *all-projects*) echo "[]" ;;\n'
                         '  *storage-pools*) echo \'{"space": {"total": 107374182400, "used": 0}}\' ;;\n'
@@ -5407,6 +8878,85 @@ class AdhocRun(unittest.TestCase):
         self.assertIn('--cwd /home/runner', line)
         self.assertIn('-- runuser -u runner -- sh -c', line)
 
+    def shell(self, extra_env=(), **stdio):
+        tmp, env = self.fake_incus()
+        env.update(extra_env)
+        vm = json.loads(self.VM)
+        vm['expanded_devices']['eth0'] = {'type': 'none'}
+        (tmp / 'vm.json').write_text(json.dumps(vm))
+        checkout = tmp / 'fixture'
+        checkout.mkdir()
+        (checkout / 'hello.txt').write_text('from head\n')
+        for command in (['init', '-q'], ['add', '.'], ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'x']):
+            subprocess.run(['git', '-C', str(checkout), *command], check=True)
+        (checkout / 'hello.txt').write_text('uncommitted\n')
+        env['HOME'] = str(tmp / 'guest')
+        host = self.ROOMY_HOST.replace('sys.exit(', f'cb.ARCHIVED = {str(tmp / "archived")!r}\nsys.exit(')
+        result = subprocess.run([sys.executable, '-c', host, str(ROOT / 'coldbox'), 'shell', '--repo', str(checkout)],
+                                env=env, capture_output=True, text=True, timeout=60, **stdio)
+        return tmp, result
+
+    def test_shell_runs_offline_with_the_repo_head_and_destroys_the_vm_on_exit(self):
+        tmp, result = self.shell(input='cat "$HOME/repo/hello.txt"; exit 4\n')
+        self.assertEqual((result.returncode, result.stdout), (4, 'from head\n'), result.stderr)
+        receipt = self.receipt(tmp)
+        self.assertEqual((receipt['mode'], receipt['repo'], receipt['exit'], receipt['verdict']),
+                         ('shell', 'fixture', 4, 'fail'))
+        self.assertEqual((receipt['vm']['offline'], receipt['vm']['destroyed']), (True, True))
+        calls = (tmp / 'calls').read_text().splitlines()
+        self.assertTrue([c for c in calls if c.endswith('device add ' + receipt['id'] + ' eth0 none')], calls)
+        self.assertTrue([c for c in calls if ' exec ' in c and '--mode auto' in c and c.endswith('bash -l')], calls)
+        self.assertEqual(len(self.deleted(tmp)), 1)
+
+    def test_shell_hangup_or_termination_still_destroys_the_vm(self):
+        for name, code in (('HUP', 129), ('TERM', 143)):
+            with self.subTest(signal=name):
+                tmp, result = self.shell(input=f'kill -{name} $(ps -o ppid= -p $PPID)\nsleep 1\n')
+                self.assertEqual(result.returncode, code, result.stderr)
+                receipt = self.receipt(tmp)
+                self.assertEqual((receipt['error'], receipt['vm']['destroyed']), ('stopped', True))
+                self.assertEqual(len(self.deleted(tmp)), 1)
+
+    def test_shell_restores_the_terminal_the_guest_session_changed(self):
+        main, terminal = pty.openpty()
+        self.addCleanup(os.close, main)
+        self.addCleanup(os.close, terminal)
+        before = termios.tcgetattr(terminal)
+        os.write(main, b'stty -echo -icanon; exit 3\n')
+        _, result = self.shell(stdin=terminal)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(termios.tcgetattr(terminal), before)
+
+    def test_a_shell_signal_exits_once_and_later_signals_are_ignored(self):
+        for name in ('SIGHUP', 'SIGTERM'):
+            self.addCleanup(signal.signal, getattr(signal, name), signal.getsignal(getattr(signal, name)))
+        with self.assertRaises(SystemExit) as stopped:
+            cb.shell_stopped(signal.SIGHUP, None)
+        self.assertEqual(stopped.exception.code, 129)
+        self.assertEqual((signal.getsignal(signal.SIGHUP), signal.getsignal(signal.SIGTERM)), (signal.SIG_IGN,) * 2)
+
+    def test_a_hangup_after_the_shell_exits_keeps_its_status_and_destroys_the_vm(self):
+        tmp, result = self.shell(extra_env={'FAKE_PULL_HUP': '1'}, input='exit 5\n')
+        self.assertEqual(result.returncode, 5, result.stderr)
+        receipt = self.receipt(tmp)
+        self.assertEqual((receipt['exit'], receipt.get('error'), receipt['vm']['destroyed']), (5, None, True))
+        self.assertEqual(len(self.deleted(tmp)), 1)
+
+    def test_shell_keeps_the_exit_status_when_the_terminal_is_gone(self):
+        main, terminal = pty.openpty()
+        self.addCleanup(os.close, main)
+        self.addCleanup(os.close, terminal)
+        for name in ('SIGHUP', 'SIGTERM'):
+            self.addCleanup(signal.signal, getattr(signal, name), signal.getsignal(getattr(signal, name)))
+        args = argparse.Namespace(repo='.')
+        with mock.patch.object(cb, 'git', return_value=b'a' * 40 + b'\n'), \
+                mock.patch.object(cb.os, 'dup', return_value=terminal), mock.patch.object(cb.os, 'dup2'), \
+                mock.patch.object(cb, 'run_local_revision', side_effect=SystemExit(129)), \
+                mock.patch.object(cb.termios, 'tcsetattr', side_effect=termios.error(errno.EIO, 'EIO')):
+            with self.assertRaises(SystemExit) as stopped:
+                cb.shell(args)
+        self.assertEqual(stopped.exception.code, 129)
+
     def test_success_exits_0_and_destroys_the_vm(self):
         tmp, env = self.fake_incus()
         result = self.coldbox(env, 'run', '--', 'true')
@@ -5430,7 +8980,7 @@ class AdhocRun(unittest.TestCase):
         self.assertNotIn('limits.', copy[0])
 
     def test_bad_sizes_are_refused_before_any_vm(self):
-        for flag, value in (('--cpus', '0'), ('--cpus', '4.5'), ('--cpus', str(os.cpu_count() + 1)),
+        for flag, value in (('--cpus', '0'), ('--cpus', '4.5'), ('--cpus', str(os.sysconf('SC_NPROCESSORS_ONLN') + 1)),
                             ('--memory', '12'), ('--memory', '0GiB'), ('--memory', '12GB'), ('--memory', '1.5GiB'),
                             ('--memory', '99999999GiB')):
             tmp, env = self.fake_incus()
@@ -5477,7 +9027,7 @@ class AdhocRun(unittest.TestCase):
         for field in ('clone_seconds', 'boot_seconds', 'ready_seconds', 'destroy_seconds'):
             self.assertGreaterEqual(vm[field], 0, field)
         self.assertLessEqual(vm['clone_seconds'] + vm['boot_seconds'], vm['ready_seconds'])
-        self.assertEqual(vm['host_ceiling'], os.cpu_count())
+        self.assertEqual(vm['host_ceiling'], os.sysconf('SC_NPROCESSORS_ONLN'))
         self.assertLessEqual(cb.at(receipt['job_started_at']), cb.at(receipt['job_ended_at']))
         self.assertEqual(receipt['resources'], dict.fromkeys(cb.RESOURCE_FIELDS))
         self.assertEqual(receipt['verdict'], 'pass')
@@ -5501,6 +9051,7 @@ class AdhocRun(unittest.TestCase):
         self.assertIs(receipt['artifacts_truncated'], False)
         self.assertEqual((folder / 'coverage' / 'index.html').read_text(), '<p>91%</p>')
         self.assertFalse((folder / 'escape').exists() or (folder / 'escape').is_symlink())
+        self.assertAlmostEqual(int(cb.folder_expiry(folder)), time.time() + 30 * 86400, delta=600)
         self.assertEqual(receipt['verdict'], 'pass')
 
     @staticmethod
@@ -5648,8 +9199,8 @@ class RunRepo(unittest.TestCase):
         'sys.exit(', 'cb.app_token = lambda path, scope=None: __import__("json").dumps([path, scope, "tok-SECRET"])\n'
                      'sys.exit(')
 
-    def fake_incus(self, clone_fails=False):
-        tmp, env = self.fake_adhoc()
+    def fake_incus(self, clone_fails=False, artifacts=None):
+        tmp, env = self.fake_adhoc(artifacts=artifacts)
         fake = tmp / 'incus'
         fail = '; echo "fatal: could not read from remote" >&2; exit 128' if clone_fails else ''
         fake.write_text(fake.read_text().replace(
@@ -5667,6 +9218,34 @@ class RunRepo(unittest.TestCase):
     def coldbox(self, env, *args):
         return subprocess.run([sys.executable, '-c', self.HOST, str(ROOT / 'coldbox'), *args], env=env,
                               capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+    def test_reap_removes_expired_artifacts_and_keeps_preserved_artifacts_with_provenance(self):
+        guest = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (guest / 'report.txt').write_text('sample evidence')
+        tmp, env = self.fake_incus(artifacts=guest)
+        receipts = tmp / 'state' / 'receipts'
+        old = int(time.time()) - 31 * 86400
+        folders = []
+        for expiry in (str(old), 'never'):
+            self.coldbox(env, 'run', '--ttl', '60', '--repo', 'me/app', '--sha', SHA)
+            path, = set(receipts.glob('cbx-*.json')) - {folder.with_suffix('.json') for folder in folders}
+            receipt = json.loads(path.read_text())
+            self.assertIs(receipt['vm']['destroyed'], True)
+            folder = path.with_suffix('.artifacts')
+            os.setxattr(folder, 'user.coldbox.expires', expiry.encode())
+            if expiry == 'never':
+                os.utime(path, (old, old))
+            folders.append(folder)
+        expired, preserved = folders
+
+        result = self.coldbox(env, 'reap')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(expired.exists())
+        self.assertFalse(preserved.with_suffix('.json').exists())
+        self.assertEqual((preserved / 'report.txt').read_text() if preserved.exists() else None, 'sample evidence')
+        self.assertEqual(json.loads(os.getxattr(preserved, 'user.coldbox.provenance')),
+                         {'owner': 'coldbox', 'job_id': preserved.stem, 'repo': 'me/app', 'sha': SHA})
 
     def test_repo_and_sha_clone_that_commit_in_the_vm_with_a_read_only_token_for_that_repo_alone(self):
         tmp, env = self.fake_incus()
@@ -5728,6 +9307,418 @@ class RunRepo(unittest.TestCase):
         failed = clone('b' * 40, 'secret')
         self.assertNotEqual(failed.returncode, 0)
         self.assertNotIn('secret', failed.stdout + failed.stderr)
+
+
+class Api(unittest.TestCase):
+    def test_queue_write_failure_does_not_leave_a_submission_log(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(cb, 'host_lock', return_value=contextlib.nullcontext()), \
+                mock.patch.object(cb, 'write_json', side_effect=OSError('queue write failed')):
+            receipts = Path(directory)
+            with self.assertRaisesRegex(OSError, 'queue write failed'):
+                cb.api_submit(argparse.Namespace(repo='me/app', sha=SHA), receipts)
+            self.assertEqual(list(receipts.glob('*.submit.log')), [])
+
+    fake_incus, receipt = RunRepo.fake_incus, AdhocRun.receipt
+    VM, fake_adhoc = AdhocRun.VM, AdhocRun.fake_incus
+    FULL_HOST = RunRepo.HOST.replace('(0.0, 0.0, 0.0)', '(1000.0, 1000.0, 1000.0)').replace(
+        'sys.exit(', 'cb.RUN_WAIT_SECONDS, cb.AUTOSCALE_SECONDS = 10, 0.2\nsys.exit(')
+
+    def coldbox(self, env, *args, host=RunRepo.HOST):
+        command = [sys.executable, '-c', host, str(ROOT / 'coldbox')]
+        if args[:2] == ('api', 'submit'):
+            launcher = Path(env['COLDBOX_STATE']).parent / 'coldbox'
+            launcher.write_text(f'import sys\nsys.argv.insert(1, {str(ROOT / "coldbox")!r})\n' +
+                                host.replace('loader.exec_module(cb)\n',
+                                             'loader.exec_module(cb)\ncb.__file__ = __file__\n'))
+            command = [sys.executable, str(launcher)]
+        return subprocess.run([*command, *args], env=env,
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+    def wait_for(self, env, name, *states):
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            status = json.loads(self.coldbox(env, 'api', 'status', name).stdout)
+            if status['state'] in states:
+                return status
+            time.sleep(0.2)
+        self.fail(f'{name} never reached {states}: {status}')
+
+    def fake_cache(self, *, visibility='private', full_name='me/app', branch_sha=SHA, public_runner=False):
+        tmp, env = self.fake_incus()
+        bundle = tmp / 'state/cache/me/app/npm.tar'
+        bundle.parent.mkdir(parents=True)
+        source = tmp / 'package'
+        source.write_text('seeded package')
+        with tarfile.open(bundle, 'w') as archive:
+            archive.add(source, arcname='.npm/package')
+        fake = tmp / 'incus'
+        fake.write_text(fake.read_text().replace(
+            '  *" exec "*)\n',
+            f'  *" exec "*" tar -x "*) mkdir -p {tmp}/restored/"$5"; exec tar -x -C {tmp}/restored/"$5" .npm ;;\n'
+            '  *" exec "*)\n', 1))
+        host = RunRepo.HOST.replace('sys.exit(', f'''
+def app_request(path, token):
+    repo = 'repos/me/app'
+    if path == repo:
+        return dict(full_name={full_name!r}, visibility={visibility!r})
+    if path == repo + '/commits/{SHA}/branches-where-head':
+        return [dict(name='topic', commit=dict(sha={branch_sha!r}))] if {branch_sha!r} else []
+    raise RuntimeError('GitHub unavailable')
+cb.app_request = app_request
+cb.registrations = lambda: [dict(target='Me/App', allow_public={public_runner!r})]
+sys.exit(''')
+        return tmp, env, bundle, host
+
+    def test_direct_cli_and_api_restore_the_same_repo_cache_without_refreshing_it(self):
+        tmp, env, bundle, host = self.fake_cache()
+        original = bundle.read_bytes()
+        self.coldbox(env, 'run', '--repo', 'me/app', '--sha', SHA, host=host)
+        first = self.receipt(tmp)
+        request = json.loads(self.coldbox(env, 'api', 'submit', '--repo', 'me/app', '--sha', SHA, host=host).stdout)
+        self.assertEqual(self.wait_for(env, request['id'], 'done', 'failed')['state'], 'done')
+        second = json.loads(self.coldbox(env, 'api', 'receipt', request['id'], host=host).stdout)
+        for receipt in (first, second):
+            self.assertTrue(receipt['vm']['destroyed'])
+            self.assertIn('cache', receipt)
+            cache = receipt['cache']
+            self.assertEqual((cache['in_bytes'], cache['in_exit']), (len(original), 0))
+            self.assertEqual((tmp / 'restored' / receipt['id'] / '.npm/package').read_text(), 'seeded package')
+            self.assertNotIn('out_bytes', cache)
+        self.assertNotEqual(first['id'], second['id'])
+        self.assertEqual(list(bundle.parent.iterdir()), [bundle])
+        self.assertEqual(bundle.read_bytes(), original)
+
+    def test_direct_run_omits_cache_without_opt_in_and_trusted_repo_branch(self):
+        for reason, options in (
+                ('disabled', {}),
+                ('other repo', {}),
+                ('public', dict(visibility='public')),
+                ('renamed', dict(full_name='me/new-name')),
+                ('public runner', dict(public_runner=True)),
+                ('fork SHA', dict(branch_sha=None)),
+                ('unavailable', {})):
+            with self.subTest(reason=reason):
+                tmp, env, bundle, host = self.fake_cache(**options)
+                target = 'me/app'
+                if reason == 'disabled':
+                    bundle.unlink()
+                    bundle.parent.rmdir()
+                if reason == 'other repo':
+                    target = 'me/other'
+                if reason == 'unavailable':
+                    host = host.replace("repo = 'repos/me/app'", "repo = 'repos/me/unavailable'")
+                self.coldbox(env, 'run', '--repo', target, '--sha', SHA, host=host)
+                receipt = self.receipt(tmp)
+                self.assertTrue(receipt['vm']['destroyed'])
+                self.assertNotIn('cache', receipt)
+                self.assertFalse((tmp / 'restored').exists())
+
+    def submit_profile(self, profile):
+        root = git_repo({'coldbox.toml': """
+[commands]
+test = "python3 -m unittest -q && touch selected"
+lint = "touch unselected"
+verify = "touch disabled"
+[checks]
+verify = false
+[profiles]
+quick = ["test"]
+blocked = ["test", "verify"]
+""", 'test_example.py': 'import unittest\n\nclass Example(unittest.TestCase):\n'
+                               '    def test_sanity(self):\n        self.assertEqual(2 + 2, 4)\n'})
+        sha = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
+        tmp, env = self.fake_incus()
+        fake = tmp / 'incus'
+        fake.write_text(fake.read_text().replace(
+            '  *" exec "*)\n',
+            f'  *" exec "*"coldbox checks --profile="*)\n'
+            '    while [ "$#" -gt 1 ]; do shift; done\n'
+            f'    cd {root} && exec env COLDBOX_JOB_DIR={tmp} {shlex.quote(sys.executable)} '
+            f'{shlex.quote(str(ROOT / "coldbox"))} checks "$1" ;;\n'
+            '  *" exec "*)\n', 1).replace(
+                '  *" file pull "*) exit 1 ;;',
+                f'  *" file pull "*"/checks.json "*) '
+                f'cat {tmp}/checks.json ;;\n'
+                '  *" file pull "*) exit 1 ;;'))
+        submitted = self.coldbox(env, 'api', 'submit', '--repo', 'me/app', '--sha', sha, '--profile', profile)
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        sub = json.loads(submitted.stdout)
+        status = self.wait_for(env, sub['id'], 'done', 'failed')
+        receipt = self.coldbox(env, 'api', 'receipt', sub['id'])
+        self.assertEqual((tmp / 'clone-args').read_text().splitlines()[-1], sha)
+        return root, sha, status, json.loads(receipt.stdout)
+
+    def test_explicit_profile_runs_only_the_named_checks_at_the_requested_sha(self):
+        root, sha, status, receipt = self.submit_profile('quick')
+        self.assertEqual((status['state'], status['profile'], status['sha']), ('done', 'quick', sha))
+        self.assertEqual((receipt['sha'], receipt['profile'], receipt['vm']['destroyed']), (sha, 'quick', True))
+        self.assertEqual([(check['check'], check['status']) for check in receipt['checks']], [('test', 'pass')])
+        self.assertTrue((root / 'selected').exists())
+        self.assertFalse((root / 'unselected').exists())
+
+    def test_unknown_or_disabled_profile_is_refused_before_running_any_check(self):
+        for profile, cause in (('absent', 'unknown_profile'), ('blocked', 'unauthorized_profile')):
+            with self.subTest(profile=profile):
+                root, sha, status, receipt = self.submit_profile(profile)
+                self.assertEqual((status['state'], status['verdict'], status['cause']), ('done', 'refused', cause))
+                self.assertEqual((receipt['sha'], receipt['profile'], receipt['verdict'], receipt['cause'],
+                                  receipt['checks'], receipt['vm']['destroyed']),
+                                 (sha, profile, 'refused', cause, [], True))
+                self.assertFalse(any((root / path).exists() for path in ('selected', 'unselected', 'disabled')))
+
+    def test_submit_returns_at_once_and_receipt_returns_the_same_receipt_run_writes(self):
+        tmp, env = self.fake_incus()
+        submitted = self.coldbox(env, 'api', 'submit', '--repo', 'me/app', '--sha', SHA)
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        sub = json.loads(submitted.stdout)
+        self.assertEqual(sub['receipt'], str(tmp / 'state' / 'receipts' / f"{sub['id']}.json"))
+        status = self.wait_for(env, sub['id'], 'done')
+        written = self.receipt(tmp)
+        self.assertEqual(status, dict(id=sub['id'], receipt=sub['receipt'], state='done', verdict=written['verdict']))
+        fetched = self.coldbox(env, 'api', 'receipt', sub['id'])
+        self.assertEqual(json.loads(fetched.stdout), written)
+        self.assertEqual((written['id'], written['mode'], written['repo'], written['sha'], written['vm']['destroyed']),
+                         (sub['id'], 'local', 'me/app', SHA, True))
+        self.assertEqual(fetched.returncode, cb.exit_code(written))
+        args = (tmp / 'clone-args').read_text().splitlines()
+        self.assertEqual(args[-3:], ['clone', 'https://github.com/me/app', SHA])
+        RunRepo.assert_no_token(self, tmp, fetched)
+
+    def test_submit_keeps_unrelated_caller_environment_out_of_the_worker_and_receipt(self):
+        tmp, env = self.fake_incus()
+        sentinel = 'fake-coldbox-caller-value'
+        observed = tmp / 'worker-saw-sentinel'
+        host = RunRepo.HOST.replace('sys.exit(', f'''
+app_token = cb.app_token
+def observe_worker(path, scope):
+    startup = cb.Path('/proc/self/environ').read_bytes().split(b'\\0')
+    present = b'CBX_TEST_SENTINEL={sentinel}' in startup or 'CBX_TEST_SENTINEL' in cb.os.environ
+    cb.Path({str(observed)!r}).write_text(str(present))
+    return app_token(path, scope)
+cb.app_token = observe_worker
+sys.exit(''')
+        submitted = self.coldbox(dict(env, CBX_TEST_SENTINEL=sentinel), 'api', 'submit',
+                                 '--repo', 'me/app', '--sha', SHA, host=host)
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        sub = json.loads(submitted.stdout)
+        self.assertEqual(self.wait_for(env, sub['id'], 'done', 'failed')['state'], 'done')
+        self.assertEqual(observed.read_text(), 'False')
+        self.assertNotIn(sentinel, Path(sub['receipt']).read_text())
+
+    def test_a_submission_waits_queued_at_the_ceiling_then_fails_without_a_receipt(self):
+        tmp, env = self.fake_incus()
+        sub = json.loads(self.coldbox(env, 'api', 'submit', '--repo', 'me/app', '--sha', SHA, host=self.FULL_HOST).stdout)
+        self.assertEqual(json.loads(self.coldbox(env, 'api', 'status', sub['id']).stdout)['state'], 'queued')
+        waiting = self.coldbox(env, 'api', 'receipt', sub['id'])
+        self.assertEqual((waiting.returncode, waiting.stdout), (75, ''))
+        status = self.wait_for(env, sub['id'], 'failed')
+        self.assertIn('job VM ceiling', status['error'])
+        self.assertEqual(self.coldbox(env, 'api', 'receipt', sub['id']).returncode, 125)
+        self.assertFalse((tmp / 'calls').exists() and ' start ' in (tmp / 'calls').read_text())
+
+    def test_a_queued_submission_that_is_signalled_logs_why_it_stopped(self):
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            tmp, env = self.fake_incus()
+            sub = json.loads(self.coldbox(env, 'api', 'submit', '--repo', 'me/app', '--sha', SHA,
+                                          host=self.FULL_HOST).stdout)
+            log = tmp / 'state' / 'receipts' / f"{sub['id']}.submit.log"
+            deadline = time.monotonic() + 30
+            while 'waiting' not in log.read_text() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            holders = {int(fd.parent.parent.name) for fd in Path('/proc').glob('[0-9]*/fd/*')
+                       if os.path.realpath(fd) == str(log)}
+            worker, = [pid for pid in holders if os.getsid(pid) == pid]
+            os.kill(worker, signum)
+            status = self.wait_for(env, sub['id'], 'failed')
+            self.assertEqual(status['error'], f'coldbox: the submission worker got {signum.name} and stopped')
+
+    def test_the_run_a_submission_re_execs_into_logs_a_signal_too(self):
+        tmp, env = self.fake_incus()
+        log = tmp / 'run.log'
+        with log.open('w') as err:
+            worker = subprocess.Popen([sys.executable, '-c', self.FULL_HOST, str(ROOT / 'coldbox'), 'run', '--repo',
+                                       'me/app', '--sha', SHA, '--name', 'cbx-1-abcdef-test'], env=env,
+                                      stdin=subprocess.DEVNULL, stdout=err, stderr=err)
+        deadline = time.monotonic() + 30
+        while 'waiting' not in log.read_text() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        worker.send_signal(signal.SIGTERM)
+        self.assertEqual(worker.wait(30), 1)
+        self.assertEqual(log.read_text().strip().split('\n')[-1],
+                         'coldbox: the submission worker got SIGTERM and stopped')
+
+    def test_a_signal_during_a_jobs_cleanup_is_logged_and_does_not_interrupt_it(self):
+        saved = signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP)
+        self.addCleanup(signal.signal, signal.SIGTERM, saved[0])
+        self.addCleanup(signal.signal, signal.SIGHUP, saved[1])
+        self.addCleanup(cb.CLEANUP.clear)
+        cb.CLEANUP.set()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            cb.submission_stopped(signal.SIGTERM, None)
+        self.assertIn('got SIGTERM and stopped after its job', err.getvalue())
+        self.assertEqual((signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP)),
+                         (signal.SIG_IGN, signal.SIG_IGN))
+
+    def test_a_callers_python_cpu_count_does_not_shrink_the_host_for_a_submission(self):
+        tmp, env = self.fake_incus()
+        host = RunRepo.HOST.replace('sys.exit(', 'cb.RUN_WAIT_SECONDS, cb.AUTOSCALE_SECONDS = 2, 0.2\nsys.exit(')
+        sub = json.loads(self.coldbox(dict(env, PYTHON_CPU_COUNT='1'), 'api', 'submit', '--repo', 'me/app', '--sha', SHA,
+                                      host=host).stdout)
+        status = self.wait_for(env, sub['id'], 'done', 'failed')
+        self.assertEqual(status['state'], 'done', (tmp / 'state' / 'receipts' / f"{sub['id']}.submit.log").read_text())
+
+    def test_a_submission_queued_at_a_full_host_starts_when_room_appears(self):
+        tmp, env = self.fake_incus()
+        load = tmp / 'load'
+        load.write_text('1000')
+        host = RunRepo.HOST.replace('lambda: (0.0, 0.0, 0.0)', f'lambda: (float(open({str(load)!r}).read()),) * 3').replace(
+            'sys.exit(', 'cb.AUTOSCALE_SECONDS = 0.2\nsys.exit(')
+        sub = json.loads(self.coldbox(env, 'api', 'submit', '--repo', 'me/app', '--sha', SHA, host=host).stdout)
+        self.wait_for(env, sub['id'], 'queued')
+        log = tmp / 'state' / 'receipts' / f"{sub['id']}.submit.log"
+        deadline = time.monotonic() + 30
+        while 'at its job VM ceiling; waiting' not in log.read_text() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertIn('no room for a job VM: load', log.read_text())
+        load.write_text('0')
+        self.assertEqual(self.wait_for(env, sub['id'], 'done', 'failed')['state'], 'done', log.read_text())
+
+    def test_submissions_keep_fifo_order_under_a_one_vm_ceiling(self):
+        tmp, env = self.fake_incus()
+        host = RunRepo.HOST.replace('sys.exit(', f'''
+root = cb.Path({str(tmp)!r})
+cb.host_cpus = lambda: 3
+cb.host_setting = lambda *args: 0
+cb.os.getloadavg = lambda: (0.0, 0.0, 0.0) if (root / 'room').exists() else (1000.0,) * 3
+cb.AUTOSCALE_SECONDS = 0.05
+admit, boot = cb.admit, cb.boot
+
+def try_admit(target, *args, **kwargs):
+    if target == 'me/first' and (root / 'first-waiting').exists():
+        deadline = cb.time.monotonic() + 10
+        while not (root / 'second-tried').exists() and cb.time.monotonic() < deadline:
+            cb.time.sleep(0.01)
+    accepted = admit(target, *args, **kwargs)
+    if target == 'me/first' and not accepted:
+        (root / 'first-waiting').touch()
+    if target == 'me/second' and (root / 'room').exists():
+        (root / 'second-tried').touch()
+    return accepted
+
+def hold_first(name, *args):
+    with (root / 'boot-order').open('a') as order:
+        print(name, file=order)
+    if name == (root / 'first-id').read_text():
+        deadline = cb.time.monotonic() + 10
+        while not (root / 'finish-first').exists() and cb.time.monotonic() < deadline:
+            cb.time.sleep(0.01)
+    return boot(name, *args)
+
+cb.admit, cb.boot = try_admit, hold_first
+sys.exit(''')
+        first = json.loads(self.coldbox(env, 'api', 'submit', '--repo', 'me/first', '--sha', SHA, host=host).stdout)
+        (tmp / 'first-id').write_text(first['id'])
+        deadline = time.monotonic() + 10
+        while not (tmp / 'first-waiting').exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue((tmp / 'first-waiting').exists())
+        second = json.loads(self.coldbox(env, 'api', 'submit', '--repo', 'me/second', '--sha', SHA, host=host).stdout)
+        self.wait_for(env, second['id'], 'queued')
+        (tmp / 'room').touch()
+        try:
+            self.wait_for(env, first['id'], 'running', 'done')
+            self.assertEqual(self.wait_for(env, second['id'], 'queued', 'running', 'done')['state'], 'queued')
+        finally:
+            (tmp / 'finish-first').touch()
+        for request in (first, second):
+            self.assertEqual(self.wait_for(env, request['id'], 'done', 'failed')['state'], 'done')
+        self.assertEqual((tmp / 'boot-order').read_text().splitlines(), [first['id'], second['id']])
+
+    def test_queue_rejects_at_capacity_and_recovers_after_worker_exit(self):
+        tmp, env = self.fake_incus()
+        host = RunRepo.HOST.replace('sys.exit(', f'''
+cb.SUBMISSION_LIMIT = 1
+cb.AUTOSCALE_SECONDS = 0.05
+root = cb.Path({str(tmp)!r})
+cb.os.getloadavg = lambda: (0.0, 0.0, 0.0) if (root / 'room').exists() else (1000.0,) * 3
+admit = cb.admit
+def interrupt(*args, **kwargs):
+    accepted = admit(*args, **kwargs)
+    if not accepted and (root / 'interrupt').exists():
+        cb.os._exit(91)
+    return accepted
+cb.admit = interrupt
+sys.exit(''')
+        request = self.coldbox(env, 'api', 'submit', '--repo', 'me/app', '--sha', SHA, host=host)
+        first = json.loads(request.stdout)
+        declined = self.coldbox(env, 'api', 'submit', '--repo', 'me/app', '--sha', SHA, host=host)
+        try:
+            self.assertEqual(declined.returncode, 75, declined.stdout)
+            self.assertEqual(json.loads(declined.stdout), dict(state='refused', cause='queue_full',
+                                                             error='the submission queue is full'))
+        finally:
+            (tmp / 'interrupt').touch()
+        failed = self.wait_for(env, first['id'], 'failed')
+        self.assertEqual(failed['cause'], 'worker_interrupted')
+        self.assertEqual(failed['error'], 'the submission worker exited before admission')
+        (tmp / 'interrupt').unlink()
+        (tmp / 'room').touch()
+        next_request = self.coldbox(env, 'api', 'submit', '--repo', 'me/app', '--sha', SHA, host=host)
+        self.assertEqual(next_request.returncode, 0, next_request.stderr)
+        self.assertEqual(self.wait_for(env, json.loads(next_request.stdout)['id'], 'done', 'failed')['state'], 'done')
+        (tmp / 'state' / 'receipts' / f"{first['id']}.submit.log").unlink()
+        self.assertEqual(json.loads(self.coldbox(env, 'api', 'status', first['id']).stdout), failed)
+
+    def test_queue_deadline_survives_the_submit_process(self):
+        _, env = self.fake_incus()
+        host = self.FULL_HOST.replace('RUN_WAIT_SECONDS, cb.AUTOSCALE_SECONDS = 10,',
+                                      'RUN_WAIT_SECONDS, cb.AUTOSCALE_SECONDS = 2,')
+        submitted = self.coldbox(env, 'api', 'submit', '--repo', 'me/app', '--sha', SHA, host=host)
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        name = json.loads(submitted.stdout)['id']
+        failed = self.wait_for(env, name, 'failed')
+        self.assertEqual(failed['cause'], 'queue_timeout')
+        self.assertEqual(json.loads(self.coldbox(env, 'api', 'status', name).stdout), failed)
+
+    def test_a_capacity_check_that_outlasts_the_queue_deadline_records_a_timeout(self):
+        tmp, env = self.fake_incus()
+        host = RunRepo.HOST.replace('sys.exit(', '''
+monotonic, wall = cb.time.monotonic, cb.time.time
+def slow_room(*args):
+    elapsed = cb.RUN_WAIT_SECONDS + 1
+    cb.time.monotonic = lambda: monotonic() + elapsed
+    cb.time.time = lambda: wall() + elapsed
+    return dict(ceiling=0, memory=1, load=1)
+cb.host_room = slow_room
+sys.exit(''')
+        submitted = self.coldbox(env, 'api', 'submit', '--repo', 'me/app', '--sha', SHA, host=host)
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        name = json.loads(submitted.stdout)['id']
+        log = tmp / 'state' / 'receipts' / f'{name}.submit.log'
+        deadline = time.monotonic() + 10
+        with log.open('rb') as held:
+            while True:
+                try:
+                    fcntl.flock(held, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        self.fail('submission worker did not exit')
+                    time.sleep(0.05)
+        log.unlink()
+        failed = self.wait_for(env, name, 'failed')
+        self.assertEqual(failed['cause'], 'queue_timeout')
+
+    def test_unknown_or_malformed_ids_are_refused(self):
+        tmp, env = self.fake_incus()
+        unknown = self.coldbox(env, 'api', 'status', 'cbx-1-abcdef-host')
+        self.assertEqual(unknown.returncode, 1)
+        self.assertIn('no submission', unknown.stderr)
+        for bad in ('../x', 'cbx-1-abcdef-host/../../etc', 'cbx-1-ABCDEF-host'):
+            self.assertEqual(self.coldbox(env, 'api', 'receipt', bad).returncode, 2, bad)
+        self.assertEqual(self.coldbox(env, 'api', 'submit', '--repo', 'me/app', '--sha', SHA[:7]).returncode, 2)
 
 
 class IsolationSelftest(unittest.TestCase):
@@ -6111,9 +10102,26 @@ class CIAdmission(unittest.TestCase):
             code, output = quiet(cb.admission_check, args, env)
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(output)['guest'], 'cbx-long')
-            record['admitted_at'] = 30001
+            record['admitted_at'] = 30003
             with self.assertRaisesRegex(RuntimeError, 'guard failed'):
                 cb.admission_check(args, env)
+
+    def test_a_guest_clock_up_to_two_seconds_behind_admission_passes_and_further_behind_fails(self):
+        record = dict(schema='coldbox.admission/v1', host='ci-primary', primary='ci-primary',
+                      target='me/app', guest='cbx-skew', admitted_at=30000.0, ttl=600, primary_capacity=None)
+        args = argparse.Namespace(expected_primary='ci-primary', overflow_host=[])
+        env = dict(RUNNER_NAME='cbx-skew', GITHUB_REPOSITORY='me/app')
+        def read(path):
+            return json.dumps(record) if str(path).endswith('admission.json') else 'ci-primary'
+        self.assertEqual(cb.ADMISSION_CLOCK_SKEW, 2)
+        with mock.patch.object(cb.Path, 'read_text', read):
+            for behind in (0.0, 0.577, 1.9, 2.0):
+                with self.subTest(behind=behind), mock.patch.object(cb.time, 'time', return_value=30000.0 - behind):
+                    self.assertEqual(quiet(cb.admission_check, args, env)[0], 0)
+            for behind in (2.1, 60.0, 86400.0):
+                with self.subTest(behind=behind), mock.patch.object(cb.time, 'time', return_value=30000.0 - behind), \
+                        self.assertRaisesRegex(RuntimeError, 'admission identity or time mismatch'):
+                    cb.admission_check(args, env)
 
     def test_runner_admission_sidecar_does_not_break_status(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -6162,6 +10170,7 @@ class CIAdmission(unittest.TestCase):
 
     def test_the_idle_timer_starts_after_guest_preparation(self):
         events = []
+        self.enterContext(mock.patch.object(cb, 'STATE', Path(self.enterContext(tempfile.TemporaryDirectory()))))
         timer = mock.Mock()
         timer.start.side_effect = lambda: events.append('timer')
         def prepared_job(*args, **kwargs):
@@ -6173,9 +10182,10 @@ class CIAdmission(unittest.TestCase):
                                   ttl=600, name='cbx-overflow', allow_public=False, allow_forks=False, size='default')
         for signum in (cb.signal.SIGTERM, cb.signal.SIGUSR1):
             self.addCleanup(cb.signal.signal, signum, cb.signal.getsignal(signum))
+        cb.note_worker(os.getpid(), args.target, args.name, 'burst')
         with mock.patch.multiple(cb, ci_host=lambda: ('overflow-host', 'primary-host'),
                                  runner_admission=lambda *a: {}, guard=lambda *a: None,
-                                 note_worker=lambda *a: None, job=prepared_job,
+                                 job=prepared_job,
                                  gh=lambda *a, **kw: {'runner': {'id': 7}, 'encoded_jit_config': 'c'}), \
                 mock.patch.object(cb.threading, 'Timer', return_value=timer) as factory:
             self.assertEqual(quiet(cb.serve, args)[0], 0)
@@ -6244,6 +10254,210 @@ class VmResources(unittest.TestCase):
 class Stats(unittest.TestCase):
     NOW = cb.at('2026-11-11T12:00:00+00:00')
 
+    def test_stats_json_exit_distinguishes_complete_orphan_and_unreadable(self):
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        with mock.patch.object(cb.time, 'time', return_value=self.NOW), \
+                mock.patch.object(cb, 'STATS_CONFIG', folder / 'stats.toml'):
+            argv = ['stats', '--json', '--receipts', str(folder)]
+            for problem, expected, orphans, unreadable in (
+                ('empty', 0, 0, 0), ('orphan', 1, 1, 0), ('corrupt', 2, 0, 1),
+                ('wrong_vm_type', 2, 0, 1), ('missing', 2, 0, 1)
+            ):
+                with self.subTest(problem=problem):
+                    path = folder / 'cbx-test.json'
+                    if problem == 'orphan':
+                        receipt = unfinished_receipt('cbx-test')
+                        receipt['seconds'] = 60
+                        receipt['started_at'] = '2026-11-11T11:55:00Z'
+                        path.write_text(json.dumps(receipt))
+                    if problem == 'corrupt':
+                        path.write_text('{')
+                    if problem == 'wrong_vm_type':
+                        path.write_text(json.dumps(dict(started_at='2026-11-11T11:55:00Z', vm=['invalid'])))
+                    command = argv if problem != 'missing' else [*argv[:-1], str(folder / 'missing')]
+                    code, output = quiet(cb.main, command)
+                    report = json.loads(output)
+                    self.assertEqual((code, report.get('schema_version'), report['orphans'],
+                                      report['unreadable_receipts']), (expected, 1, orphans, unreadable))
+
+    def test_stats_json_exits_incomplete_for_unreadable_queue_sources(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        folder = state / 'receipts'
+        for path in (state / 'queues' / 'me' / 'app.json', folder / 'submissions' / 'queue.json'):
+            path.parent.mkdir(parents=True)
+            path.write_text('{')
+        argv = ['stats', '--json', '--receipts', str(folder)]
+        with mock.patch.object(cb.time, 'time', return_value=self.NOW), \
+                mock.patch.object(cb, 'STATS_CONFIG', state / 'stats.toml'):
+            code, output = quiet(cb.main, argv)
+            report = json.loads(output)
+            self.assertEqual((code, report['unreadable_receipts'], report['requests']['unreadable_queue_sources']),
+                             (2, 0, 2))
+            receipt = unfinished_receipt('cbx-test')
+            receipt.update(seconds=60, started_at='2026-11-11T11:55:00Z')
+            cb.write_json(folder / 'cbx-test.json', receipt)
+            self.assertEqual(quiet(cb.main, argv)[0], 1)
+
+    def test_stats_attributes_resources_and_leaves_unmeasured_jobs_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            folder = state / 'receipts'
+            folder.mkdir()
+            config = state / 'stats.toml'
+            passed = self.runner('cbx-pass', 2000, 5, 40, 100, verdict='pass')
+            passed['tests'] = dict(total=2, skipped=1, results=[dict(status='passed', seconds=2.75),
+                                                                dict(status='skipped', seconds=90)])
+            passed['cache'] = dict(in_bytes=0, pip=dict(in_bytes=42, in_exit=0))
+            passed['vm']['reclaimed_bytes'] = 512
+            failed = self.runner('cbx-fail', 2200, 5, 40, 100, verdict='fail')
+            failed['tests'] = dict(total=2, skipped=0, truncated=True, results=[dict(status='failed', seconds=1)])
+            failed['cache'] = dict(in_bytes=99, in_exit=2)
+            wait = dict(self.runner('cbx-wait', 2700, None, 30, 1), github=None,
+                        vm=dict(destroyed=False, ttl_seconds=3600))
+            del wait['seconds']
+            unobserved = dict(wait, id='cbx-unobserved', started_at='2026-11-11T11:58:20+00:00')
+            for receipt in (passed, failed, wait, unobserved):
+                receipt['log'] = str(folder / f"{receipt['id']}.log")
+                cb.write_json(folder / f"{receipt['id']}.json", receipt)
+            (folder / 'cbx-wait.log').write_text('2026-11-11 11:56:40Z: Listening for Jobs\n')
+            (folder / 'cbx-pass.log').write_text('2026-11-11 11:43:45Z: Listening for Jobs\n'
+                                                '2026-11-11 11:44:05Z: Running job: verify\n')
+            with mock.patch.object(cb.time, 'time', return_value=self.NOW), mock.patch.object(cb, 'STATE', state), \
+                    mock.patch.object(cb, 'STATS_CONFIG', config, create=True):
+                code, raw = quiet(cb.main, ['stats', '--since', '24h', '--json'])
+                config.write_text('[cost]\nper_vm_hour = 10\n')
+                priced_code, priced = quiet(cb.main, ['stats', '--since', '24h', '--json'])
+                _, display = quiet(cb.main, ['stats', '--since', '24h'])
+                config.write_text('[cost]\nper_vm_hour = true\n')
+                invalid, errors = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(invalid), contextlib.redirect_stderr(errors):
+                    cb.main(['stats', '--since', '24h', '--json'])
+                (folder / 'cbx-unreadable.json').write_text('{')
+                config.write_text('[cost]\nper_vm_hour = 10\n')
+                _, partial = quiet(cb.main, ['stats', '--since', '24h', '--json'])
+        self.assertEqual((code, priced_code), (0, 0))
+        report = json.loads(raw)
+        self.assertEqual(report['requests']['assignment_unknown'], 1)
+        self.assertEqual(report['resources'], dict(junit_test_seconds=2.75, junit_jobs=1,
+                                                   idle_vm_hours=0.061111, idle_vms=2, idle_vms_unknown=2,
+                                                   reclaimed_bytes_per_job=512, reclaimed_jobs=1,
+                                                   reclaimed_jobs_unknown=1, cache_hit_share=0.5, cache_jobs=2,
+                                                   vm_hours=0.2, passing_jobs=1, cost_per_pass='unknown'))
+        self.assertEqual(json.loads(priced)['resources']['cost_per_pass'], 2)
+        self.assertIn('cost per pass: 2.0', display)
+        self.assertEqual(json.loads(invalid.getvalue())['resources']['cost_per_pass'], 'unknown')
+        self.assertIn('per_vm_hour must be a finite, non-negative number', errors.getvalue())
+        self.assertEqual(json.loads(partial)['resources']['cost_per_pass'], 'unknown')
+        self.assertEqual(json.loads(partial)['unreadable_receipts'], 1)
+
+    def test_destroy_only_attributes_a_pool_delta_to_an_isolated_job(self):
+        target = f'/1.0/instances/cbx-job?project={cb.PROJECT}'
+        base = f'/1.0/instances/base-dev?project={cb.PROJECT}'
+        other = f'/1.0/instances/cbx-other?project={cb.PROJECT}'
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            for lock in ('autoscale.lock', 'build-base.lock'):
+                (state / lock).touch()
+            for label, samples, gone, reclaimed in (
+                ('isolated', [(frozenset({target, base}), 1000), (frozenset({base}), 750)], True, 250),
+                ('another VM', [(frozenset({target, base, other}), 1000)], True, None),
+                ('no drop yet', [(frozenset({target, base}), 1000), (frozenset({base}), 1000)], True, None),
+                ('pool gained use', [(frozenset({target, base}), 1000), (frozenset({base}), 1100)], True, None),
+                ('delete failed', [(frozenset({target, base}), 1000)], False, None),
+            ):
+                with self.subTest(label=label), mock.patch.multiple(
+                        cb, STATE=state, pool_sample=mock.Mock(side_effect=samples), destroy=mock.Mock(return_value=gone)), \
+                        mock.patch.object(cb.time, 'sleep'):
+                    self.assertEqual(cb.destroy_job('cbx-job')[:2], (gone, reclaimed))
+                    if label == 'another VM':
+                        cb.destroy.assert_called_once_with('cbx-job')
+                    elif gone:
+                        cb.destroy.assert_called_once_with('cbx-job', attempts=1, stop_sampling=mock.ANY)
+                    else:
+                        cb.destroy.assert_has_calls([mock.call('cbx-job', attempts=1, stop_sampling=mock.ANY),
+                                                     mock.call('cbx-job', attempts=2)])
+
+    def test_slow_teardown_finishes_the_same_delete_without_pool_attribution(self):
+        name = 'cbx-job'
+        target = f'/1.0/instances/{name}?project={cb.PROJECT}'
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            for lock in ('autoscale.lock', 'build-base.lock'):
+                (state / lock).touch()
+            samples = mock.Mock(return_value=(frozenset({target}), 1000))
+            delete = mock.MagicMock(returncode=0)
+            confirm = mock.MagicMock(returncode=1)
+            delete.__enter__.return_value = delete
+            confirm.__enter__.return_value = confirm
+
+            def finish_delete(*_, timeout=None):
+                if timeout is not None:
+                    raise subprocess.TimeoutExpired('incus delete', timeout)
+                with (state / 'autoscale.lock').open('rb') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return b'', b''
+
+            delete.communicate.side_effect = finish_delete
+            confirm.communicate.return_value = b'', b'Instance not found'
+            with mock.patch.multiple(cb, STATE=state, pool_sample=samples), \
+                    mock.patch.object(cb.subprocess, 'Popen', side_effect=[delete, confirm]) as popen:
+                self.assertEqual(cb.destroy_job(name)[:2], (True, None))
+            self.assertEqual(popen.call_count, 2)
+            delete.kill.assert_not_called()
+            samples.assert_called_once()
+
+    def test_command_counts_observed_requests_and_measured_phases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            folder, queue = state / 'receipts', state / 'queues' / 'me'
+            folder.mkdir()
+            queue.mkdir(parents=True)
+            submissions = folder / 'submissions'
+            submissions.mkdir()
+            queued = f'cbx-{int(self.NOW) - 200}-abcdef-test'
+            timed_out = f'cbx-{int(self.NOW) - 1700}-abcdea-test'
+            failed = f'cbx-{int(self.NOW) - 1500}-abcdeb-test'
+            cb.write_json(submissions / 'queue.json', [dict(id=queued)])
+            cb.write_json(submissions / f'{timed_out}.json', dict(cause='queue_timeout'))
+            (folder / f'{failed}.submit.log').write_text('worker exited before writing a receipt\n')
+            finished = self.runner('cbx-1', 1000, 10, 40, 100, verdict='pass')
+            finished['vm']['destroy_seconds'] = 7
+            finished['github'].update(job_id=1, queued_at='2026-11-11T11:26:35+00:00')
+            finished['checks'] = [dict(check='setup', status='pass', seconds=9),
+                                  dict(check='test', status='pass', seconds=12),
+                                  dict(check='test', status='not_run', seconds=0)]
+            incomplete = self.runner('cbx-2', 1010, None, 30, 100, verdict='incomplete')
+            incomplete['github']['steps'] = [dict(name='Set up job', seconds=2), dict(name='Set up job', seconds=85)]
+            incomplete['checks'] = [dict(check='test', status='not_run', seconds=0)]
+            linked = self.runner('cbx-3', 1020, None, 20, 100, verdict='incomplete')
+            linked['github'].update(job_id=2, steps=[])
+            for receipt in (finished, incomplete, linked):
+                cb.write_json(folder / f"{receipt['id']}.json", receipt)
+            cb.write_json(queue / 'app.json', dict(observed_at='2026-11-11T11:59:50+00:00',
+                                                  queued=0, accepted_jobs=[
+                                                      dict(id=1, created_at=finished['github']['queued_at']),
+                                                      dict(id=2, created_at='2026-11-11T11:27:10+00:00'),
+                                                      dict(id=3, created_at='2026-11-11T11:59:45+00:00')]))
+            with mock.patch.object(cb.time, 'time', return_value=self.NOW), mock.patch.object(cb, 'STATE', state):
+                code, raw = quiet(cb.main, ['stats', '--since', '1h', '--json'])
+                _, display = quiet(cb.main, ['stats', '--since', '1h'])
+                _, copied = quiet(cb.main, ['stats', '--since', '1h', '--receipts', str(folder), '--json'])
+        self.assertEqual(code, 0)
+        report = json.loads(raw)
+        self.assertEqual({k: report['requests'][k] for k in ('accepted', 'assigned', 'terminal', 'definitive')},
+                         dict(accepted=6, assigned=2, terminal=4, definitive=1))
+        self.assertEqual(report['requests']['unlinked_runner_jobs'], 1)
+        self.assertEqual(report['requests']['log_only_submissions'], 1)
+        self.assertEqual(json.loads(copied)['requests']['terminal'], 3)
+        self.assertEqual(report['requests']['definitive_pct'], 16.7)
+        self.assertEqual(report['phases']['vm_ready'], dict(n=3, missing=0, seconds=90))
+        for phase, seconds in [('runner_setup', 2), ('check_setup', 9), ('test', 12), ('teardown', 7)]:
+            self.assertEqual(report['phases'][phase], dict(n=1, missing=2, seconds=seconds))
+        for line in ('VM ready: 90 s (3/3 jobs measured)', 'runner setup: 2 s (1/3 jobs measured)',
+                     'check setup: 9 s (1/3 jobs measured)', 'test execution: 12 s (1/3 jobs measured)',
+                     'VM teardown: 7 s (1/3 jobs measured)', 'request coverage: unobserved requests unknown'):
+            self.assertIn(line, display)
+
     def runner(self, name, start, queue, ready, wall, host='host-p', repo='me/app', primary='host-p', **extra):
         started = self.NOW - 3000 + start
         stamp = lambda offset: datetime.fromtimestamp(started + offset, timezone.utc).isoformat()
@@ -6261,6 +10475,26 @@ class Stats(unittest.TestCase):
                 self.runner('cbx-2', 50, 30, 60, 300),
                 self.runner('cbx-3', 70, None, 50, 200, host='host-a', repo='me/other'),
                 dict(self.runner('cbx-4', 80, 5, 45, 1), github=None)]
+
+    def test_savings_bill_only_runner_jobs_by_the_rounded_up_minute(self):
+        shell = dict(self.runner('cbx-shell', 90, None, 40, 600), mode='shell', github=None,
+                     job_started_at=datetime.fromtimestamp(self.NOW - 2800, timezone.utc).isoformat(),
+                     job_ended_at=datetime.fromtimestamp(self.NOW - 2200, timezone.utc).isoformat(), exit=0)
+        unmeasured = self.runner('cbx-old', 95, None, 40, 60)
+        del unmeasured['github']['runner_started_at']
+        no_metadata = dict(self.runner('cbx-no-metadata', 96, None, 40, 60), github=None, job_name='verify')
+        backwards = self.runner('cbx-backwards', 97, None, 40, -1)
+        log = Path(tempfile.mkdtemp()) / 'runner.log'
+        log.write_text(datetime.fromtimestamp(self.NOW - 60, timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ: Running job: verify\n'))
+        in_progress = dict(self.runner('cbx-in-progress', 98, None, 40, 60), github=None, log=str(log),
+                           vm=dict(ready_seconds=40, host_ceiling=40, destroyed=False))
+        del in_progress['seconds']
+        report = cb.stats_report([*self.receipts(), shell, unmeasured, no_metadata, backwards, in_progress], 3600, self.NOW)
+        savings = report['savings']
+        self.assertEqual((savings['billable_minutes'], savings['usd_per_minute'], savings['estimated_usd'],
+                          savings['unmeasured_jobs']), (2 + 5 + 4, 0.006, 0.07, 4))
+        self.assertAlmostEqual(savings['vm_minutes'], report['resources']['vm_hours'] * 60, places=2)
+        self.assertGreater(report['savings']['vm_minutes'], (100 + 300 + 200 + 600) / 60)
 
     def test_summarizes_queue_boot_and_job_time_per_repo_and_host(self):
         report = cb.stats_report(self.receipts(), 3600, self.NOW)
@@ -6386,6 +10620,7 @@ class Stats(unittest.TestCase):
         self.assertEqual(report['queue_wait'], dict(n=5, p50=10, p90=30, max=30, missing=0))
         self.assertEqual((report['jobs'], report['jobs_per_hour']), (5, 6))
         self.assertEqual(report['split'], dict(jobs=5, missing=0, orchestration_seconds=270, test_seconds=500,
+                                               job_wall_seconds=500,
                                                orchestration_pct=35.1))
         self.assertEqual(report['orphans'], 2)
         self.assertEqual(cb.stats_report(self.outcome_receipts(), 7 * 86400, self.NOW)['outcomes']['settled'], 8)
@@ -6403,7 +10638,7 @@ class Stats(unittest.TestCase):
         self.assertIn('definitive (pass or fail): 3 of 7 settled, 42.9%', text)
         self.assertIn('incomplete causes: ttl 1, vm_not_ready 1, vm_not_destroyed 1', text)
         self.assertIn('ready p50/p90: 40/60 s; queue p50/p90: 10/30 s; jobs/hour: 6', text)
-        self.assertIn('orchestration (VM ready + destroy) vs test (job wall): 270 s vs 500 s, 35.1% orchestration '
+        self.assertIn('orchestration (VM ready + destroy) vs job wall: 270 s vs 500 s, 35.1% orchestration '
                       'over 5 jobs', text)
         self.assertIn('orphans (vm.destroyed false after the job or its TTL): 2', text)
         empty = cb.stats_text(cb.stats_report([], 3600, self.NOW))
@@ -6415,3 +10650,312 @@ class Stats(unittest.TestCase):
         for text in ('0h', '1', 'h', '-1h', '1w'):
             with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
                 cb.window(text)
+
+
+class VmUpOverlay(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        self.files, self.vm, self.bin = (root / name for name in ('overlay', 'vm', 'guest-bin'))
+        self.marker = self.vm / 'var/lib/coldbox/overlay-dirs'
+        self.owned = os.fsdecode(b'opt/-caf\xe9 tools')
+        self.new = 'opt/coldverify'
+        for directory in (self.files / self.owned, self.files / self.new, self.vm / self.owned,
+                          self.vm / 'usr/local/bin', self.marker.parent, self.bin):
+            directory.mkdir(parents=True)
+        (self.files / self.owned).chmod(0o750)
+        (self.vm / self.owned).chmod(0o2755)
+        (self.files / self.new / 'coldverify').write_text('overlay\n')
+        self.marker.write_bytes(os.fsencode(self.owned) + b'\n')
+        for utility in ('sh', 'mkdir', 'touch', 'grep'):
+            (self.bin / utility).symlink_to(shutil.which(utility))
+        self.stderr = root / 'guest-stderr'
+        self.allow = root / 'vm-allow'
+        self.allow.write_text(f'image custom/ready\nimage {cb.BASE}\n')
+        self.destroy = mock.Mock(return_value=True)
+
+    def guest_exec(self, name, *command, user=cb.RUNNER, timeout=None):
+        if command == ('sudo', '-n', 'true'):
+            return ['true']
+        if command[0] == 'ln':
+            return ['ln', '-sf', command[2], str(self.vm / command[3].lstrip('/'))]
+        command = [str(self.vm) if word == '/' else word for word in command]
+        if command[0] == 'tar':
+            return command
+        if command[0] == '/usr/bin/python3':
+            command[0] = str(self.bin / 'python3')
+        return ['/bin/sh', '-c', 'log=$1; shift; exec "$@" 2>>"$log"', 'sh', str(self.stderr),
+                'env', f'PATH={self.bin}', 'LC_ALL=C', *command]
+
+    def up(self, *options):
+        profile = {('get', 'coldbox', 'limits.cpu'): '4', ('get', 'coldbox', 'limits.memory'): '8GiB',
+                   ('device', 'get', 'coldbox', 'root', 'size'): '20GiB'}
+        with mock.patch.multiple(cb, GUEST_FILES=self.files, VM_ALLOW=self.allow, fleet=lambda: None,
+                                 admit=lambda *args: True, new_id=lambda: 'cbx-9-z', boot=lambda *args, **kwargs: None,
+                                 destroy=self.destroy, ic_exec=self.guest_exec, query=lambda _: {},
+                                 ic=lambda *args: profile[args[1:]], vm_memory=lambda: 8 * GIB, vm_disk=lambda: 20 * GIB):
+            return quiet(cb.main, ['vm', 'up', '--here', '--offline', *options])
+
+    def assert_overlay(self):
+        self.assertEqual(stat.S_IMODE((self.vm / self.owned).stat().st_mode), 0o750)
+        self.assertEqual(self.marker.read_bytes(), os.fsencode(self.owned) + b'\nopt/coldverify\n')
+        self.assertEqual((self.vm / self.new / 'coldverify').read_text(), 'overlay\n')
+        self.assertEqual(os.readlink(self.vm / 'usr/local/bin/coldverify'), '/opt/coldverify/coldverify')
+
+    def test_implicit_image_applies_the_overlay_without_external_chmod(self):
+        (self.bin / 'python3').symlink_to(sys.executable)
+        code, out = self.up()
+        self.assertEqual((code, out), (0, 'cbx-9-z\n'), self.stderr.read_text())
+        self.assert_overlay()
+
+    def test_managed_handler_matches_whole_record_lines_without_running_other_programs(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        record = root / cb.OVERLAY_DIRS_RECORD
+        record.parent.mkdir(parents=True)
+        names = [f'opt/d{index}' for index in range(700)]
+        for name in names + ['opt/a', 'opt/ab', 'opt/x']:
+            (root / name).mkdir(parents=True, exist_ok=True)
+            (root / name).chmod(0o700)
+        (root / 'opt/file').write_text('')
+        (root / 'opt/file').chmod(0o600)
+        record.write_bytes(b'\n'.join(n.encode() for n in names) + b'\nopt/a\nopt/file\n')
+        lines = b''.join(f'0755 {n}\n'.encode() for n in [*names, 'opt/a', 'opt/ab', 'opt/x', 'opt/file', 'opt/new1', 'opt/new2'])
+        done = subprocess.run([sys.executable, '-I', '-B', '-S', '-c', cb.MANAGED_OVERLAY_DIRS, str(root),
+                               cb.OVERLAY_DIRS_RECORD], input=lines + b'0755 opt/partial', capture_output=True,
+                              env=dict(PATH=str(root / 'empty')))
+        self.assertEqual((done.returncode, done.stderr), (0, b''))
+        mode = lambda name: stat.S_IMODE((root / name).stat().st_mode)
+        self.assertEqual({mode(n) for n in names + ['opt/a']}, {0o755})
+        self.assertEqual((mode('opt/ab'), mode('opt/x'), mode('opt/file')), (0o700, 0o700, 0o600))
+        self.assertTrue(record.read_bytes().endswith(b'\nopt/a\nopt/file\nopt/new1\nopt/new2\n'))
+
+    def managed_and_stock(self, record, lines, preexec=None, record_mode=0o644):
+        results = []
+        for handler in (['/bin/sh', '-c', cb.GUEST_OVERLAY_DIRS, 'sh'],
+                        [sys.executable, '-I', '-B', '-S', '-c', cb.MANAGED_OVERLAY_DIRS]):
+            root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+            (root / cb.OVERLAY_DIRS_RECORD).parent.mkdir(parents=True)
+            (root / cb.OVERLAY_DIRS_RECORD).write_bytes(record)
+            (root / cb.OVERLAY_DIRS_RECORD).chmod(record_mode)
+            for name in ('opt/a', 'opt/z'):
+                (root / name).mkdir(parents=True)
+                (root / name).chmod(0o700)
+            done = subprocess.run([*handler, str(root), cb.OVERLAY_DIRS_RECORD], input=lines, capture_output=True,
+                                  preexec_fn=preexec)
+            (root / cb.OVERLAY_DIRS_RECORD).chmod(0o644)
+            results.append((done.returncode != 0, (root / cb.OVERLAY_DIRS_RECORD).read_bytes(),
+                            {name: stat.S_IMODE((root / name).stat().st_mode) for name in ('opt/a', 'opt/z')}))
+        return results
+
+    def test_managed_handler_matches_the_shell_on_an_unterminated_record(self):
+        stock, managed = self.managed_and_stock(b'opt/a\nopt/z', b'0755 opt/new\n0755 opt/a\n0755 opt/z\n')
+        self.assertEqual(managed, stock)
+        self.assertEqual(managed, (False, b'opt/a\nopt/zopt/new\n', {'opt/a': 0o755, 'opt/z': 0o700}))
+
+    def test_managed_handler_matches_the_shell_on_a_write_only_record(self):
+        stock, managed = self.managed_and_stock(b'opt/a\n', b'0755 opt/new\n0755 opt/a\n', record_mode=0o200)
+        self.assertEqual(managed, stock)
+        self.assertEqual(managed[:2], (False, b'opt/a\nopt/new\n'))
+
+    def test_managed_handler_does_not_wait_on_a_fifo_record_it_never_needs_to_read(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (root / cb.OVERLAY_DIRS_RECORD).parent.mkdir(parents=True)
+        os.mkfifo(root / cb.OVERLAY_DIRS_RECORD)
+        for handler in (['/bin/sh', '-c', cb.GUEST_OVERLAY_DIRS, 'sh'],
+                        [sys.executable, '-I', '-B', '-S', '-c', cb.MANAGED_OVERLAY_DIRS]):
+            with self.subTest(handler=handler[0]):
+                done = subprocess.run([*handler, str(root), cb.OVERLAY_DIRS_RECORD], input=b'', capture_output=True,
+                                      timeout=20)
+                self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_managed_handler_fails_when_the_record_cannot_take_a_whole_line(self):
+        import resource
+        def limit():
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (len(b'opt/a\n') + 3, resource.RLIM_INFINITY))
+        stock, managed = self.managed_and_stock(b'opt/a\n', b'0755 opt/new-directory\n0755 opt/a\n', limit)
+        self.assertTrue(stock[0])
+        self.assertTrue(managed[0])
+
+    def test_explicit_images_apply_the_overlay_without_guest_python(self):
+        (self.bin / 'chmod').symlink_to(shutil.which('chmod'))
+        for image in ('custom/ready', cb.BASE):
+            with self.subTest(image=image):
+                (self.vm / self.owned).chmod(0o2755)
+                code, out = self.up('--image', image)
+                self.assertEqual((code, out), (0, 'cbx-9-z\n'), self.stderr.read_text())
+                self.assert_overlay()
+
+    def test_implicit_image_append_failure_stops_before_extract_and_can_retry(self):
+        (self.bin / 'python3').symlink_to(sys.executable)
+        self.marker.unlink()
+        self.marker.mkdir()
+        code, out = self.up()
+        self.assertEqual(code, 125)
+        self.assertNotIn('cbx-9-z\n', out)
+        self.assertIn(f'cannot create {self.marker}: Is a directory', self.stderr.read_text())
+        self.assertFalse((self.vm / self.new).exists())
+        self.assertFalse((self.vm / 'usr/local/bin/coldverify').is_symlink())
+        self.destroy.assert_called_once_with('cbx-9-z')
+        self.marker.rmdir()
+        self.marker.write_bytes(os.fsencode(self.owned) + b'\n')
+        self.assertEqual(self.up(), (0, 'cbx-9-z\n'), self.stderr.read_text())
+        self.assert_overlay()
+
+
+class VmUpOptions(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.allow = self.tmp / 'vm-allow'
+        self.allow.write_text('image cp-net/ready\nnetwork cpbr0\n')
+        self.booted, self.queried, self.sudo = [], [], 0
+        profile = {('get', 'coldbox', 'limits.cpu'): '8\n', ('get', 'coldbox', 'limits.memory'): '16GiB\n',
+                   ('device', 'get', 'coldbox', 'root', 'size'): '40GiB\n'}
+        patches = dict(CI_HOSTS=self.tmp / 'missing', VM_ALLOW=self.allow, admit=mock.Mock(return_value=True),
+                       new_id=lambda: 'cbx-9-z', push_guest_files=lambda name, *, managed=False: None,
+                       vm_memory=lambda: 16 * GIB,
+                       vm_disk=lambda: 40 * GIB, destroy=mock.Mock(return_value=True),
+                       ic=lambda *args: profile[args[1:]], query=self.query,
+                       boot=lambda *args, **kwargs: self.booted.append((args, kwargs)))
+        for name, value in patches.items():
+            patcher = mock.patch.object(cb, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(cb.subprocess, 'run', side_effect=self.fake_run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def query(self, path):
+        self.queried.append(path)
+        if 'missing' in path:
+            raise subprocess.CalledProcessError(1, 'incus')
+        return {}
+
+    def fake_run(self, command, **_):
+        self.assertEqual((command[0], command[-7:]), ('timeout', ['runuser', '-u', 'runner', '--', 'sudo', '-n', 'true']))
+        return argparse.Namespace(returncode=self.sudo)
+
+    def test_up_boots_from_a_listed_image_and_network_with_the_asked_size(self):
+        code, out = quiet(cb.main, ['vm', 'up', '--here', '--image', 'cp-net/ready', '--cpus', '4',
+                                    '--memory', '8GiB', '--disk', '40GiB', '--network', 'cpbr0'])
+        self.assertEqual((code, out), (0, 'cbx-9-z\n'))
+        (name, _, offline, *config), kwargs = self.booted[0]
+        self.assertEqual((name, offline), ('cbx-9-z', False))
+        self.assertEqual(config, ['--config', f'{cb.ADHOC}=true', '--config', 'limits.cpu=4',
+                                  '--config', 'limits.memory=8GiB', '--profile', 'coldbox'])
+        self.assertEqual(kwargs, dict(base='cp-net/ready', bridge='cpbr0', disk='40GiB'))
+        self.assertEqual(self.queried, [f'/1.0/instances/cp-net/snapshots/ready?project={cb.PROJECT}',
+                                        f'/1.0/networks/cpbr0?project={cb.PROJECT}'])
+        self.assertEqual(cb.admit.call_args.args, ('vm', 'cbx-9-z', 'vm'))
+
+    def test_an_image_without_sizes_gets_the_coldbox_profile_limits_not_its_own(self):
+        self.assertEqual(quiet(cb.main, ['vm', 'up', '--image', 'cp-net/ready'])[0], 0)
+        (_, _, _, *config), kwargs = self.booted[0]
+        self.assertEqual(config[2:], ['--config', 'limits.cpu=8', '--config', 'limits.memory=16GiB',
+                                      '--profile', 'coldbox'])
+        self.assertEqual(kwargs, dict(base='cp-net/ready', disk='40GiB'))
+
+    def test_without_options_vm_up_is_unchanged(self):
+        self.assertEqual(quiet(cb.main, ['vm', 'up'])[0], 0)
+        self.assertEqual(self.booted, [(('cbx-9-z', mock.ANY, False, '--config', f'{cb.ADHOC}=true'), {})])
+        self.assertEqual(self.queried, [])
+
+    def test_an_image_or_network_not_listed_by_the_owner_is_refused(self):
+        for text, argv in ((None, ['--image', 'cp-net/ready']), (None, ['--network', 'cpbr0']),
+                           ('network cp-net/ready\nimage cpbr0\n', ['--image', 'cp-net/ready']),
+                           ('image cp-net/ready\n', ['--network', 'cpbr0']),
+                           ('image cp-net/ready\n', ['--image', 'cp-net/ready-2']),
+                           ('# image other/ready\n', ['--image', 'other/ready'])):
+            if text is None:
+                self.allow.unlink(missing_ok=True)
+            else:
+                self.allow.write_text(text)
+            with self.subTest(text=text, argv=argv), self.assertRaisesRegex(SystemExit, 'is not listed in .*vm-allow'):
+                cb.main(['vm', 'up', *argv])
+        cb.admit.assert_not_called()
+        self.assertEqual((self.booted, self.queried), ([], []))
+
+    def test_a_listed_image_or_network_that_does_not_exist_on_this_host_is_refused(self):
+        self.allow.write_text('image missing/ready\nnetwork missingbr0\n')
+        for argv in (['--image', 'missing/ready'], ['--network', 'missingbr0']):
+            with self.subTest(argv=argv), self.assertRaisesRegex(SystemExit, 'listed in .* but does not exist'):
+                cb.main(['vm', 'up', *argv])
+        cb.admit.assert_not_called()
+        self.assertEqual(self.booted, [])
+
+    def test_sizes_above_the_coldbox_profile_are_refused(self):
+        for argv, message in ((['--memory', '17GiB'], "--memory 17GiB is above the coldbox profile"),
+                              (['--disk', '41GiB'], "--disk 41GiB is above the coldbox profile's root disk")):
+            with self.subTest(argv=argv), self.assertRaisesRegex(SystemExit, message):
+                cb.main(['vm', 'up', *argv])
+        with mock.patch.object(cb, 'host_cpus', return_value=40), \
+                self.assertRaisesRegex(SystemExit, "--cpus 9 is above the coldbox profile's limits.cpu"):
+            cb.main(['vm', 'up', '--cpus', '9'])
+        cb.admit.assert_not_called()
+        self.assertEqual(self.booted, [])
+
+    def test_offline_and_a_network_together_are_refused(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
+            cb.main(['vm', 'up', '--offline', '--network', 'cpbr0'])
+        self.assertIn('not allowed with argument', err.getvalue())
+        self.assertEqual(self.booted, [])
+
+    def test_an_image_whose_runner_has_no_passwordless_sudo_is_destroyed(self):
+        self.sudo = 1
+        code, out = quiet(cb.main, ['vm', 'up', '--image', 'cp-net/ready'])
+        self.assertEqual(code, 125)
+        self.assertIn('cp-net/ready has no runner user with passwordless sudo', out)
+        cb.destroy.assert_called_once_with('cbx-9-z')
+        self.assertNotIn('cbx-9-z\n', out)
+
+    def test_a_full_host_forwards_the_options_to_the_peer(self):
+        cb.admit.return_value = False
+        ran = mock.Mock(return_value=argparse.Namespace(returncode=0, stdout='cbx-5-x-vm-a\n'))
+        with mock.patch.multiple(cb, adhoc_peers=lambda: ['vm-a'], least_loaded=lambda peers, _: peers), \
+                mock.patch.object(cb.subprocess, 'run', ran):
+            code, out = quiet(cb.main, ['vm', 'up', '--image', 'cp-net/ready', '--memory', '8GiB',
+                                        '--network', 'cpbr0'])
+        self.assertEqual(code, 0)
+        self.assertEqual(ran.call_args.args[0][-2:], ['vm-a', 'coldbox vm up --here --ttl 7200 --image cp-net/ready '
+                                                               '--memory 8GiB --network cpbr0'])
+        self.assertEqual(self.booted, [])
+
+
+class BootOnANamedNetwork(unittest.TestCase):
+    def boot(self, nic_network, local=None, pool=None, **kwargs):
+        calls = []
+        vm = {'type': 'virtual-machine', 'config': {}, 'expanded_config': {}, 'devices': local or {},
+              'expanded_devices': {'root': {'type': 'disk', 'path': '/', 'pool': pool or cb.POOL},
+                                   'eth0': {'type': 'nic', 'network': nic_network, 'security.port_isolation': 'true'}}}
+        with mock.patch.multiple(cb, sync_acl=lambda: None, ic=lambda *args: calls.append(args) or '',
+                                 query=lambda path: vm, wait_ready=lambda *a, **k: None):
+            cb.boot('cbx-1', 9, False, **kwargs)
+        return calls
+
+    def test_boot_moves_eth0_to_the_network_and_sizes_root_before_starting(self):
+        calls = self.boot('cpbr0', base='cp-net/ready', bridge='cpbr0', disk='48GiB')
+        self.assertEqual(calls[0][:3], ('copy', 'cp-net/ready', 'cbx-1'))
+        self.assertEqual(calls[1:], [('config', 'device', 'override', 'cbx-1', 'eth0', 'network=cpbr0'),
+                                     ('config', 'device', 'override', 'cbx-1', 'root', 'size=48GiB'),
+                                     ('start', 'cbx-1')])
+
+    def test_boot_refuses_a_nic_that_is_not_on_the_asked_network(self):
+        for network, kwargs in (('cpbr0', {}), (cb.BRIDGE, dict(bridge='cpbr0'))):
+            with self.subTest(network=network), self.assertRaisesRegex(RuntimeError, 'NIC is not on the isolated'):
+                self.boot(network, **kwargs)
+
+    def test_an_image_boot_always_takes_eth0_from_the_profile(self):
+        calls = self.boot(cb.BRIDGE, base='cp-net/ready', disk='40GiB')
+        self.assertEqual(calls[1:3], [('config', 'device', 'override', 'cbx-1', 'eth0', f'network={cb.BRIDGE}'),
+                                      ('config', 'device', 'override', 'cbx-1', 'root', 'size=40GiB')])
+
+    def test_an_image_with_its_own_root_disk_is_sized_in_place_only_on_the_coldbox_pool(self):
+        calls = self.boot(cb.BRIDGE, local={'root': {'type': 'disk', 'path': '/'}}, base='cp-net/ready', disk='40GiB')
+        self.assertIn(('config', 'device', 'set', 'cbx-1', 'root', 'size=40GiB'), calls)
+        with self.assertRaisesRegex(RuntimeError, f'root disk is not on the {cb.POOL} pool'):
+            self.boot(cb.BRIDGE, pool='other', base='cp-net/ready', disk='40GiB')
+
+    def test_default_boot_makes_no_overrides(self):
+        calls = self.boot(cb.BRIDGE)
+        self.assertEqual([call[0] for call in calls], ['copy', 'start'])

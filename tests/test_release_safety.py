@@ -118,13 +118,13 @@ class WarmCapacity(unittest.TestCase):
                        live_workers=lambda folder: self.workers, host_vms=lambda: self.vms,
                        registrations=lambda: [], vm_memory=lambda: GIB,
                        host_memory=lambda field='MemTotal': 16 * GIB,
-                       additional_vm_memory=lambda workers, memory, vms=None: 0,
-                       host_setting=lambda *args: 0, host_cpu_load=lambda: 0, storage_refusal=lambda: None)
+                       query=lambda path: [],
+                       host_setting=lambda *args: 0, host_cpu_load=lambda: 0, storage_room=lambda workers: (100, None))
         for name, value in patches.items():
             patcher = mock.patch.object(cb, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        for patcher in (mock.patch.object(cb.os, 'cpu_count', return_value=12),
+        for patcher in (mock.patch.object(cb, 'host_cpus', return_value=12),
                         mock.patch.object(cb.os, 'getloadavg', return_value=(0.0, 0.0, 0.0))):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -151,5 +151,5 @@ class WarmCapacity(unittest.TestCase):
 
     def test_idle_warm_runners_fill_the_core_bound_like_busy_ones(self):
         self.assertTrue(cb.admit('more/repo', 'cbx-1-c', 'base'))
-        with mock.patch.object(cb.os, 'cpu_count', return_value=6):
+        with mock.patch.object(cb, 'host_cpus', return_value=6):
             self.assertFalse(cb.admit('more/repo', 'cbx-1-c', 'base'))

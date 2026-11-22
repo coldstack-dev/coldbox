@@ -134,6 +134,7 @@ class AppAuth(unittest.TestCase):
                 self.env.write_text('' if missing == 'id' else 'COLDBOX_GITHUB_APP_ID=12345\n')
                 key = self.key if missing == 'id' else Path(self.scratch.name) / 'absent.pem'
                 with mock.patch.object(cb, 'APP_KEY', key), \
+                        mock.patch.dict(os.environ, COLDBOX_ALLOW_PERSONAL_LOGIN='1'), \
                         mock.patch.object(cb.urllib.request, 'urlopen', self.response), \
                         mock.patch.object(cb.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'legacy')) as run:
                     cb.GitHub().get('repos/owner/repo')
@@ -226,7 +227,8 @@ class StatusAuth(unittest.TestCase):
         import contextlib
         output = io.StringIO()
         with mock.patch.multiple(cb, kvm_fix=lambda: '', registrations=mock.Mock(side_effect=RuntimeError('stop-after-auth')),
-                                 **patches), contextlib.redirect_stdout(output):
+                                 **patches), contextlib.redirect_stdout(output), \
+                mock.patch.dict(os.environ, COLDBOX_ALLOW_PERSONAL_LOGIN='1'):
             with self.assertRaisesRegex(RuntimeError, 'stop-after-auth'):
                 cb.status(None)
         return output.getvalue()
@@ -242,6 +244,34 @@ class StatusAuth(unittest.TestCase):
         with mock.patch.object(cb.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '')):
             output = self.status_output(app_token=lambda: None)
         self.assertIn('FAIL  GitHub auth: no GitHub App and no gh login', output)
+
+    def test_without_an_opt_in_status_fails_and_never_asks_gh(self):
+        import contextlib
+        output = io.StringIO()
+        with mock.patch.dict(os.environ), mock.patch.object(cb.subprocess, 'run') as run, \
+                mock.patch.multiple(cb, kvm_fix=lambda: '', app_token=lambda: None,
+                                    registrations=mock.Mock(side_effect=[[], RuntimeError('stop-after-auth')])), \
+                contextlib.redirect_stdout(output):
+            os.environ.pop('COLDBOX_ALLOW_PERSONAL_LOGIN', None)
+            with self.assertRaisesRegex(RuntimeError, 'stop-after-auth'):
+                cb.status(None)
+        self.assertIn('FAIL  GitHub auth: no GitHub App', output.getvalue())
+        self.assertFalse(any(call.args[0][:2] == ['gh', 'auth'] for call in run.call_args_list))
+
+    def test_a_runner_registered_with_the_opt_in_lets_status_use_the_login(self):
+        import contextlib
+        output = io.StringIO()
+        opted = [dict(target='me/app', personal_login=True)]
+        with mock.patch.dict(os.environ), \
+                mock.patch.object(cb.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '')), \
+                mock.patch.multiple(cb, kvm_fix=lambda: '', app_token=lambda: None,
+                                    registrations=mock.Mock(side_effect=[opted, RuntimeError('stop-after-auth')])), \
+                contextlib.redirect_stdout(output):
+            os.environ.pop('COLDBOX_ALLOW_PERSONAL_LOGIN', None)
+            with self.assertRaisesRegex(RuntimeError, 'stop-after-auth'):
+                cb.status(None)
+            self.assertEqual(os.environ.get('COLDBOX_ALLOW_PERSONAL_LOGIN'), '1')
+        self.assertIn('WARN  GitHub auth: personal gh login (opted in', output.getvalue())
 
     def test_a_failing_app_fails_without_falling_back_to_gh(self):
         with mock.patch.object(cb.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '')) as run:
@@ -265,7 +295,8 @@ class SetupApp(unittest.TestCase):
     def setUp(self):
         etc = Path(tempfile.mkdtemp(dir=self.scratch.name))
         self.key, self.env = etc / 'coldbox' / 'github-app.pem', etc / 'coldbox' / 'github-app.env'
-        self.permissions = dict(administration='write', actions='read', metadata='read')
+        self.permissions = dict(administration='write', actions='read', metadata='read', checks='write',
+                                contents='read')
         self.requests = []
         patches = [mock.patch.object(cb, 'APP_KEY', self.key), mock.patch.object(cb, 'APP_ENV', self.env),
                    mock.patch.object(cb.os, 'geteuid', return_value=0),
@@ -321,7 +352,7 @@ class SetupApp(unittest.TestCase):
 
     def test_refuses_an_app_with_more_permissions_and_writes_nothing(self):
         self.permissions.update(contents='write', actions='write')
-        with self.assertRaisesRegex(cb.ConfigError, 'remove actions:write, contents:write; add actions:read$'):
+        with self.assertRaisesRegex(cb.ConfigError, 'remove actions:write, contents:write; add actions:read, contents:read$'):
             self.setup('--app-id', '4242', '--key', str(self.download))
         self.assertFalse(self.key.exists() or self.env.exists())
 

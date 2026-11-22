@@ -132,7 +132,7 @@ if [[ $storage == zfs ]] && ! modprobe -nq zfs; then
     echo "coldbox install: kernel $(uname -r) has no zfs module, so VM storage uses plain directories (COLDBOX_STORAGE=dir)" >&2
 fi
 
-packages=(incus incus-agent qemu-system-x86 ovmf dnsmasq-base python3 git)
+packages=(incus incus-agent qemu-system-x86 ovmf dnsmasq-base python3 python3-yaml git)
 [[ $storage == zfs ]] && packages+=(zfsutils-linux)
 if [[ $storage == zfs ]]; then floor=$pool_size floor_name=COLDBOX_POOL_SIZE floor_use='the ZFS pool'
 else floor=$disk floor_name=--disk floor_use="one job VM's disk"; fi
@@ -187,6 +187,7 @@ qemu_ready || { systemctl restart incus.service && qemu_ready; } ||
 ic() { incus --force-local "$@" </dev/null; }
 icp() { incus --force-local --project "$prefix" "$@"; }
 mark=user.coldbox.managed=true
+forever=user.coldbox.expires=never
 only_coldbox_uses_pool() {
     [[ $(ic project get "$prefix" user.coldbox.managed 2>/dev/null) == true ]] &&
         ic query "/1.0/storage-pools/$1" | python3 -c '
@@ -228,19 +229,23 @@ if ! claim storage "$prefix"; then
     else ic storage create "$prefix" dir "$mark"; fi
 fi
 
-claim network acl "$acl" || ic network acl create "$acl" "$mark"
+claim network acl "$acl" || ic network acl create "$acl" "$mark" "$forever"
 python3 "$here/coldbox" acl | incus --force-local network acl edit "$acl"
-net=("$mark" ipv4.address="$subnet" ipv4.nat=true ipv6.address=none security.acls="$acl"
+net=("$mark" "$forever" ipv4.address="$subnet" ipv4.nat=true ipv6.address=none security.acls="$acl"
      security.acls.default.ingress.action=reject security.acls.default.egress.action=reject)
 if claim network "$bridge"; then ic network set "$bridge" "${net[@]}"
 else ic network create "$bridge" "${net[@]}"; fi
 
 claim project "$prefix" || ic project create "$prefix" -c "$mark" -c features.images=true \
     -c features.profiles=true -c features.storage.volumes=true -c features.networks=false
+ic project set "$prefix" "$forever"
+ic storage set "$prefix" "$forever"
 icp profile show coldbox >/dev/null 2>&1 || icp profile create coldbox </dev/null
 if ! profile_error=$(icp profile edit coldbox 2>&1 <<EOF
 description: Coldbox job VM (managed by install.sh)
 config:
+  user.coldbox.managed: "true"
+  user.coldbox.expires: never
   limits.cpu: "$cpus"
   limits.memory: $memory
 devices:

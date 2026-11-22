@@ -1,0 +1,25 @@
+name: toolcache
+on: push
+jobs:
+  hit:
+    runs-on: [self-hosted, coldbox]
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: echo "$RUNNER_TOOL_CACHE" && node --version && go version && ls "$RUNNER_TOOL_CACHE"/*/
+      - run: python --version
+  miss:
+    runs-on: [self-hosted, coldbox]
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: echo "$RUNNER_TOOL_CACHE" && node --version && ls "$RUNNER_TOOL_CACHE"/node/

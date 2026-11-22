@@ -1,5 +1,5 @@
 {
-  "exclude": [".cursor", "scripts/vps-smoke.sh", ".fleet/", ".github/workflows/", "docs/oss-audit-2026-45.md"],
+  "exclude": [".cursor", "scripts/vps-smoke.sh", ".fleet/", ".github/workflows/", "docs/oss-audit-2026-45.md", "coldbox.toml/"],
   "approvals": [
     {"scope": "history", "kind": "ipv4", "path": "README.md", "fingerprint": "72cf1234b2f5f7d7", "reason": "Example subnet for a second Coldbox bridge in the README and its tests; not a host address."},
     {"scope": "history", "kind": "ipv4", "path": "tests/test_coldbox.py", "fingerprint": "72cf1234b2f5f7d7", "reason": "Example subnet for a second Coldbox bridge in the README and its tests; not a host address."},
@@ -160,19 +160,23 @@
     {"scope": "history", "kind": "ipv4", "path": "tests/test_coldbox.py", "fingerprint": "bb466c99efaf56af", "reason": "Public network constant or documentation/test fixture address the isolation selftest names on purpose; not a fleet host."},
     {"scope": "history", "kind": "ipv4", "path": "tests/test_coldbox.py", "fingerprint": "d5aaf78a281ee0d0", "reason": "Public network constant or documentation/test fixture address the isolation selftest names on purpose; not a fleet host."},
     {"scope": "history", "kind": "tailnet-ip", "path": "tests/test_coldbox.py", "fingerprint": "784c66258c669cda", "reason": "Public network constant or documentation/test fixture address the isolation selftest names on purpose; not a fleet host."},
+    {"scope": "history", "kind": "tailnet-ip", "path": "tests/test_coldbox.py", "fingerprint": "d72676dfa714edb2", "reason": "Documentation address inside the CGNAT range that older ACL tests used; it stays in the already-public mirror history."},
     {"scope": "history", "kind": "home-path", "path": "tests/test_coldbox.py", "fingerprint": "e08faecff343a01a", "reason": "Guest-VM path of the runner user, not a host path."},
     {"scope": "tree", "kind": "export-path-review", "path": "examples/receipts/local-fail.json", "source_sha256": "36fa79b842d6d71051b943b0a3edcc72dfbb746eb97a7c6553b28358cf03e7c1", "reason": "Sanitized receipt schema example required by the example verdict regression test; contains no credentials or host inventory."},
     {"scope": "tree", "kind": "export-path-review", "path": "examples/receipts/local-pass.json", "source_sha256": "4132a0b382f85fbdbebe6ef607c8d15f8a1bb7ab2f3e04ef50e7dc4f8bbb633d", "reason": "Sanitized receipt schema example required by the example verdict regression test; contains no credentials or host inventory."},
     {"scope": "tree", "kind": "export-path-review", "path": "examples/receipts/runner-canceled.json", "source_sha256": "5b4278ee68fe57f5efb1f9df2f8f6fd069bfabe8d1dc54bd50eea036653d6a3c", "reason": "Sanitized receipt schema example required by the example verdict regression test; contains no credentials or host inventory."},
     {"scope": "tree", "kind": "export-path-review", "path": "examples/receipts/runner-idle.json", "source_sha256": "07f4a864d0883dd22960d21f66dca84ed71f5b3c22794ff8cc5c4dfcee512d34", "reason": "Sanitized receipt schema example required by the example verdict regression test; contains no credentials or host inventory."},
     {"scope": "tree", "kind": "export-path-review", "path": "examples/receipts/runner-pass.json", "source_sha256": "d9c8837698e1321579512f7c5a09f081f12517c1c2f0fb4c36618baef4175467", "reason": "Sanitized receipt schema example required by the example verdict regression test; contains no credentials or host inventory."},
-    {"scope": "verification", "kind": "dependency-license-review", "path": "@dependency/PyYAML", "fingerprint": "1cc624b44d6e740b", "reason": "PyYAML 6.0.3 ships the standard MIT permission notice without a title line; reviewed and accepted."}
+    {"scope": "verification", "kind": "dependency-license-review", "path": "@dependency/PyYAML", "fingerprint": "1cc624b44d6e740b", "reason": "PyYAML 6.0.3 ships the standard MIT permission notice without a title line; reviewed and accepted."},
+    {"scope": "verification", "kind": "dependency-license-review", "path": "@dependency/PyYAML", "fingerprint": "457f4a485629ac3d", "reason": "Owner approval: \"PyYAML is MIT, which is compatible.\""}
   ],
   "quickstart": [
-    {"file": "README.md", "line": 129, "argv": ["./coldbox", "--help"]},
-    {"file": "README.md", "line": 131, "argv": ["python3", "-m", "pip", "install", "pyyaml"]}
+    {"file": "README.md", "line": 141, "argv": ["./coldbox", "--help"]},
+    {"file": "README.md", "line": 143, "argv": ["python3", "-m", "pip", "install", "pyyaml"]}
   ],
+  "verify_tools": ["shellcheck"],
   "checks": [
-    {"role": "tests", "argv": ["python3", "-m", "unittest", "discover", "-s", "tests", "-q"]}
+    {"role": "tests", "argv": ["python3", "-m", "unittest", "discover", "-s", "tests", "-q"]},
+    {"role": "lint", "argv": ["shellcheck", "install.sh", "scripts/restart-matrix.sh", "tests/stress.sh", "uninstall.sh"]}
   ]
 }

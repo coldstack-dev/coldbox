@@ -86,7 +86,7 @@ def remote(args):
                     raise ValueError('invalid trial lease')
                 if cap is None and not args.acquire:
                     raise ValueError('cap removed; trial aborted')
-                cpus = max(0, os.cpu_count()-cb['host_setting'](cb['RESERVE'], 'CPU threads'))
+                cpus = max(0, os.sysconf('SC_NPROCESSORS_ONLN')-cb['host_setting'](cb['RESERVE'], 'CPU threads'))
                 if not quiet(dict(cpus=cpus, load=list(os.getloadavg())), args):
                     return dict(applied=False, reason='live load exceeds gate')
                 write(path, dict(limit=args.limit, owner=args.owner,
@@ -124,7 +124,7 @@ def remote(args):
             receipt = json.loads(path.read_text())
             if receipt.get('mode') == 'runner' and receipt.get('verdict') != 'idle':
                 receipts.append(receipt)
-    return dict(at=time.time(), cpu=cpu, load=list(os.getloadavg()), cpus=max(0, os.cpu_count()-cb['host_setting'](cb['RESERVE'], 'CPU threads')), busy=busy, warm=warm,
+    return dict(at=time.time(), cpu=cpu, load=list(os.getloadavg()), cpus=max(0, os.sysconf('SC_NPROCESSORS_ONLN')-cb['host_setting'](cb['RESERVE'], 'CPU threads')), busy=busy, warm=warm,
                 available=cb['host_memory']('MemAvailable'), total=cb['host_memory']()-cb['additional_vm_memory'](workers, cb['vm_memory']()),
                 reserve=cb['HOST_RESERVE'], memory=cb['vm_memory'](),
                 cpu_psi=psi('cpu'), memory_psi=psi('memory'), oom=int(vmstat['oom_kill']),
@@ -296,6 +296,174 @@ def measure_only(args):
         print(json.dumps(result, allow_nan=False))
 
 
+def capacity_sample(cb, ready_workers):
+    state = cb['STATE']
+    with cb['host_lock']():
+        folder = state / 'workers'
+        workers = cb['live_workers'](folder, prune=False)
+        if cb['unreadable_live_workers'](folder):
+            raise ValueError('cannot measure commitments with unreadable live workers')
+        ready_workers.intersection_update(worker.name for worker in workers)
+        ready = state / 'ready'
+        ready_workers.update(worker.name for worker in workers if (ready / worker.name).exists())
+        memory, host = cb['vm_memory'](), cb['host_memory']()
+        sizes = {worker.name: cb['vm_bytes'](worker, memory) for worker in workers}
+        vms = cb['host_vms']()
+        untracked = vms - sizes.keys()
+        builders = sum(worker.kind == 'vm' for worker in workers)
+        if untracked:
+            builders += len(untracked.intersection(cb['adhoc_vms']()))
+        extra = cb['additional_vm_memory'](workers, memory, vms)
+        pending = 0
+        for worker in workers:
+            if worker.name in ready_workers:
+                continue
+            if (ready / worker.name).exists():
+                ready_workers.add(worker.name)
+                continue
+            try:
+                receipt = json.loads((state / 'receipts' / f'{worker.name}.json').read_text())
+            except FileNotFoundError:
+                pass
+            else:
+                if 'ready_seconds' in receipt.get('vm', {}):
+                    ready_workers.add(worker.name)
+                    continue
+                if worker.name not in vms and finalized(receipt) and receipt['vm']['destroyed']:
+                    continue
+            pending += 1
+        space = cb['query'](f"/1.0/storage-pools/{cb['POOL']}/resources")['space']
+        disk = cb['vm_disk']()
+        if disk <= 0 or not 0 <= space['used'] <= space['total'] or space['total'] <= 0:
+            raise ValueError('cannot measure disk commitments with invalid pool capacity')
+        cpus = cb['host_cpus']() - cb['host_setting'](cb['RESERVE'], 'CPU threads')
+        budgets = dict(cpu=[(len(workers) + len(untracked)) * cb['CORES_PER_JOB'], cpus],
+                       ram=[sum(sizes.values()) + len(untracked) * memory + extra, host - cb['host_share'](host)],
+                       disk=[space['used'] + pending * disk, space['total'] - space['total'] // 10])
+        queue = state / 'receipts' / 'submissions' / 'queue.json'
+        try:
+            queued = json.loads(queue.read_text())
+        except FileNotFoundError:
+            queued = []
+        admitted = {worker.name: (folder / str(worker.pid)).stat().st_mtime_ns for worker in workers
+                    if worker.kind == 'once' and (state / 'receipts' / f'{worker.name}.submit.log').is_file()}
+        return dict(at=time.time(), build=cb['build_id'](loaded=True), budgets=budgets,
+                    available=cb['host_memory']('MemAvailable'), floor=cb['memory_floor'](host),
+                    workers=sizes, builder_vms=builders, direct_admitted=admitted, direct_queued=queued)
+
+
+def capacity_summary(samples):
+    return dict(samples=len(samples), builds=sorted({sample['build'] for sample in samples} - {None}),
+                build_changed=any(sample['build'] != samples[0]['build'] or not sample['build'] for sample in samples),
+                over_admissions=sum(any(used > limit for used, limit in sample['budgets'].values())
+                                    for sample in samples),
+                floor_violations=sum(sample['available'] < sample['floor'] for sample in samples),
+                peak_builder_vms=max(sample['builder_vms'] for sample in samples),
+                min_floor_margin_bytes=min(sample['available'] - sample['floor'] for sample in samples),
+                peak={resource: max((sample['budgets'][resource] for sample in samples), key=lambda pair: pair[0])
+                      for resource in ('cpu', 'ram', 'disk')})
+
+
+def burst_summary(samples, receipts, cohort, sizes, job_size):
+    direct = cohort['direct']
+    jobs = cohort['jobs']
+    repo, sha = cohort['repo'], cohort['sha']
+    if (len(direct) < 2 or len(set(direct)) != len(direct)
+            or len({job['id'] for job in jobs}) != len(jobs)
+            or len({job.get('runner_name') for job in jobs if job.get('runner_name')})
+            != sum(bool(job.get('runner_name')) for job in jobs)):
+        raise ValueError('expected an ordered list of distinct submissions and distinct Actions jobs')
+    receipts = {receipt['id']: receipt for receipt in receipts
+                if receipt.get('repo') == repo and receipt.get('sha') == sha}
+    job_sizes = {}
+    terminal = 0
+    for job in jobs:
+        size = job_size(job['labels'])
+        if size is None:
+            raise ValueError('each Actions job needs compatible Coldbox runner labels')
+        name = job.get('runner_name')
+        receipt = receipts.get(name, {})
+        github = receipt.get('github') or {}
+        if (job['status'] == 'completed' and receipt.get('mode') == 'runner' and github.get('job_id') == job['id']
+                and finalized(receipt) and receipt['vm']['destroyed']):
+            terminal += 1
+        if name and any(sample['workers'].get(name) == sizes[size] for sample in samples):
+            job_sizes[name] = size
+    terminal += sum(receipts.get(name, {}).get('mode') == 'local' and finalized(receipts[name])
+                    and receipts[name]['vm']['destroyed'] for name in direct)
+    stamps = {}
+    for sample in samples:
+        for name, stamp in sample['direct_admitted'].items():
+            stamps.setdefault(name, stamp)
+    observed = sorted((name for name in direct if name in stamps), key=stamps.get)
+    waiting = [[request['id'] for request in sample['direct_queued']
+                if request['repo'] == repo and request['sha'] == sha] for sample in samples]
+    requested = set(direct) | {job.get('runner_name') for job in jobs}
+    unlisted = sorted((set(receipts) | {name for queue in waiting for name in queue}) - requested)
+    fifo = (observed == direct and len({stamps[name] for name in observed}) == len(direct)
+            and any(len(queue) >= 2 for queue in waiting) and not unlisted
+            and all(queue == [name for name in direct if name in queue] for queue in waiting))
+    overlap = any(set(sample['workers']).intersection(direct) and set(sample['workers']).intersection(job_sizes)
+                  for sample in samples)
+    return dict(requests=len(jobs) + len(direct), non_terminal=len(jobs) + len(direct) - terminal,
+                unlisted=unlisted,
+                actions_sizes=sorted(set(job_sizes.values())), mixed_overlap=overlap,
+                direct_acceptance_order=direct, direct_admission_order=observed, fifo=fifo)
+
+
+def supervisor_builds(cb):
+    return {record['unit']: cb['supervisor_build'](record['unit'], record['target'])
+            for record in cb['registrations']() if record['active'] == 'active'}
+
+
+def audit(args):
+    cb = runpy.run_path(args.coldbox)
+    args.output.mkdir(parents=True)
+    supervisors = supervisor_builds(cb) if not args.burst else {}
+    samples = []
+    ready_workers = set()
+    deadline = time.monotonic() + args.seconds
+    with (args.output / 'samples.jsonl').open('x') as out:
+        while True:
+            try:
+                sample = capacity_sample(cb, ready_workers)
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                report = dict(host=os.uname().nodename, status='INCOMPLETE', samples=len(samples),
+                              sample_error=str(error))
+                write(args.output / 'summary.json', report)
+                print(json.dumps(report, allow_nan=False))
+                return 1
+            samples.append(sample)
+            out.write(json.dumps(sample, allow_nan=False) + '\n')
+            out.flush()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or args.burst and args.burst.is_file():
+                break
+            time.sleep(min(2 if args.burst else 30, remaining))
+    start, end = samples[0]['at'], samples[-1]['at']
+    report = dict(host=os.uname().nodename, start=start, end=end, **capacity_summary(samples))
+    complete = len(samples) > 1 and not any(report[key] for key in (
+        'build_changed', 'over_admissions', 'floor_violations'))
+    if args.burst:
+        if not args.burst.is_file():
+            raise ValueError('mixed burst evidence never arrived')
+        receipts, unreadable = cb['read_receipts']([cb['STATE'] / 'receipts'], start, end)
+        sizes = {size: cb['vm_shape'](size)[0] or cb['vm_memory']() for size in cb['SIZES']}
+        report.update(burst_summary(samples, receipts, json.loads(args.burst.read_text()), sizes, cb['job_size']),
+                      unreadable_receipts=unreadable)
+        report['passed'] = (complete and report['fifo'] and report['mixed_overlap']
+                            and report['actions_sizes'] == sorted(sizes) and not (unreadable or report['non_terminal']))
+        passed = report['passed']
+    else:
+        end_supervisors = supervisor_builds(cb)
+        passed = (complete and bool(supervisors) and supervisors == end_supervisors
+                  and set(supervisors.values()) == {samples[0]['build']})
+        report.update(capacity_passed=passed, supervisor_builds=supervisors, final_supervisor_builds=end_supervisors)
+    write(args.output / 'summary.json', report)
+    print(json.dumps(report, allow_nan=False))
+    return 0 if passed else 1
+
+
 def trial_run(args):
     def interrupted(signum, frame):
         raise InterruptedError(f'signal {signum}')
@@ -411,14 +579,22 @@ def main():
     runner.add_argument('--remote-script', required=True)
     runner.add_argument('--seconds', type=int, default=1800)
     runner.add_argument('--output', type=Path, required=True)
+    observer = sub.add_parser('audit', help='check admission commitments and request completion on this host')
+    observer.add_argument('--seconds', type=int, default=86400)
+    observer.add_argument('--output', type=Path, required=True)
+    observer.add_argument('--burst', type=Path, help='path to the mixed burst jobs and submission IDs')
     args = parser.parse_args()
     if args.action == 'run':
         if any(not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]*', h) for h in args.host):
             parser.error('hosts must be SSH names')
         run(args)
+    elif args.action == 'audit':
+        if not 0 < args.seconds <= 86400:
+            parser.error('audit window must be between 1 and 86400 seconds')
+        return audit(args)
     else:
         print(json.dumps(remote(args), allow_nan=False))
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

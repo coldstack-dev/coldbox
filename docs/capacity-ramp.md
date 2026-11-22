@@ -80,3 +80,127 @@ error receipt or an incomplete receipt whose worker is no longer active or whose
 or CPU PSI some avg10 >=50% in two consecutive samples. No limit is inferred from an unobserved level.
 Preserve all results under the project. Reusing an output directory with reports is
 refused to protect evidence.
+
+## Check admission budgets and request completion
+
+### Verify the build after an idle-only swap
+
+Before a maintenance pause, confirm that the other CI hosts are admitting jobs.
+On the target host, pass the approved candidate, its full SHA-256 digest, and
+a new backup path to the rollout script.
+
+```sh
+sudo python3 scripts/rollout-coldbox.py "$target_host" "$candidate" "$sha256" "$backup"
+```
+
+The script holds `autoscale.lock` for at most 30 minutes, including the wait
+for zero active jobs. It saves the installed executable, swaps at zero active
+jobs, and queues `systemctl restart --no-block` before releasing the lock.
+Old supervisors may need the lock to finish shutting down. The script verifies
+the original supervisor set, each current systemd invocation's loaded build,
+and the executable digest after releasing the lock. On verification failure,
+it reacquires the lock and waits for zero active jobs before restoring the
+digest-verified pre-swap executable. The rollback follows the same restart
+and release order. Run the fixture after the script exits successfully.
+
+On the primary, the first check timed out with all 39 units still stopping.
+All 39 loaded the target build after release. That attempt started on
+`ce650e4ed5d9` and used the separately staged `92fcde5047c4` for rollback.
+The live retry used the corrected lock order in a one-off rollout script.
+It held the lock for 12 minutes 26 seconds while jobs drained, then verified
+all 39 units about 13 seconds after release.
+
+### Start the fleet audit
+
+On each CI host, run the audit against the installed build after the idle-only
+rollout. Start the audits together for a common observation period. Run as the
+Coldbox service user or with sudo when required to read local state.
+
+```sh
+python3 scripts/capacity-ramp.py audit --seconds 86400 --output .smoke/admission-audit
+```
+
+Each sample records the charged CPU threads, committed RAM, committed disk, and
+their limits. CPU uses the scheduler's charge per VM, including warm VMs. RAM
+uses worker sizes and other VM commitments, with the host share reserved. Disk
+uses pool usage plus pending root disk reservations, with a tenth of the pool
+reserved. A ready marker or a receipt showing a completed boot clears the
+reservation for that worker for the rest of its lifetime. A final receipt for
+an absent, destroyed VM also clears the charge while the worker exits. The audit
+checks available memory against the host floor. `summary.json` contains the peaks with their corresponding limits,
+the smallest memory margin, and the build and supervisor builds on that host.
+
+Use `samples.jsonl` to inspect the observed values and sampling times. An
+over-admission is a sample with at least one commitment above its limit.
+`capacity_passed` describes the host's sampled capacity and supervisor build.
+For the fleet's request outcomes, use `coldbox stats --json --since 24h` with one
+`--receipts` directory per host. Handle the report's [exit codes](../README.md#json-output)
+before using the counts.
+Keep each host's `queues` directory alongside its `receipts` directory so stats
+can match jobs seen in one queue to receipts from a peer. Check that the combined
+`requests.terminal` equals `requests.accepted` and that all four host summaries
+show the same build, zero over-admissions, and zero floor violations.
+Check the reported builder VM peak. The CPU check uses the CI reserve even
+when an ad-hoc builder VM shares the host, so an overage with builders present
+needs the sample for context. A failed capacity probe records an incomplete
+audit and preserves all earlier samples.
+
+The four-host observation window started on **2026-11-20 at 20:53:14.394 UTC**.
+The primary reported 39 supervisors on `c628b8a1dfcf`. Each of the three
+overflow hosts reported 12 on the same build. The primary fixture passed one
+test and its VM was destroyed.
+
+At the 21:46 UTC readback, all four audits were running. The 415 samples,
+including burst load, showed zero over-admissions and zero memory floor
+violations. All 60 observed requests had reached a terminal state. Evaluate
+the full window after it closes on November 21 at 20:53 UTC. The audit files
+are under `.smoke/p7b-c628/window/audit` in each host's project checkout.
+
+Each overflow host passed a burst with three Actions sizes and four FIFO
+direct submissions. Across 416 samples, all 21 requests ended terminal and
+the audit found zero over-admissions. Actions and direct jobs overlapped on
+each overflow host.
+
+On the primary, 12 base VMs charged 36 of 40 CPU threads, leaving room for
+one more 3-thread VM. The fixture jobs ran serially in that slot. All 14
+requests across two bursts ended terminal, direct admissions stayed FIFO,
+and the audit found zero over-admissions. Peak committed CPU was 39 of 40
+threads. P7 uses the test-host mixed burst below and the four-host window.
+
+### Check a mixed burst on the test host
+
+1. Prepare a private fixture workflow with small, default, and large jobs.
+   Use the `coldbox-small`, `coldbox`, and `coldbox-large` labels.
+2. Start `audit --burst cohort.json --seconds 720 --output .smoke/mixed-burst`
+   before triggering the workflow and running `coldbox api submit` for a pinned
+   revision. Keep enough requests waiting to observe at least two direct IDs
+   in the queue and an Actions runner overlapping a direct worker.
+3. After the jobs settle, write `cohort.json` atomically with the fixture `repo`
+   and `sha`, the GitHub run's `jobs` array, and a `direct` array of submission
+   IDs in acceptance order.
+   The audit stops when it sees the file or reaches the time limit.
+
+The audit matches Actions job IDs to final, destroyed VM receipts. It checks
+the observed reservation for each runner against its expected size. It checks
+direct admission order using the timestamps on host worker records written
+under the admission lock. A missing outcome, missing size, missing overlap,
+budget violation, unlisted request for the fixture revision, or unproven FIFO
+order makes the audit exit nonzero.
+
+The test fixture gave its direct workers a temporary `COLDBOX_RESERVE` file
+that held them in the queue until the audit saw their order. The fixture then
+restored the host's normal reserve in that file.
+
+On November 20, 2026, build `92fcde5047c4` finished all seven requests and
+destroyed all seven VMs. Four direct submissions were admitted in FIFO order
+and overlapped the three Actions sizes. Across 133 samples, CPU peaked at 9 of
+30 charged threads, RAM at 73.6 of 159.9 GiB, and disk at 53.2 of 86.8 GiB.
+Available memory stayed at least 66.7 GiB above the floor. The audit recorded
+zero over-admissions and zero non-terminal requests.
+
+A second burst ran candidate `5f0d5cc0cb10` alongside older CI supervisors.
+All seven fixture requests finished and the direct admissions followed FIFO
+order. The audit found 15 samples above the disk budget while runner VMs were
+booting. The supervisors that started those background runners predated disk
+reservation accounting. Verify the loaded supervisor builds before treating
+a burst as proof for a single build.

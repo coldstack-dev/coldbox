@@ -16,29 +16,39 @@ A self-hosted runner executes whatever a workflow tells it to. Coldbox limits wh
   or an org whose default runner group allows public repos. GitHub
   [warns](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#self-hosted-runner-security)
   that on public repos a fork's pull request can run code on your machine.
-- **A public repo you own runs only with your opt-in, and strangers wait for your approval.**
+- **A public repo you own runs only with your opt-in, and only its writers' own code runs.**
   `coldbox register OWNER/REPO --allow-public` (the flag, not an environment variable) serves one public repo owned by a
   user account, and records `COLDBOX_ALLOW_PUBLIC=1` in that repo's service. Jobs triggered by a user with write access
-  then run at once. A pull request from anyone else's fork runs only after someone with write access approves it on
-  GitHub. Coldbox refuses the repo, and logs the fix, unless its Actions setting requires approval for all outside
-  contributors:
+  then run at once, except fork pull requests (next item). Coldbox refuses the repo, and logs the fix, unless its
+  Actions setting requires approval for all outside contributors, a second lock in case a fork check is ever missed:
   `gh api -X PUT repos/OWNER/REPO/actions/permissions/fork-pr-contributor-approval -f approval_policy=all_external_contributors`.
   Coldbox also checks each run itself, before it starts a VM for it and again in the job-started hook: a job runs only
-  if its triggering user has write access, or it is a `pull_request` from a fork (which GitHub held for approval). An
-  outside user's `issue_comment`, `pull_request_target` or `workflow_run` job is never run. Each runner remembers the
+  if it is not from a fork and its triggering user has write access. An outside user's `issue_comment`,
+  `pull_request_target` or `workflow_run` job is never run. Each runner remembers the
   writer list it started with. If the setting is relaxed or write access changes, every autoscale pass (each 30 seconds)
   deregisters this host's idle runners whose list is out of date, so their workers start over with fresh rules; running
-  jobs keep going. `--allow-forks` can't be combined with `--allow-public`, and an org-owned public repo is refused.
-- **Fork pull requests never run by default.** A job-started hook inside the VM fails the job before any step runs
-  when the pull request's (or `workflow_run`'s) head repo differs from the base repo, also when the fork was deleted. It fails
-  closed: events that can't show where the code came from, such as `merge_group` or `issue_comment`, are refused too. Only
+  jobs keep going. An org-owned public repo is refused.
+- **Fork pull requests never run, on any repo.** No setting, opt-in or approval on GitHub changes this. The autoscaler
+  starts no VM for a run whose head repo differs from the repo, and the job-started hook inside the VM fails any job
+  that reaches one anyway before any step runs, when the pull request's (`pull_request`, `pull_request_target`) or
+  `workflow_run`'s head repo differs from the base repo, also when the fork was deleted. A re-run keeps its original
+  event, so re-running a fork's run is refused too. The job log, the runner service's journal (`not scaling for run
+  …`) and the job's `job.json` (`refused`) all say `fork pull request: fork code never runs on Coldbox; a writer reviews
+  it by hand`. So an outside pull request gets no CI on your hosts: a writer reads it and decides by hand. If a required
+  check is skipped rather than failed for forks, GitHub shows it green, so never merge a fork's pull request on the
+  check alone. On a private repo the hook also fails closed: events that can't show where the code came from, such as
+  `merge_group` or `issue_comment`, are refused too. Only
   `push`, `workflow_dispatch`, `schedule`, `repository_dispatch`, `release`, `create` and `delete` run without a check.
-  `--allow-forks` overrides this on a private repo. On a public repo the rule above applies instead.
-- **The example workflow keeps forks off your machine too.** [examples/coldbox.yml](examples/coldbox.yml) sends a fork's
-  pull request to a GitHub-hosted runner that fails it, so fork code never reaches a self-hosted runner. It also stops a
-  job after 60 minutes and leaves no token in `.git/config`. A new push to a pull request cancels that pull request's
-  older run, so its VM is freed for the run that counts. Pushes and manual runs are never canceled. Copy it byte for
-  byte: tests pin these guards.
+  GitHub's `dynamic` jobs (Dependabot graph jobs, CodeQL default setup) run on a private repo unless the ref is
+  `refs/pull/...` or a pull request in the event comes from another repo. The hook has no GitHub credential, so it
+  can't ask GitHub where a `dynamic` job's code came from. A `dynamic` job that ran fork code with neither of those
+  signs would run. This is accepted only while every repo Coldbox serves is private with no forks; recheck it if a
+  served repo with `dynamic` workflows becomes public or a fork of a private one appears.
+- **The example workflow keeps forks off your machine too.** [examples/coldbox.yml](examples/coldbox.yml) runs its job
+  on Coldbox only and skips a fork's pull request, so fork code never reaches a runner and no job uses a GitHub-hosted
+  one. It also stops a job after 60 minutes and leaves no token in `.git/config`. A new push to a pull request cancels
+  that pull request's older run, so its VM is freed for the run that counts. Pushes and manual runs are never canceled.
+  Copy it byte for byte: tests pin these guards.
 - **No host mounts, no host secrets.** Before booting, Coldbox refuses any VM that has a device other than its own root disk
   and its NIC on the isolated bridge, or any `raw.*` config. Your `gh` token stays on the host. The only credential that enters
   the VM is the single-use runner config, passed on stdin. Jobs get GitHub's own per-job `GITHUB_TOKEN`, as on hosted runners.
@@ -74,7 +84,8 @@ A self-hosted runner executes whatever a workflow tells it to. Coldbox limits wh
 - A GitHub account with admin rights on the repo (or org) you register.
 
 Coldbox authenticates as a GitHub App you own, with only the permissions it needs: Administration read/write (to
-add and remove runners), Actions read (to see queued jobs) and Metadata read. An App for org-wide runners also gets the
+add and remove runners), Actions read (to see queued jobs), Checks read/write (to post `coldbox verify`), Contents
+read (to compare trees and clone private repos) and Metadata read. An App for org-wide runners also gets the
 organization self-hosted runners permission. `coldbox setup-app` prints a link to GitHub's App form with exactly
 those permissions filled in. After you create the App, `sudo coldbox setup-app --app-id <id> --key <pem>` checks the
 key against GitHub and refuses an App with any other permission. It then puts the key at `/etc/coldbox/github-app.pem`
@@ -85,8 +96,9 @@ memory and refresh five minutes before expiry. Targeted calls select the install
 `status` use the first available installation. No key or token is written to logs. A configured App that fails stops
 the request without falling back.
 
-Without the App, Coldbox falls back to your personal `gh auth login`, which can do anything your account can.
-`coldbox status` names the active auth and warns on a personal login.
+Without the App, Coldbox refuses to call GitHub. `coldbox register OWNER/REPO --allow-personal-login` opts that runner
+into your personal `gh auth login`, which can do anything your account can; other commands take
+`COLDBOX_ALLOW_PERSONAL_LOGIN=1`. `coldbox status` names the active auth and warns on a personal login.
 
 The JWT follows [GitHub's RS256 requirements](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app)
 and uses the host's `openssl` executable with Python's standard library.
@@ -110,9 +122,9 @@ coldbox detect ~/src/myrepo > ~/src/myrepo/coldbox.toml                         
 git -C ~/src/myrepo add coldbox.toml && git -C ~/src/myrepo commit -m 'Add coldbox.toml' # run uses the committed HEAD
 coldbox run ~/src/myrepo                                                                # checks in a throwaway VM
 coldbox detect --workflow ~/src/myrepo > coldbox.yml &&                                  # refuses if a workflow already
-  [ ! -e ~/src/myrepo/.github/workflows/coldbox.yml ] &&                                # runs coldbox checks; never
+  [ ! -e ~/src/myrepo/.github/workflows/coldbox.yml ] &&                                # requires executed tests; never
   install -Dm644 coldbox.yml ~/src/myrepo/.github/workflows/coldbox.yml                # overwrites; commit, push
-coldbox register you/myrepo                                                             # ephemeral runner service
+coldbox register you/myrepo                                                              # 1 slot, or 0 (on demand) if none fits
 ```
 
 `coldbox status` shows whether everything is healthy (with the fix for anything that is not), the registered repos,
@@ -135,25 +147,39 @@ python3 -m unittest discover -s tests -q
 ### Existing workflows
 
 Jobs other than `coldbox checks` run too. Change `runs-on: ubuntu-latest` to `runs-on: [self-hosted, coldbox]` and the
-job runs in a fresh Coldbox VM. Real jobs have passed on Coldbox with `actions/checkout` (v4, v5), `actions/setup-node`
-(v4, v5), `actions/upload-artifact` (v4), `docker run`, the `push`, `pull_request` and `workflow_dispatch` triggers, several
-jobs in one workflow and repository secrets. Other actions and workflow features are untested; they may work, but nothing
-proves it yet. [docs/compatibility.md](docs/compatibility.md) has the full table.
+job runs in a fresh Coldbox VM. The [v1 Actions support matrix](docs/actions-support.md) lists supported labels,
+verified workflows and actions, and the limits of job admission.
 
 ## Checks
 
-`coldbox detect PATH` suggests checks from the files in a repo, and `--workflow` proposes a workflow that runs them; `coldbox checks` (run inside the VM by the workflow) runs them.
-Every detected check runs unless `coldbox.toml` or the host default switches it off. Python, Go and Rust test checks are
-added only when test files exist. `go test` and `cargo test` exit 0 with zero tests, so their checks also fail unless at least one test passed.
+`coldbox detect PATH` suggests checks from the files in a repo. `coldbox detect --workflow PATH` generates a workflow
+that runs `coldbox checks` and then `coldbox require-tests`. The second step fails the workflow if no fresh test report
+shows an executed test. Skipped tests do not count. For custom test commands, write a JUnit XML report under the
+checkout. See [test evidence in receipts](docs/receipt.md#tests_ran) for the report formats.
+To update an existing generated workflow, add `- run: coldbox require-tests` after the `coldbox checks` step.
+
+`coldbox checks` on its own reports the exit status of the configured commands. It can pass a lint-only run.
+Every detected check runs unless `coldbox.toml` or the host default switches it off. `go test` and `cargo test` exit 0
+with zero tests, so their Coldbox checks require at least one passing test.
+On a `pull_request` event, `coldbox checks` also plans from the base commit (`pull_request.base.sha` in the event file)
+and runs both: every base check with its base command, then any check or command the pull request adds. A pull request
+can add a check, but a check it switches off, renames or changes still runs its base command, with a notice that the
+change takes effect after merge. The commands run in the pull request's tree, so a script they call is still the pull
+request's own. A base commit missing from the checkout (use `fetch-depth: 0`) or an unreadable event fails with exit 2.
 These are plain shell commands, not plugins:
 
 | Repo has | setup | lint | test |
 | --- | --- | --- | --- |
-| Python (`pyproject.toml`, `setup.py`, `requirements.txt`, `*.py`) | `pip3 install -r requirements.txt` if present | `python3 -m compileall`; `ruff check .` and `mypy` if configured, each from a throwaway venv (mypy's also gets the project installed when `pyproject.toml` has `[project]`) | `python3 -m pytest -q` if `test_*.py` exists |
-| Node (`package.json`) | `npm ci`, `pnpm` or `yarn install --frozen-lockfile` by lockfile (pnpm and yarn via `npx`, at the `packageManager` version; Yarn 2+ uses `--immutable`), else `npm install` | `npm run lint`, else `eslint .` if configured or a dependency; `tsc --noEmit` if `tsconfig.json` exists | `npm test`, else `vitest run` or `jest` if configured or a dependency |
+| Python (`pyproject.toml`, `setup.py`, `requirements.txt`, `*.py`) | `python3 -m pip install -r requirements.txt` in a virtual environment if the file exists | `python3 -m compileall`. If configured, `ruff check .` and `mypy` run in the virtual environment. Mypy also installs the project if `pyproject.toml` has `[project]`. | `python3 -m pytest -q` if a `test_*.py` or `*_test.py` file appears to define, import, inherit, or generate tests |
+| Node (`package.json`) | `npm ci`, `pnpm` or `yarn install --frozen-lockfile` by lockfile (pnpm and yarn via `npx`, at the `packageManager` version; Yarn 2+ uses `--immutable`), else `npm install` | `npm run lint`, else `eslint .` if configured or a dependency; `tsc --build` for `tsconfig.json` with project references, otherwise `tsc --noEmit` if the config exists | `npm test` when a test script or its lifecycle hooks can run tests, else `vitest run` or `jest` if configured or a dependency |
 | Go (`go.mod`) | | `gofmt -l` + `go vet ./...` | `go test -v ./...` if `*_test.go` exists; fails if no test passed |
 | Rust (`Cargo.toml`) | | `cargo fmt --check` + `cargo clippy -D warnings` | `cargo test` if a `.rs` file has a `#[test]`; fails if no test passed |
 | Shell (`*.sh`) | | `shellcheck` | |
+
+When detected Python setup installs requirements, later commands use its virtual environment, including commands
+under `[commands]`.
+
+TypeScript build mode follows project references and may write the outputs configured by those projects.
 
 Coldbox detects no `verify` command. A repo that verifies through another tool names it under `[commands]`, e.g.
 `verify = "coldverify --ci"`. `verify = true` without a command is an error, and so is a `.fleet/verify.sh` with no
@@ -178,7 +204,7 @@ check stays on and an earlier choice is kept. The choice is saved as a `[checks]
 `coldbox detect` and `coldbox checks` follow it, and each job VM gets a copy. A repo's own `coldbox.toml` still wins:
 `lint = true` there runs lint even when the host default has it off.
 
-Order: setup, lint, test, verify, then your own checks. A failed setup skips the rest, and a repo with nothing to run fails.
+Order: setup, lint, test, verify, then your own checks. The first failed check skips the rest (recorded `not_run`), and a repo with nothing to run fails.
 In a job on a Coldbox runner, each failed check also becomes an error annotation, and one more annotation names up to ten
 failed tests from the JUnit report Coldbox asks pytest for (not a `--junitxml` the project sets itself). The reason then
 shows on the check run and the pull request, not only in the log.
@@ -186,18 +212,27 @@ shows on the check run and the pull request, not only in the log.
 ### What is in the VM
 
 Ubuntu 26.04 with git, Docker (with compose and buildx), Python 3.14 + pytest, Node 22 + npm, Go 1.26, Rust 1.93 +
-clippy/rustfmt, shellcheck, gh, restic, rclone, build-essential, curl, jq, passwordless sudo and the newest actions-runner.
+clippy/rustfmt, shellcheck, gh, restic, rclone, rsync, bubblewrap, build-essential, curl, jq, passwordless sudo and the newest
+actions-runner. Background apt updates are masked, so a job's `apt-get install` never waits on the dpkg lock; the weekly
+base rebuild brings in security updates.
 These toolchains are Ubuntu's own packages, so they are older than the ones on GitHub's hosted image. For a current Node, use
 `actions/setup-node`, which works unchanged. Other setup actions (`actions/setup-python`, `actions/setup-go`,
 `dtolnay/rust-toolchain`) are untested on Coldbox; see [docs/compatibility.md](docs/compatibility.md).
+
+Job VMs pass the host CPU through, so a guest gets exactly the host's x86-64 level. Older Xeons such as Ivy Bridge stop at
+x86-64-v2 (no AVX2), and binaries built for x86-64-v3 fail there with `CPU ISA level is lower than required`.
+`actions/setup-python`'s Ubuntu 26.04 CPython builds are among them. On such a host, install Python with
+`astral-sh/setup-uv` instead. Check a host with `/lib64/ld-linux-x86-64.so.2 --help | grep x86-64-v`.
 
 `coldbox-refresh.timer` rebuilds the base VM every week with updated packages and the newest actions-runner, so jobs do not
 start by updating the runner. A failed rebuild, such as a package mirror timing out, runs again after 30 minutes, up to 3
 runs in all, and jobs keep using the old base until one passes. Run `sudo coldbox build-base` to do it now. Jobs that are
 running keep their VM.
 
-Before a new base replaces the old one, the rebuild clones a VM from it and runs `true` there, as a job would. If that
-fails, the new base is deleted, the old one stays, and `coldbox status` FAILs with the reason until a rebuild passes.
+Before a new base replaces the old one, the rebuild clones a VM from it and runs a bundled Git and Python test as the
+runner user. The test must pass and the clone must be deleted before promotion. The refresh log and
+`/var/lib/coldbox/base-smoke.json` record the candidate snapshot, test count, and teardown result. If the smoke check
+fails, the rebuild keeps the old base and `coldbox status` FAILs with the reason until a rebuild passes.
 
 Each successful rebuild keeps one previous base as `base-prev`, including its `warm` snapshot. The next rebuild replaces
 that previous base, so allow disk space for two retained bases and the new base during a build. To restore the previous
@@ -209,6 +244,17 @@ Rebuild output lists added, removed and changed package versions and the actions
 The first package inventory prints only a count. Read scheduled refresh output with `journalctl -u coldbox-refresh`.
 Inventories live at `/var/lib/coldbox/base-packages.txt` and `/var/lib/coldbox/base-packages.prev.txt`; rollback exchanges
 them with the bases. These inventories show changes but do not test whether the image works for a particular repo.
+
+To give jobs `actions/setup-node`, `setup-python` or `setup-go` versions without a download, list them in
+`/etc/coldbox/toolcache`, one `node|python|go VERSION` per line, such as `node 24` or `node 26.8.1`. Each rebuild
+resolves a line to the newest stable build in that action's `versions-manifest.json` and installs it into
+`/opt/hostedtoolcache`, where the runner's `RUNNER_TOOL_CACHE` points, so a matching `setup-*` step logs `Found in cache`.
+The rebuild prints each resolved version and sha256, and the inventory lists it as `toolcache/node/24 24.x.y`, so a
+prefix moving to a new patch shows in the rebuild's change list. The sha256 comes from GitHub's release API at build
+time: it proves the download is what GitHub serves now, not that anyone reviewed that build. Python's own installer also
+upgrades pip from PyPI during the build. A download, checksum or install failure fails the rebuild and keeps the current
+base. Without the file, or with an empty one, nothing is pre-populated. A version not listed still downloads as before.
+On a host below x86-64-v3, a `python` line fails the rebuild, because Python's installer runs the interpreter.
 
 To add your own files to every job VM, put them under `/etc/coldbox/guest/` on the host at the path they should have in the
 VM. Each newly started job VM receives them without a base rebuild. For example, `/etc/coldbox/guest/opt/tools/run` becomes `/opt/tools/run`. They are
@@ -226,7 +272,7 @@ To choose the size yourself, re-run it with flags, for example `sudo ./install.s
 (or set `COLDBOX_CPUS`, `COLDBOX_MEMORY`, `COLDBOX_DISK`). `coldbox register --slots N` runs up to N
 jobs at once for a repo. It refuses a slot total, counting every registered slot, that would leave the host ceiling
 (below) no room for one `large` VM beside all slots at their full `limits.memory`, and the error names the most
-`--slots` that fit. On a 247 GiB host with 12 GiB VMs that allows 15 slots. `coldbox status` FAILs a host whose
+`--slots` that fit. Without `--slots`, it registers 1 slot, or 0 for a repo when no slot fits. On a 247 GiB host with 12 GiB VMs that allows 15 slots. `coldbox status` FAILs a host whose
 registered slots break that bound. So a job no idle slot can take, such as a sized job or one for a repo with
 `--slots 0`, waits at most until one running job finishes, never forever. It does not stop per-repo slots from
 splitting capacity: an idle slot of a quiet repo cannot take a busy repo's job.
@@ -266,26 +312,63 @@ To compare a host's build with a commit, run `git show <ref>:coldbox | sha256sum
 | --- | --- |
 | `sudo ./install.sh [--install-incus] [--cpus N] [--memory SIZE] [--disk SIZE] [--checks LIST] [--name-prefix NAME] [--subnet CIDR]` | Asks which checks are on by default (or takes `--checks`), then installs Incus (adding the Zabbly repo when you agree, or with `--install-incus`), ZFS loop pool `coldbox` (plain directories with `COLDBOX_STORAGE=dir` or when the kernel has no ZFS module), bridge, ACL, profile sized from the host, base VM `base-dev` with snapshot `warm`, reaper and refresh timers and the CLI. Safe to re-run; `COLDBOX_REBUILD=1` rebuilds the base. |
 | `coldbox --version` | Prints the version and the first 12 hex characters of the running file's SHA-256, for example `coldbox 0.2.0 (build 0123456789ab)`. Releases are tagged `vX.Y.Z`. |
-| `coldbox status` | Prints the same version and build first, then health checks with fixes, registered repos with their GitHub visibility, job VMs and recent receipts. A registered repo that is now public without `--allow-public`, or whose visibility cannot be read, is a FAIL. Exit 1 if a check fails. |
-| `coldbox stats [--since 1h] [--receipts DIR]... [--json]` | Summarizes this host's receipts from the window. First the outcomes: the share of settled VMs (finished in the window, not `idle` or `refused`) whose verdict is definitive (`pass` or `fail`), each `incomplete` `cause`, p50/p90 ready and queue wait, jobs per hour (jobs whose recorded job end falls in the window; an interrupted job without one is not counted), orchestration (VM `ready_seconds` plus `destroy_seconds`) against test time (job wall) over jobs that record all three, and orphans (receipts with `vm.destroyed` false after the job ended or its TTL passed). Then p50/p90/max queue wait, boot to ready and job wall time per repo and per host, the slowest workflow steps and checks, and host saturation (peak VMs and peak busy jobs alive in the window, including ones that started earlier or are still running, the VM ceiling, and overflow jobs). A job whose receipt lacks a field is counted under MISSING, never as zero. Repeat `--receipts` with folders copied from other hosts to combine them. |
-| `coldbox run PATH [--offline] [--receipts DIR]` | Copies the committed HEAD (`git archive`) into a fresh VM, runs `coldbox checks`, writes a receipt, destroys the VM. Exit 0 pass, 1 fail, 125 incomplete. `--receipts DIR` (either form of `run`) writes the receipt to DIR instead of `/var/lib/coldbox/receipts`, so stress and test runs stay out of the production receipts; the job still counts against the host ceiling. |
+| `coldbox status` | Prints the same version and build first, then health checks, registered repos with their GitHub visibility, job VMs and recent receipts. For each active runner supervisor, it reports the startup build as `current` or `stale` relative to the installed CLI. A supervisor without matching startup evidence reports `unknown`. A registered repo that is now public without `--allow-public`, or whose visibility cannot be read, is a FAIL. Exit 1 if a check fails. |
+| `coldbox status --hosts` | Reports each configured host's installed build, verdict, orphan job VMs, last receipt and jobs in the last 24 h. Reports loaded supervisor builds and fleet health findings below the table. Exit 1 unless every host passes. Without `/etc/coldbox/ci-hosts.json`, it checks only this host. |
+| `coldbox stats [--since 1h] [--receipts DIR]... [--json]` | Shows observed request outcomes, settled VM outcomes, queue wait, job throughput, timing coverage and host saturation in the window. Repeat `--receipts` to combine host data. `--json` adds `savings`: `vm_minutes` for every VM in the window, and `billable_minutes` (each GitHub Actions runner job's wall time rounded up to a minute, as GitHub bills) times GitHub's Linux 2-core rate as `estimated_usd`. Runner jobs without a measured wall time (older receipts, or a failed GitHub lookup) are left out and counted in `unmeasured_jobs`. |
+| `coldbox shell --repo PATH [--ttl S]` | Opens an interactive shell in an offline throwaway VM with the checkout's committed HEAD in `~/repo`, and destroys the VM when the shell exits. It writes a receipt with `mode: "shell"`. |
+| `coldbox run PATH [--offline] [--receipts DIR]` | Copies the committed HEAD (`git archive`) into a fresh VM, runs `coldbox checks`, writes a receipt, destroys the VM. Exit 0 pass, 1 fail, 125 incomplete. `--receipts DIR` (either form of `run`) writes the receipt to DIR instead of `/var/lib/coldbox/receipts`, so stress and test runs stay out of the production receipts; the job still counts against the host ceiling. At the ceiling `run` waits up to 30 minutes for room, then exits 1. |
 | `coldbox run --repo OWNER/REPO --sha SHA` | Like `coldbox run PATH`, but the VM clones that exact commit from GitHub. With GitHub App auth, Coldbox mints a token limited to that one repo with Contents: read and hands it to the clone over stdin; if there is no App, or it is not installed on the repo with Contents: read, Coldbox says so and clones anonymously, so only public repos work. Private clones stay off until the App is granted Contents: read. It uses the default VM size, not `[vm] size`. |
 | `coldbox run [--ttl S] [--offline] -- CMD [ARG ...]` | Runs one command as `runner` in `/home/runner` of a fresh VM from `base-dev/warm`, streams its output (stderr merged into stdout), writes a receipt and destroys the VM; the reaper deletes it at `--ttl` (default 1h) if that fails. Exits with the command's exit code, or 125 if the VM did not boot, the TTL ran out or the VM could not be destroyed. |
 | `coldbox selftest isolation [--ttl S] [--receipts DIR]` | Boots one job VM and proves the isolation and limits described under the safety model, writes a receipt with an `isolation` field and destroys the VM. Exits 0 for `pass`, 1 for `fail` (each problem is printed), 125 otherwise. `coldbox-selftest.timer` runs it weekly. |
-| `coldbox vm up [--ttl S] [--offline]` | Starts a disposable VM from `base-dev/warm` on the same isolated network and prints its name. The reaper deletes it after `--ttl` (default 2h). It refuses on the primary named in `/etc/coldbox/ci-hosts.json`. When this host is past its `/etc/coldbox/vm-max` limit or its job VM ceiling, it starts the VM on the other overflow host with the most room (never the primary) and prints that name; `--here` refuses instead. |
+| `coldbox vm up [--ttl S] [--offline \| --network NAME] [--image INSTANCE/SNAPSHOT] [--cpus N] [--memory SIZE] [--disk SIZE]` | Starts a disposable VM from `base-dev/warm` on the same isolated network and prints its name. `--image` starts from another snapshot in the Coldbox project, and `--network` puts `eth0` on another Incus network (still port-isolated), but only ones the host owner lists in `/etc/coldbox/vm-allow` as `image INSTANCE/SNAPSHOT` or `network NAME`. An image VM gets the `coldbox` profile's limits unless `--cpus`/`--memory` shrink them, and its `runner` must have passwordless sudo. `--memory` and `--disk` go up to the profile's sizes. The reaper deletes it after `--ttl` (default 2h). It refuses on the primary named in `/etc/coldbox/ci-hosts.json`. When this host is past its `/etc/coldbox/vm-max` limit or its job VM ceiling, it starts the VM on the other overflow host with the most room (never the primary) and prints that name; `--here` refuses instead. |
 | `coldbox vm exec NAME -- CMD...` | Runs CMD in the VM as `runner` (passwordless sudo) in its home directory, passing stdin, stdout and the exit code through: `coldbox vm exec NAME -- bash -s < script.sh`. ssh rejoins words with spaces, so over ssh quote an argument that holds spaces twice: `ssh host coldbox vm exec NAME -- bash -c "'cd repo && make test'"`. |
 | `coldbox vm down NAME` / `coldbox vm list` | Deletes the VM / lists ad-hoc VMs and their time left. `exec` and `down` touch only VMs that `vm up` made, and reach one on another overflow host by the host its name ends with. |
-| `coldbox register OWNER/REPO [--slots N] [--allow-public]` or `ORG` | Starts `coldbox-runner@…` (systemd): N loops of one VM waiting for one job, receipt, destroy, repeat. For a repo it also autoscales (below); `--slots 0` runs only bursts. |
+| `coldbox register OWNER/REPO [--slots N] [--allow-public] [--allow-personal-login]` or `ORG` | Starts `coldbox-runner@…` (systemd): N loops of one VM waiting for one job, receipt, destroy, repeat. For a repo it also autoscales (below); `--slots 0` runs only bursts. |
 | `coldbox unregister OWNER/REPO` | Stops that service and deletes the `cbx-*` runners this host started on GitHub. Other hosts' runners stay online. |
 | `coldbox serve OWNER/REPO --once` | The loop the service runs, in the foreground; `--once` stops after one VM and exits 0 for `pass`, 1 for `fail`, 125 otherwise (like `coldbox run`). |
-| `coldbox reap [--keep-days 30]` | Deletes job VMs past their TTL (`--ttl`, default 6h for runners, 1h for `run`), job VMs other than `vm up` ones with no live worker (left behind by a reboot or a crash) regardless of TTL, and receipts and their artifacts older than 30 days. Every VM Coldbox creates carries `user.coldbox.managed=true` and `user.coldbox.expires` (Unix seconds, or `never` for the live `base-dev` and a base still being built); reap gives the retired `base-prev` 14 days for `build-base --rollback`, then deletes it and any other marked VM past its expiry. It finalizes each receipt in `/var/lib/coldbox/receipts` whose VM and worker are gone (`vm.destroyed: true`, `reconciled_by`). The reaper timer runs it every minute. `coldbox status` FAILs while such a VM or receipt exists, and on any receipt still at `vm.destroyed: false` past its TTL even if its worker is alive, and on any instance in the project without both marks, such as a hand-renamed old base. |
+| `coldbox reap [--keep-days 30]` | Deletes job VMs past their TTL (`--ttl`, default 6h for runners, 1h for `run`), job VMs other than `vm up` ones with no live worker (left behind by a reboot or a crash) regardless of TTL, and receipts, job logs, submission logs, and artifacts older than 30 days. Active or unreconciled jobs keep their evidence until the reaper can settle them. Every VM Coldbox creates carries `user.coldbox.managed=true` and `user.coldbox.expires` (Unix seconds, or `never` for the live `base-dev` and a base still being built); reap gives the retired `base-prev` 14 days for `build-base --rollback`, then deletes it and any other marked VM past its expiry. It finalizes each receipt in `/var/lib/coldbox/receipts` whose VM and worker are gone (`vm.destroyed: true`, `reconciled_by`). The reaper timer runs it every minute. `coldbox status` FAILs while such a VM or receipt exists, and on any receipt still at `vm.destroyed: false` past its TTL even if its worker is alive, and on any instance in the project without both marks, such as a hand-renamed old base. |
 | `sudo coldbox build-base [--rollback]` | Rebuilds `base-dev/warm` with current packages and the newest actions-runner (what the weekly timer runs), or restores `base-prev` without rebuilding. Repeated rollback commands are safe until another rebuild starts. |
 | `sudo ./uninstall.sh` | Removes everything Coldbox created except Incus itself and the receipts. It deletes only the Incus project, network, ACL and pool marked `user.coldbox.managed=true`; `install.sh` sets that mark and refuses to take over a same-named resource without it. The one exception is an unmarked pool whose every user is in Coldbox's own marked project (an install from before the mark): it marks that pool and changes nothing else. Likewise, it deletes only the UFW rules that `install.sh` added (listed in `/var/lib/coldbox/ufw-rules`). |
+
+Stats counts observed requests accepted in the window and how many were assigned, reached a terminal
+outcome (including incomplete), or got a definitive pass or fail. The definitive share uses observed
+acceptances as its denominator. It combines receipts, direct submission records and logs, and GitHub
+queue observations from the adjacent `queues/` directory. Queue observations retain job IDs for
+30 days. GitHub job IDs join queue entries to receipts. A runner job without an ID appears in
+coverage and may overlap a known queue entry, so it is excluded from the definitive rate. When an
+acceptance timestamp is missing, stats uses the recorded job start or VM start. A direct submission
+with only a log has unknown assignment. On the local host, a closed submission log with no queue
+entry or receipt records an incomplete outcome. Copy each host's receipts and queue data under a
+separate parent directory when combining reports. Unobserved requests remain unknown.
+
+Timing totals show measured and missing job counts for VM ready, GitHub runner setup, Coldbox check
+setup, test execution and VM teardown. Test time comes from executed Coldbox test checks or a host
+suite receipt. Whole-job wall time, including workflow steps without explicit test instrumentation,
+stays in the job wall column and in `split.job_wall_seconds` in JSON. The deprecated
+`split.test_seconds` field remains an alias for job wall. The per-repo and per-host tables
+show p50/p90/max for queue wait, VM ready and job wall. MISSING counts jobs without that
+measurement. The report also includes settled VM verdict counts, the slowest workflow steps
+and checks, the orphan count and host saturation.
+
+The resource summary reports how many jobs have JUnit execution time, attributable disk
+reclamation, and an observed dependency cache outcome. JUnit time sums the reported durations
+of executed cases, so it can exceed wall time when tests run in parallel. Idle VM-hours count
+time spent listening for work inside the selected window. Copy the console log beside each
+runner receipt to include its idle time in a combined report. Cache-hit share uses jobs with a
+known restore outcome. A job hits the cache when at least one dependency archive restores
+successfully. The summary shows `unknown` when it has no attributable measurements.
+
+To estimate cost per pass, set `per_vm_hour` under `[cost]` in `/etc/coldbox/stats.toml`.
+`COLDBOX_STATS_CONFIG` selects another file for a single invocation. Stats multiplies the VM-hours
+in the window, including idle and failed VMs, by the rate and divides by the number of passing
+jobs settled in the window. The input and output use the same currency. Cost is `unknown` by
+default.
 
 ### Autoscaling
 
 Every 30 seconds a repo's runner service asks GitHub how many of its queued jobs a Coldbox runner can take (labels within
-`self-hosted, linux, x64, coldbox`) and how many of its `cbx-*` runners are free. For each queued job beyond the free runners it
+`self-hosted, linux, x64, dependabot, coldbox`; `dependabot` lets GitHub's Dependabot graph jobs for a private repo run
+here) and how many of its `cbx-*` runners are free. For each queued job beyond the free runners it
 starts one extra one-job VM runner, a burst. Every listed CI host does this the same way. Bursts and slots from all
 repos share one host ceiling: CPU threads less the reserve, divided by 3 (`CORES_PER_JOB`; a busy job VM averaged 1.5
 cores, p90 about 6, over 1,424 jobs), counting every Coldbox VM, idle or busy, and every worker whose VM is not up yet
@@ -383,7 +466,73 @@ no queued jobs. Failed GitHub reads retain the last observation; status shows it
 Completed runner receipts include `github.queue_wait_seconds` when GitHub job timing is available;
 status and the runner log also show this duration.
 
+Run `coldbox status --hosts` from your existing scheduled health check and use its exit status for
+failure and recovery notifications. The check compares installed builds against the primary and
+reports stale or unknown supervisor builds. For active repository supervisors, it flags stalled
+queues and observations that are missing, unreadable, or more than five minutes old. Unreachable
+peers and peers whose status cannot be read have separate findings.
+
+If you already run `coldverify-deployed-check.service`, install the
+[fleet health drop-in](ops/coldverify-deployed-check.service.d/coldbox-fleet.conf) in that unit's
+drop-in directory and reload the user systemd manager. The unit runs fleet status after its
+deployed-guest check and names each failed check in the journal. Its existing failure and
+recovery hooks continue to handle notifications for the unit.
+
+To clear a `BUILD DRIFT` finding, install the intended Coldbox revision on the primary and every
+configured peer during an idle rollout. Upgrade the primary first so its fleet reader understands
+the new stats exit codes from its peers. Run `coldbox status --hosts` again and check that every
+row reports the intended build and there are zero `BUILD DRIFT` findings. The loaded supervisor
+builds are listed separately, so check those rows too.
+
+### JSON output
+
+Both commands emit one JSON object with `schema_version: 1`. Usage errors follow the CLI's
+standard exit 2 behavior and write to stderr.
+
+| Command | Exit 0 | Exit 1 | Exit 2 | Schema |
+| --- | --- | --- | --- | --- |
+| `coldbox status --json` | Health checks pass | A health check fails | Status cannot be read | [Status v1](docs/status.schema.json) |
+| `coldbox status --hosts --json` | All hosts pass | At least one host fails, including build drift | No host reports failure and at least one is incomplete, or the fleet cannot be read | [Status v1](docs/status.schema.json) |
+| `coldbox stats --json` | The report is readable with zero receipt-based orphans | At least one receipt indicates an orphan | Evidence is unreadable and no orphan is known, or stats cannot produce a report | [Stats v1](docs/stats.schema.json) |
+
+Stats still reports historical job outcomes. A failed job with a cleaned-up VM is a valid
+observation. `unreadable_receipts` counts unreadable receipt files and unreadable input directories.
+
 ## Receipts and seams for the Cold tools
+
+### The `coldbox verify` check
+
+When a runner job named `verify` from `.github/workflows/verify.yml` finishes for a pull request, the host posts a
+`coldbox verify` check run on the PR head through the GitHub App, with `external_id` set to the head commit's tree.
+The host reads the job, the run and the trees from the GitHub API. The check is `success` only when GitHub reports a
+successful job on the registered runner and the same head as the workflow run. The head's `.github/` and `coldbox.toml`
+must match the base branch's, the Coldbox receipt must be `pass`, and the checkout's ColdVerify receipt
+(`.cold/verify-receipt.json`) must report `PASS` for the head or its merge commit with the corresponding Git tree.
+If a condition fails, the check summary gives the reason. The job VM can write the receipt, so a matching Git tree
+only confirms that the reported tree belongs to the reported commit.
+
+`coldbox status` audits the default branch of each active repository registration through the GitHub App.
+`ENFORCED` means a branch rule requires the `coldbox verify` check from this App and the `verify` job has a
+required `coldbox require-tests` step. `GAP` names missing enforcement. `UNVERIFIED` names evidence the audit
+could not read. Both make status exit nonzero and appear in `coldbox status --hosts`. The audit uses PyYAML
+on the host to read workflows. Its result covers the configured check requirement for ordinary merges.
+
+To publish `coldbox verify (host suite)`, run `coldbox run --offline --trusted-suite FILE --verify-job ID PATH`
+on the host. It runs the suite against the selected Actions job's PR head in a separate VM. A rule that requires
+host-observed evidence must name `coldbox verify (host suite)` and select the Coldbox App. See [suite observations](docs/receipt.md#suite_observation).
+
+A repository runner can also publish `coldverify receipt` after its `verify` job. Set
+`COLDBOX_COLDVERIFY_HOST` in that runner unit's environment to an SSH alias with a dedicated identity for
+Coldverify's restricted `host-receipt` command. A separate Coldbox process gets the suite manifest over SSH,
+observes the job's base and head in separate offline VMs under the normal admission limits, and sends their
+host receipts back for the verdict. Coldbox posts the returned payload on the job's head through the App.
+The App key stays on the CI host.
+
+Only the App can post the check, so a branch rule can require `coldbox verify` from that App alone. Coldbox does not
+change any branch rule. When the VM left no job record, the host finds the job by its runner name in the
+repo's recent pull request runs. After a worker exits, `coldbox reap` finishes receipts in the host state directory
+once their VMs are gone. It publishes any pending check whose job it can identify, or records why it could not post.
+If a check might already have reached GitHub, the reaper looks for it using the receipt ID and avoids a second POST.
 
 Coldbox stays a separate repo. Other tools connect through two plain seams:
 
@@ -400,14 +549,14 @@ Coldbox stays a separate repo. Other tools connect through two plain seams:
 
 ## Tested on
 
-Test host: Intel i7-10700KF (8 cores, 16 threads), 45 GB RAM, Ubuntu 26.04.1, kernel 7.0, Incus 6.0.5 (before `install.sh` refused it), ZFS loop pool on local disk.
+Test host: a fresh nested Ubuntu 24.04 VM (8 vCPUs, 16 GiB) started by the fresh-host acceptance test on a bare-metal Xeon E5-2660 v2 (40 threads) or Xeon E5-2430L v2 (24 threads) host. Each run installs Coldbox, registers a private test repo with one slot, dispatches a two-job workflow and needs a `pass` receipt with every job VM destroyed.
 
-| What (measured 2026-11-04 and 05) | Time |
+| What (measured 2026-11-12, three passing runs) | Time |
 | --- | --- |
-| `sudo ./install.sh`, first run (packages, base VM, toolchains, runner) | 297 s; 189 s after `uninstall.sh` |
-| `sudo ./install.sh`, re-run with everything in place | 3.8 s |
-| `sudo coldbox build-base` (weekly refresh, includes Docker) | 291 s |
-| Job queued until picked up (runner VM is booted before the job arrives) | about 1 s |
+| `sudo ./install.sh --install-incus`, first run (Incus, packages, base VM, toolchains, runner) | 817 s, 914 s, 1,068 s |
+| Fresh VM started until the first `pass` receipt (install, register, dispatch, job) | 1,319 s, 1,452 s, 1,488 s |
+| Workflow dispatched until both jobs finished (in these runs the second job started after the first ended) | 348 s, 368 s, 411 s |
+| First job queued until picked up (runner VM is booted before the job arrives) | 1 s, 1 s, 2 s |
 
 A job VM takes a median of 56 s until ready (90% under 90 s), measured over 1,197 jobs in the 7 days to
 2026-11-08 on a bare-metal host with 40 threads and Incus 6.0.7. In a nested-KVM cloud VM it took 103–110 s; see
@@ -432,7 +581,15 @@ in tight timeouts.
 
 - Linux x86_64 hosts only (Incus with KVM). No macOS, Windows (WSL2 included) or ARM hosts, and job VMs are Ubuntu 26.04 only.
 - Not faster per job than hosted runners on single-threaded suites; the gains are cost, queue time and parallel slots.
-- No dependency cache between jobs: every VM starts clean, so jobs download their packages every time.
+- The only dependency caches are npm, pip, Go modules and cargo downloads, per repo and opt-in on each host. The folder must belong to the runner service's user:
+  `sudo install -d -o "$(systemctl show -P User "coldbox-runner@$(systemd-escape OWNER/REPO).service")" /var/lib/coldbox/cache/OWNER/REPO`.
+  After a job of that repo's runner passes on a push to the repo's default branch (the host asks GitHub, not the VM),
+  the host saves the VM's `~/.npm` as `npm.tar`, `~/.cache/pip` as `pip.tar`, `~/go/pkg/mod` as `go.tar`,
+  `~/.cargo/registry` as `cargo.tar` and `~/.cargo/git` as `cargo-git.tar` (each at most 2 GiB) without unpacking them. Each later job VM of that repo starts with them unpacked as the `runner` user. Pull request jobs read them and
+  never write them. They are off for org runners and for repos served with `--allow-public`.
+  `coldbox run --repo` and `coldbox api submit` restore the same cache when the GitHub App confirms
+  the requested private repo and the exact SHA is the tip of one of its branches. Direct runs only restore archives.
+  The Go build cache, cargo's `target/` and the rest of `~/.cargo` (installed binaries, config, credentials) are not saved.
 - Each host starts VMs only on itself. Every listed CI host autoscales the same way (see [Autoscaling](#autoscaling)),
   but there is no shared pool of hosts.
 

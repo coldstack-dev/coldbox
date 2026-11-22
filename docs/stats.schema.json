@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Coldbox stats v1",
+  "type": "object",
+  "required": ["schema_version"],
+  "properties": {"schema_version": {"const": 1}},
+  "oneOf": [
+    {
+      "required": [
+        "since_seconds", "since", "vms", "jobs", "jobs_per_hour", "queue_wait", "boot_to_ready", "job_wall",
+        "outcomes", "requests", "resources", "split", "phases", "orphans", "jobs_without_steps",
+        "repos", "hosts", "slowest_steps", "unreadable_receipts"
+      ],
+      "properties": {
+        "since_seconds": {"type": "integer", "minimum": 1},
+        "since": {"type": "string", "format": "date-time"},
+        "vms": {"$ref": "#/$defs/count"},
+        "jobs": {"$ref": "#/$defs/count"},
+        "jobs_per_hour": {"type": "number", "minimum": 0},
+        "queue_wait": {"$ref": "#/$defs/timing"},
+        "boot_to_ready": {"$ref": "#/$defs/timing"},
+        "job_wall": {"$ref": "#/$defs/timing"},
+        "outcomes": {"type": "object"},
+        "requests": {"type": "object"},
+        "resources": {"type": "object"},
+        "savings": {
+          "type": "object",
+          "required": ["vm_minutes", "billable_minutes", "usd_per_minute", "estimated_usd", "unmeasured_jobs"],
+          "properties": {
+            "vm_minutes": {"type": "number", "minimum": 0},
+            "billable_minutes": {"$ref": "#/$defs/count"},
+            "usd_per_minute": {"type": "number", "minimum": 0},
+            "estimated_usd": {"type": "number", "minimum": 0},
+            "unmeasured_jobs": {"$ref": "#/$defs/count"}
+          }
+        },
+        "split": {"type": "object"},
+        "phases": {"type": "object"},
+        "orphans": {"$ref": "#/$defs/count"},
+        "jobs_without_steps": {"$ref": "#/$defs/count"},
+        "repos": {"type": "object"},
+        "hosts": {"type": "object"},
+        "slowest_steps": {"type": "array", "items": {"type": "object"}},
+        "unreadable_receipts": {"$ref": "#/$defs/count"}
+      }
+    },
+    {
+      "required": ["verdict", "error"],
+      "properties": {"verdict": {"const": "INCOMPLETE"}, "error": {"type": "string"}}
+    }
+  ],
+  "$defs": {
+    "count": {"type": "integer", "minimum": 0},
+    "timing": {
+      "type": "object",
+      "required": ["n", "missing"],
+      "properties": {
+        "n": {"$ref": "#/$defs/count"},
+        "missing": {"$ref": "#/$defs/count"},
+        "p50": {"type": "number"},
+        "p90": {"type": "number"},
+        "max": {"type": "number"}
+      },
+      "dependentRequired": {"p50": ["p90", "max"], "p90": ["p50", "max"], "max": ["p50", "p90"]},
+      "additionalProperties": false
+    }
+  }
+}
