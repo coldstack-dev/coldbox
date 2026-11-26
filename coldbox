@@ -7,6 +7,7 @@ import collections
 import concurrent.futures
 import configparser
 import contextlib
+import copy
 import errno
 import fcntl
 import grp
@@ -56,8 +57,10 @@ UNITS = {'': 1, 'B': 1, 'KB': 10**3, 'MB': 10**6, 'GB': 10**9, 'TB': 10**12,
          'KiB': 2**10, 'MiB': 2**20, 'GiB': 2**30, 'TiB': 2**40}
 HOST_RESERVE = 2 * 2**30
 HOST_IDLE = 1536 * 2**20
-INCUS_COMMANDS = {'run', 'shell', 'serve', 'register', 'reap', 'status', 'vm', 'selftest'}
+INCUS_COMMANDS = {'run', 'shell', 'serve', 'register', 'reap', 'status', 'vm', 'selftest', 'pool'}
 ADHOC = 'user.coldbox.adhoc'
+WARM = 'user.coldbox.warm'
+WARM_JOB = 'user.coldbox.warm-job'
 MANAGED, EXPIRES = 'user.coldbox.managed', 'user.coldbox.expires'
 PROVENANCE = 'user.coldbox.provenance'
 ROLLBACK_WINDOW = 14 * 86400
@@ -75,6 +78,13 @@ TOOL_DIRS = {'node': 'node', 'python': 'Python', 'go': 'go'}
 RESERVE = Path(os.environ.get('COLDBOX_RESERVE', '/etc/coldbox/reserve'))
 VM_MAX = Path('/etc/coldbox/vm-max')
 VM_ALLOW = Path('/etc/coldbox/vm-allow')
+VM_WARM = Path('/etc/coldbox/vm-warm')
+WARM_POOL = Path(os.environ.get('COLDBOX_WARM_POOL', '/etc/coldbox/warm-pool'))
+WARM_TTL = 6 * 3600
+WARM_BOOT = 300
+WARM_CLAIM = 300
+TEARDOWN_MAX_WORKERS = 2
+TEARDOWN_MAX_PENDING = 4
 RUNNER = 'runner'
 APP_KEY = Path('/etc/coldbox/github-app.pem')
 APP_ENV = Path(os.environ.get('COLDBOX_GITHUB_APP_ENV', '/etc/coldbox/github-app.env'))
@@ -108,6 +118,9 @@ CLONE = ('token=$(cat); mkdir -p ~/repo && cd ~/repo && git init -q && '
          'git fetch -q --depth 1 "$1" "$2" && git checkout -q --detach FETCH_HEAD && '
          f'test "$(git rev-parse HEAD)" = "$2" && git ls-files | sed "s|^|$HOME/repo/|" > {ARCHIVED}')
 ARTIFACTS = f'{GUEST_JOB_DIR}/artifacts'
+CONSOLE_BYTES = 2**20
+CONSOLE_CHUNK = 64 * 1024
+CONSOLE_MARKER = b"\n[coldbox: console output truncated]\n"
 ARTIFACT_BYTES, ARTIFACT_FILES, ARTIFACT_SECONDS, ARTIFACT_MEMORY = 100 * 2**20, 1000, 120, 512 * 2**20
 PYTEST_CONFIGS = ('pytest.ini', 'pyproject.toml', 'setup.cfg', 'tox.ini')
 LABELS = ['self-hosted', 'linux', 'x64', 'coldbox', 'dependabot']
@@ -156,6 +169,8 @@ DRAINING = threading.Event()
 RELEASING = threading.Lock()
 ACTIVE_LOG = None
 COLDVERIFY_CHILDREN = []
+COLDVERIFY_LOCK = threading.Lock()
+TEARDOWN_REAPER = None
 IDLE_UNIT = {'inactive', 'failed'}
 NAME = re.compile(r'[a-z][a-z0-9_-]*')
 RAN_A_TEST = (" 2>&1 | awk '{{print}} /{}/{{ok=1}} /{}/{{n++}} END{{f=ENVIRON[\"COLDBOX_JUNIT\"]; if (f) {{"
@@ -163,7 +178,20 @@ RAN_A_TEST = (" 2>&1 | awk '{{print}} /{}/{{ok=1}} /{}/{{n++}} END{{f=ENVIRON[\"
               "exit !ok}}' || {{ echo 'coldbox: no passing test in the output' >&2; exit 1; }}")
 GO_TEST = 'go test -v ./...' + RAN_A_TEST.format(r'^[ \t]*--- PASS', r'^[ \t]*--- PASS')
 CARGO_TEST = 'cargo test' + RAN_A_TEST.format(r'^test result: ok\. [1-9]', r'^test .* \.\.\. ok$')
+ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+ACTIONS_TIMESTAMP = re.compile(r'^\ufeff?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z ?')
+UNITTEST_RULE = re.compile(r'^-{10,}$')
+UNITTEST_RAN = re.compile(r'^Ran (\d+) tests? in \d+(?:\.\d+)?s$')
+UNITTEST_RESULT = re.compile(r'^(OK|FAILED)(?: \(([^)]+)\))?$')
+UNITTEST_SKIPPED = re.compile(r'\bskipped=(\d+)\b')
+PYTEST_SUMMARY = re.compile(r'^(?:=+ )?(\d+ [a-z]+(?:, \d+ [a-z]+)*) in \d+(?:\.\d+)?s(?: \([^)]+\))?(?: =+)?$')
+PYTEST_ITEM = re.compile(r'(\d+) ([a-z]+)')
+PYTEST_EXECUTED = frozenset(('passed', 'failed', 'error', 'errors', 'xfailed', 'xpassed'))
+CARGO_SUMMARY = re.compile(r'^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;')
+GO_TEST_CASE = re.compile(r'^\s*--- (?:PASS|FAIL): \S+ \(\d+(?:\.\d+)?s\)$')
+JOB_LOG_BYTES = 32 * 1024 * 1024
 RUST_TEST = re.compile(r'#\[(?:\w+::)*test\]')
+ORG_LOGIN = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]*')
 TARGET = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9_.-]+)?')
 PY_ACTIVATE = '. "${TMPDIR:-/tmp}/coldbox-py/bin/activate"'
 PY_VENV = f'python3 -m venv --system-site-packages "${{TMPDIR:-/tmp}}/coldbox-py" && {PY_ACTIVATE} && '
@@ -181,6 +209,10 @@ class ConfigError(Exception):
 
 
 class Unsafe(ValueError):
+    pass
+
+
+class WarmOverlayMismatch(RuntimeError):
     pass
 
 
@@ -211,6 +243,25 @@ def write_json(path, data, *, durable=False):
             os.fsync(directory)
         finally:
             os.close(directory)
+
+
+def state_folder(name):
+    """A folder under STATE that STATE's owner can write, also when root's reap is the first to need it."""
+    folder = STATE / name
+    if not folder.is_dir():
+        folder.mkdir(parents=True, exist_ok=True)
+        if os.geteuid() == 0:
+            owner = STATE.stat()
+            os.chown(folder, owner.st_uid, owner.st_gid)
+    return folder
+
+
+def mark_ready(name):
+    """Record that this VM is ready, replacing a marker another user made: root's reap marks a standby that the
+    runner user later claims."""
+    marker = state_folder('ready') / name
+    marker.unlink(missing_ok=True)
+    marker.touch()
 
 
 def size_bytes(text):
@@ -735,7 +786,25 @@ def require_tests(root, job_dir):
     return 1
 
 
+ORG_JOB_GATE = Path('/etc/coldbox/org-job')
+
+
+def org_job_approved():
+    try:
+        ORG_JOB_GATE.stat()
+    except FileNotFoundError:
+        return True
+    deadline = time.monotonic() + 120
+    while not (ORG_JOB_GATE / 'deny').exists() and time.monotonic() < deadline:
+        if (ORG_JOB_GATE / 'allow').exists():
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def job_started(env=None):
+    if not org_job_approved():
+        raise Unsafe('host refused the public organization job')
     env = os.environ if env is None else env
     if env.get('COLDBOX_CI_PRIMARY'):
         admission_check(argparse.Namespace(expected_primary=env['COLDBOX_CI_PRIMARY']), env=env)
@@ -785,17 +854,18 @@ def record_queue_wait(metadata, runner):
     try:
         jobs = attempt_jobs(metadata['repo'], metadata['run_id'], metadata['run_attempt'])
         matched = next(job for job in jobs if job.get('runner_name') == runner)
-        queued, started = matched['created_at'], matched['started_at']
-        seconds = (datetime.fromisoformat(started) -
-                   datetime.fromisoformat(queued)).total_seconds()
-        if seconds < 0:
-            raise ValueError('job started before it was queued')
-        metadata.update(job_id=matched['id'], queued_at=queued, runner_started_at=started,
-                        queue_wait_seconds=round(seconds, 3))
+        metadata['job_id'] = matched['id']
         if matched.get('completed_at'):
             metadata['completed_at'] = matched['completed_at']
         if steps := job_steps(matched.get('steps')):
             metadata['steps'] = steps
+        queued = datetime.fromisoformat(matched['created_at'])
+        metadata['queued_at'] = matched['created_at']
+        seconds = (datetime.fromisoformat(matched['started_at']) - queued).total_seconds()
+        if seconds < 0:
+            del metadata['queued_at']
+            raise ValueError('job started before it was queued')
+        metadata.update(runner_started_at=matched['started_at'], queue_wait_seconds=round(seconds, 3))
         print(f'coldbox: {runner} queue waited {seconds:g} s', file=sys.stderr, flush=True)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError, StopIteration) as error:
         print(f'coldbox: queue wait unavailable for {runner}: {error}', file=sys.stderr, flush=True)
@@ -922,17 +992,64 @@ def ic_exec(name, *command, user=RUNNER, cwd=None, env=(), timeout=None):
     return prefix + args + ['--', *command]
 
 
+class ConsoleLog:
+    def __init__(self, file, observe=None):
+        self.file = file
+        self.observe = observe
+        self.stdout = None
+        self.total = 0
+        self.head = (CONSOLE_BYTES - len(CONSOLE_MARKER)) // 2
+        self.tail_size = CONSOLE_BYTES - self.head - len(CONSOLE_MARKER)
+        self.tail = None
+
+    def write(self, data):
+        if self.observe:
+            self.observe(data)
+        if self.stdout is not None and self.total < self.head:
+            self.stdout.write(data[:self.head - self.total])
+            self.stdout.flush()
+        room = max(0, CONSOLE_BYTES - self.total)
+        self.total += len(data)
+        if room:
+            self.file.write(data[:room])
+        if len(data) > room:
+            if self.tail is None:
+                self.file.seek(-self.tail_size, os.SEEK_END)
+                self.tail = collections.deque(self.file.read(self.tail_size), maxlen=self.tail_size)
+                self.file.seek(self.head)
+                self.file.write(CONSOLE_MARKER)
+                self.file.truncate()
+            self.tail.extend(data[room:][-self.tail_size:])
+        self.flush()
+
+    def flush(self):
+        self.file.flush()
+
+    def finish(self):
+        if self.tail is not None:
+            self.file.write(bytes(self.tail))
+        self.flush()
+        if self.stdout is not None and self.total > self.head:
+            self.file.seek(self.head)
+            shutil.copyfileobj(self.file, self.stdout)
+            self.stdout.flush()
+
+
 def tee(command, log, data=None):
     proc = subprocess.Popen(command, stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if data is not None:
         proc.stdin.write(data)
         proc.stdin.close()
-    for line in proc.stdout:
-        log.write(line)
-        log.flush()
-        sys.stdout.buffer.write(line)
-        sys.stdout.flush()
+    output = sys.stdout.buffer
+    if log.observe is not None and not output.isatty():
+        log.stdout = output
+    with proc.stdout:
+        for chunk in iter(lambda: proc.stdout.read1(CONSOLE_CHUNK), b''):
+            log.write(chunk)
+            if log.stdout is None:
+                output.write(chunk)
+                output.flush()
     return proc.wait()
 
 
@@ -993,7 +1110,7 @@ def wait_ready(name, expires, network, restarts=3):
 
 def pull(name, path):
     result = subprocess.run(['incus', '--force-local', '--project', PROJECT, 'file', 'pull', f'{name}{path}', '-'],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, timeout=10)
     return json.loads(result.stdout) if result.returncode == 0 and result.stdout.strip() else None
 
 
@@ -1076,6 +1193,139 @@ def destroy_job(name):
     else:
         gone = destroy(name)
     return gone, None, elapsed + time.monotonic() - started
+
+
+def note_teardown(name, pid=None):
+    pid = os.getpid() if pid is None else pid
+    folder = STATE / 'teardown'
+    folder.mkdir(parents=True, exist_ok=True)
+    staged = folder / f'.{name}.{pid}.{threading.get_ident()}'
+    staged.write_text(json.dumps([pid, process_start(pid), name]))
+    os.replace(staged, folder / name)
+
+
+def clear_teardown(name):
+    (STATE / 'teardown' / name).unlink(missing_ok=True)
+
+
+def tearing_down(folder=None, prune=True):
+    folder = STATE / 'teardown' if folder is None else folder
+    if not folder.is_dir():
+        return set()
+    active = set()
+    for record in folder.glob('cbx-*'):
+        try:
+            fields = json.loads(record.read_text())
+            pid, start, name = fields if isinstance(fields, list) and len(fields) == 3 else (None, None, None)
+        except (OSError, ValueError, TypeError):
+            pid = start = name = None
+        if type(pid) is int and pid > 0 and isinstance(start, str) and start and name == record.name \
+                and process_start(pid) == start:
+            active.add(name)
+        elif prune:
+            record.unlink(missing_ok=True)
+    return active
+
+
+class TeardownReaper:
+    def __init__(self, max_workers=TEARDOWN_MAX_WORKERS, max_pending=TEARDOWN_MAX_PENDING):
+        if max_workers < 1 or max_pending < max_workers:
+            raise ValueError('max_workers must be >= 1 and max_pending >= max_workers')
+        self._max_workers = max_workers
+        self._max_pending = max_pending
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._queue = collections.deque()
+        self._active = 0
+        self._workers = 0
+        self._threads = []
+        self._closed = False
+        self.failures = 0
+
+    def pending(self):
+        with self._lock:
+            return self._active + len(self._queue)
+
+    def submit(self, name, task):
+        note_teardown(name)
+        run_sync = False
+        with self._cond:
+            while not self._closed and self._active + len(self._queue) >= self._max_pending:
+                self._cond.wait()
+            if self._closed:
+                run_sync = True
+            else:
+                self._queue.append((name, task))
+                self._threads = [thread for thread in self._threads if thread.is_alive()]
+                if self._workers < self._max_workers:
+                    self._workers += 1
+                    thread = threading.Thread(target=self._run, daemon=True)
+                    self._threads.append(thread)
+                    thread.start()
+                self._cond.notify()
+        if run_sync:
+            try:
+                task()
+            finally:
+                clear_teardown(name)
+
+    def _run(self):
+        while True:
+            with self._cond:
+                if not self._queue:
+                    self._workers -= 1
+                    self._cond.notify_all()
+                    return
+                name, task = self._queue.popleft()
+                self._active += 1
+            try:
+                task()
+            except Exception as error:
+                with self._lock:
+                    self.failures += 1
+                print(f'coldbox: async teardown failed for {name}: {error}', file=sys.stderr, flush=True)
+            finally:
+                clear_teardown(name)
+                with self._cond:
+                    self._active -= 1
+                    self._cond.notify_all()
+
+    def drain(self, timeout=None, *, close=False):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._cond:
+            if close:
+                self._closed = True
+                self._cond.notify_all()
+            while self._active or self._queue:
+                if deadline is not None:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        return False
+                    self._cond.wait(left)
+                else:
+                    self._cond.wait()
+            threads = list(self._threads)
+        for thread in threads:
+            left = None if deadline is None else max(0.0, deadline - time.monotonic())
+            thread.join(left)
+        with self._lock:
+            self._threads = [thread for thread in self._threads if thread.is_alive()]
+            return not self._active and not self._queue
+
+
+def get_teardown_reaper():
+    global TEARDOWN_REAPER
+    if TEARDOWN_REAPER is None or TEARDOWN_REAPER._closed:
+        TEARDOWN_REAPER = TeardownReaper()
+    return TEARDOWN_REAPER
+
+
+def wait_for_teardowns(close=False):
+    global TEARDOWN_REAPER
+    if TEARDOWN_REAPER is not None:
+        TEARDOWN_REAPER.drain(close=close)
+        if close:
+            TEARDOWN_REAPER = None
 
 
 def lifecycle(expires):
@@ -1262,7 +1512,8 @@ def observe_suite(name, suite, cwd, expires, receipt, log):
 
 
 def job(mode, name, ttl, command, repo, sha=None, stdin=None, archive=None, offline=False, cwd=None, env=(),
-        extra=None, receipts=None, on_ready=None, config=(), judge=None, clone=None, cache=None, suite=None):
+        extra=None, receipts=None, on_ready=None, config=(), judge=None, clone=None, cache=None, suite=None,
+        recheck_org=None, teardown=None, on_teardown=None, warm_claimed=False, pooled=False):
     global ACTIVE_LOG
     CLEANUP.clear()
     receipts = Path(receipts or STATE / 'receipts')
@@ -1274,26 +1525,94 @@ def job(mode, name, ttl, command, repo, sha=None, stdin=None, archive=None, offl
                    host=os.uname().nodename, checks=[], started_at=now_iso(), log=str(log_path), **(extra or {}),
                    vm=dict(name=name, image=BASE, ttl_seconds=ttl, offline=offline, destroyed=False))
     publishes_check = mode == 'runner' or bool(receipt.get('verify_job'))
+    if mode == 'runner':
+        receipt['job_result'] = None
     if publishes_check:
         receipt['verification'] = dict(state='pending')
     write_json(path, receipt, durable=publishes_check)
     guest_env = [f'COLDBOX_JOB_DIR={GUEST_JOB_DIR}', 'PIP_BREAK_SYSTEM_PACKAGES=1', *env]
-    with log_path.open('ab') as log:
+    pending = b''
+    interrupted = False
+
+    def observe_runner(chunk):
+        nonlocal pending
+        lines, _, rest = (pending + chunk).rpartition(b'\n')
+        pending = rest[-CONSOLE_CHUNK:]
+        if b' completed with result: ' in lines:
+            completed, result = job_outcome(lines)
+            if result:
+                receipt.update(job_name=completed, job_result=result)
+                write_json(path, receipt)
+                return
+        if not receipt['job_result'] and b'Running job: ' in lines and (assigned := running_job(lines)):
+            if recheck_org and not receipt.get('job_name'):
+                decision = 'allow' if recheck_org() else 'deny'
+                subprocess.run(ic_exec(name, 'touch', str(ORG_JOB_GATE / decision), user=None),
+                               check=True, capture_output=True)
+            receipt['job_name'] = assigned
+            write_json(path, receipt)
+
+    def finish_teardown(target_receipt):
+        gone, reclaimed, destroy_seconds = destroy_job(name)
+        (STATE / 'ready' / name).unlink(missing_ok=True)
+        ended = time.time()
+        target_receipt['vm'].update(destroyed=gone, destroyed_at=now_iso(), lifetime_seconds=round(ended - started, 3),
+                                    destroy_seconds=round(destroy_seconds, 3))
+        if reclaimed is not None:
+            target_receipt['vm']['reclaimed_bytes'] = reclaimed
+        target_receipt['seconds'] = round(ended - started, 3)
+        collect_job_log_tests(target_receipt)
+        settle(target_receipt)
+        write_json(path, target_receipt, durable=publishes_check)
+        if mode == 'runner' and 'exit' not in target_receipt and target_receipt.get('github'):
+            record_queue_wait(target_receipt['github'], name)
+            collect_job_log_tests(target_receipt)
+            settle(target_receipt)
+            write_json(path, target_receipt, durable=True)
+        print(f"coldbox: outcome [{target_receipt['reason_code']}]", file=sys.stderr)
+        print(f"coldbox: {target_receipt['verdict'].upper()} receipt {path}", file=sys.stderr)
+        if on_teardown:
+            on_teardown(target_receipt)
+
+    with log_path.open('w+b') as file:
+        log = ConsoleLog(file, observe_runner if mode == 'runner' else None)
         ACTIVE_LOG = log_path if mode == 'runner' else None
         try:
-            timing = boot(name, expires, offline, *config)
+            if warm_claimed:
+                timing = dict(clone_seconds=0.0, boot_seconds=0.0, warm_claimed=True)
+            else:
+                if pooled and warm_pool_on():
+                    note_pool('miss', vm=name)
+                timing = boot(name, expires, offline, *config)
             receipt['vm']['ready_seconds'] = round(time.time() - started, 3)
             if isinstance(timing, dict):
                 receipt['vm'].update(timing)
             receipt['vm']['host_ceiling'] = host_cpus()
             write_json(path, receipt, durable=publishes_check)
-            (STATE / 'ready').mkdir(parents=True, exist_ok=True)
-            (STATE / 'ready' / name).touch()
+            mark_ready(name)
             ic('file', 'push', str(Path(__file__).resolve()), f'{name}/usr/local/bin/coldbox', '--mode', '0755')
-            if mode == 'runner':
-                push_guest_files(name, managed=True)
+            if warm_claimed:
+                try:
+                    push_guest_files(name, mode=mode, strict_stamp=True)
+                    note_pool('hit', vm=name)
+                except WarmOverlayMismatch:
+                    note_pool('reaped', vm=name, reason='unhealthy')
+                    note_pool('miss', vm=name)
+                    if not destroy(name):
+                        raise RuntimeError(f'could not destroy stale warm VM {name}')
+                    (STATE / 'ready' / name).unlink(missing_ok=True)
+                    warm_claimed = False
+                    timing = boot(name, expires, offline, *config)
+                    receipt['vm']['ready_seconds'] = round(time.time() - started, 3)
+                    receipt['vm'].pop('warm_claimed', None)
+                    if isinstance(timing, dict):
+                        receipt['vm'].update(timing)
+                    write_json(path, receipt, durable=publishes_check)
+                    mark_ready(name)
+                    ic('file', 'push', str(Path(__file__).resolve()), f'{name}/usr/local/bin/coldbox', '--mode', '0755')
+                    push_guest_files(name, mode=mode)
             else:
-                push_guest_files(name)
+                push_guest_files(name, mode=mode)
             if cache:
                 receipt['cache'] = cache_in(name, cache, 'npm')
                 receipt['cache'].update({tool: cache_in(name, cache, tool) for tool in CACHES if tool != 'npm'})
@@ -1318,76 +1637,62 @@ def job(mode, name, ttl, command, repo, sha=None, stdin=None, archive=None, offl
                    '--create-dirs', '--mode', '0644')
                 subprocess.run(ic_exec(name, 'sh', '-c', 'printf "%s\\n" "$1" > /etc/coldbox/host',
                                        'sh', receipt['admission']['host'], user=None), check=True, capture_output=True)
+            if recheck_org:
+                subprocess.run(ic_exec(name, 'mkdir', str(ORG_JOB_GATE), user=None), check=True, capture_output=True)
             if on_ready:
                 on_ready()
             command_started = time.time()
             receipt['job_started_at'] = now_iso()
             write_json(path, receipt, durable=publishes_check)
-            if mode == 'shell':
-                run = ic_exec(name, *command, cwd=cwd, env=guest_env)
-                run[run.index('non-interactive')] = 'auto'
-                code = subprocess.run(['timeout', '--foreground', '--signal=KILL',
-                                       str(max(1, int(expires - time.time()))), *run], stdin=stdin).returncode
-                signal.signal(signal.SIGHUP, signal.SIG_IGN)
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            elif suite is None:
-                code = tee(ic_exec(name, *command, cwd=cwd, env=guest_env, timeout=expires - time.time()), log, stdin)
-            else:
-                code = observe_suite(name, suite, cwd, expires, receipt, log)
-            receipt['job_seconds'] = round(time.time() - command_started, 3)
-            receipt['job_ended_at'] = now_iso()
-            receipt['exit'] = code
+            try:
+                if mode == 'shell':
+                    run = ic_exec(name, *command, cwd=cwd, env=guest_env)
+                    run[run.index('non-interactive')] = 'auto'
+                    code = subprocess.run(['timeout', '--foreground', '--signal=KILL',
+                                           str(max(1, int(expires - time.time()))), *run], stdin=stdin).returncode
+                    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                elif suite is None:
+                    code = tee(ic_exec(name, *command, cwd=cwd, env=guest_env, timeout=expires - time.time()), log, stdin)
+                else:
+                    code = observe_suite(name, suite, cwd, expires, receipt, log)
+                receipt['job_seconds'] = round(time.time() - command_started, 3)
+                receipt['job_ended_at'] = now_iso()
+                receipt['exit'] = code
+                if code in (124, 137) and time.time() >= expires - 1:
+                    receipt['error'] = 'TTL reached'
+            finally:
+                if pending:
+                    observe_runner(b'\n')
+                if log.tail is not None:
+                    receipt['console_truncated_bytes'] = log.total - CONSOLE_BYTES + len(CONSOLE_MARKER)
+                log.finish()
+                if suite is None:
+                    try:
+                        collect_tests(name, receipt, archive is not None or clone is not None)
+                    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as error:
+                        receipt.setdefault('error', str(error) or type(error).__name__)
             if judge:
                 judge(receipt, log_path)
             if mode == 'runner':
-                receipt['job_name'], receipt['job_result'] = job_outcome(log_path.read_bytes())
-                receipt['job_name'] = receipt['job_name'] or running_job(log_path.read_bytes())
-            if code in (124, 137) and time.time() >= expires - 1:
-                receipt['error'] = 'TTL reached'
+                receipt.setdefault('job_name', None)
+                if github := receipt.get('github'):
+                    record_queue_wait(github, name)
             if suite is None:
-                github = None if 'profile' in receipt else pull(name, f'{GUEST_JOB_DIR}/job.json')
                 result = pull(name, f'{GUEST_JOB_DIR}/checks.json')
-                if github:
-                    if mode == 'runner':
-                        record_queue_wait(github, name)
-                    receipt.update(github=github, repo=github['repo'] or repo, sha=github['sha'])
-                    if mode == 'runner':
-                        receipt['coldverify'] = strict_receipt(name, receipt['repo'])
                 if ('profile' in receipt and code == 2 and result and result.get('verdict') == 'refused'
                         and result.get('cause') in ('unknown_profile', 'unauthorized_profile')):
                     receipt['profile_refusal'] = dict(cause=result['cause'], error=result['error'])
                 elif result:
                     receipt.update(checks=result['checks'], checks_verdict=result['verdict'])
-                tests = subprocess.run(ic_exec(name, 'coldbox', 'junit', '--newer', JOB_STARTED,
-                                               *(['--archived', ARCHIVED] if archive is not None or clone else []),
-                                               *JUNIT_DIRS[mode], timeout=120),
-                                       capture_output=True, text=True)
-                strict = receipt.get('coldverify') or {}
-                strict_count = strict.pop('tests_ran', None)
-                if receipt.get('job_name') != 'verify':
-                    strict_count = None
-                if strict_count is not None:
-                    receipt.update(tests_ran=strict_count, tests_source='cold-verify')
-                if tests.returncode == 0:
-                    summary = json.loads(tests.stdout)
-                    cold_verify = summary.pop('cold_verify', [])
-                    if strict_count is None:
-                        ran, source = tests_ran(summary, cold_verify)
-                        if ran is not None:
-                            receipt.update(tests_ran=ran, tests_source=source)
-                    if summary['total']:
-                        receipt['tests'] = summary
         except subprocess.CalledProcessError as error:
             stderr = error.stderr.decode() if isinstance(error.stderr, bytes) else error.stderr or ''
             receipt['error'] = f"{' '.join(map(str, error.cmd[:7]))} failed: {stderr.strip()[-500:]}"
-        except (OSError, RuntimeError, ValueError) as error:
+        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
             receipt['error'] = str(error) or type(error).__name__
         except (SystemExit, KeyboardInterrupt):
+            interrupted = True
             receipt['error'] = 'stopped'
-            if suite is None and 'profile' not in receipt and (github := pull(name, f'{GUEST_JOB_DIR}/job.json')):
-                receipt['github'] = github
-            if mode == 'runner' and (assigned := running_job(log_path.read_bytes())):
-                receipt['job_name'] = assigned
             raise
         finally:
             ACTIVE_LOG = None
@@ -1417,22 +1722,156 @@ def job(mode, name, ttl, command, repo, sha=None, stdin=None, archive=None, offl
                     write_json(path, receipt, durable=True)
                 except OSError as error:
                     print(f'coldbox: could not save evidence before destroying {name}: {error}', file=sys.stderr)
-            gone, reclaimed, destroy_seconds = destroy_job(name)
-            (STATE / 'ready' / name).unlink(missing_ok=True)
-            ended = time.time()
-            receipt['vm'].update(destroyed=gone, destroyed_at=now_iso(), lifetime_seconds=round(ended - started, 3),
-                                 destroy_seconds=round(destroy_seconds, 3))
-            if reclaimed is not None:
-                receipt['vm']['reclaimed_bytes'] = reclaimed
-            receipt['seconds'] = round(ended - started, 3)
-            settle(receipt)
-            write_json(path, receipt, durable=publishes_check)
-    print(f"coldbox: outcome [{receipt['reason_code']}]", file=sys.stderr)
-    print(f"coldbox: {receipt['verdict'].upper()} receipt {path}", file=sys.stderr)
+            if teardown is not None and not interrupted:
+                file.flush()
+                file.close()
+                receipt['vm']['teardown'] = 'async'
+                if not publishes_check:
+                    with contextlib.suppress(OSError):
+                        write_json(path, receipt)
+                background = copy.deepcopy(receipt)
+                teardown.submit(name, lambda: finish_teardown(background))
+            else:
+                finish_teardown(receipt)
     return receipt
 
 
-def strict_receipt(name, repo):
+def collect_tests(name, receipt, archived):
+    timeout = 120 if 'exit' in receipt else 10
+    try:
+        github = None if 'profile' in receipt else pull(name, f'{GUEST_JOB_DIR}/job.json')
+        if github:
+            receipt.update(github=github, repo=github['repo'] or receipt['repo'], sha=github['sha'])
+            if receipt['mode'] == 'runner':
+                receipt['coldverify'] = strict_receipt(name, receipt['repo'], timeout)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as error:
+        receipt.setdefault('error', str(error) or type(error).__name__)
+    strict = receipt.get('coldverify') or {}
+    strict_count = strict.pop('tests_ran', None)
+    if receipt.get('job_name') != 'verify':
+        strict_count = None
+    if strict_count is not None:
+        receipt.update(tests_ran=strict_count, tests_source='cold-verify')
+    tests = subprocess.run(ic_exec(name, 'coldbox', 'junit', '--newer', JOB_STARTED,
+                                   *(['--archived', ARCHIVED] if archived else []),
+                                   *JUNIT_DIRS[receipt['mode']], timeout=timeout),
+                           capture_output=True, text=True)
+    if tests.returncode == 0:
+        summary = json.loads(tests.stdout)
+        if not isinstance(summary, dict):
+            raise ValueError('invalid test evidence summary')
+        cold_verify = summary.pop('cold_verify', [])
+        if strict_count is None:
+            ran, source = tests_ran(summary, cold_verify)
+            receipt['tests_source'] = source
+            if ran is not None:
+                receipt['tests_ran'] = ran
+        if summary['files']:
+            receipt['tests'] = summary
+
+
+class LogRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlparse(newurl).scheme != 'https':
+            raise urllib.error.HTTPError(newurl, code, 'refusing non-https redirect', headers, fp)
+        moved = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if moved is not None:
+            for header in list(moved.headers) + list(moved.unredirected_hdrs):
+                if header.lower() in ('authorization', 'x-github-api-version', 'accept'):
+                    moved.remove_header(header)
+        return moved
+
+
+def fetch_job_log(repo, job_id, retries=(1, 2)):
+    path = f'repos/{repo}/actions/jobs/{int(job_id)}/logs'
+    opener = urllib.request.build_opener(LogRedirect())
+    for attempt in range(len(retries) + 1):
+        token = app_token(path) or personal_login() or subprocess.run(
+            ['gh', 'auth', 'token'], env=dict(os.environ, GH_HOST='github.com'),
+            capture_output=True, text=True, check=True, timeout=60).stdout.strip()
+        request = urllib.request.Request(
+            f'https://api.github.com/{path}',
+            headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json',
+                     'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'coldbox'})
+        try:
+            with opener.open(request, timeout=30) as response:
+                return response.read(JOB_LOG_BYTES).decode('utf-8', 'replace')
+        except urllib.error.HTTPError as error:
+            code = error.code
+            error.close()
+            if attempt < len(retries) and (code == 404 or 500 <= code < 600):
+                time.sleep(retries[attempt])
+                continue
+            raise RuntimeError(f'GET {path}: HTTP {code}') from None
+
+
+def clean_job_log_lines(text):
+    lines, in_command = [], False
+    for raw in text.splitlines():
+        line = ANSI_ESCAPE.sub('', ACTIONS_TIMESTAMP.sub('', raw, count=1)).rstrip()
+        if line.startswith('##[group]Run '):
+            in_command = True
+            continue
+        if in_command:
+            if line.startswith('##[endgroup'):
+                in_command = False
+            continue
+        lines.append(line)
+    return lines
+
+
+def job_log_tests_ran(text):
+    lines = clean_job_log_lines(text)
+    found, total, index = False, 0, 0
+    while index < len(lines):
+        line = lines[index]
+        if UNITTEST_RULE.fullmatch(line) and index + 1 < len(lines) and (ran := UNITTEST_RAN.fullmatch(lines[index + 1])):
+            after = index + 2
+            while after < len(lines) and (not lines[after] or lines[after].startswith('FAIL: ')):
+                after += 1
+            if after < len(lines):
+                if lines[after] == 'NO TESTS RAN':
+                    found = True
+                    index = after + 1
+                    continue
+                if outcome := UNITTEST_RESULT.fullmatch(lines[after]):
+                    skipped = int(skip[1]) if outcome[2] and (skip := UNITTEST_SKIPPED.search(outcome[2])) else 0
+                    found = True
+                    total += max(0, int(ran[1]) - skipped)
+                    index = after + 1
+                    continue
+        if pytest := PYTEST_SUMMARY.fullmatch(line):
+            items = [(int(count), kind) for count, kind in PYTEST_ITEM.findall(pytest[1])]
+            if any(kind in PYTEST_EXECUTED or kind == 'skipped' for _, kind in items):
+                found = True
+                total += sum(count for count, kind in items if kind in PYTEST_EXECUTED)
+        elif cargo := CARGO_SUMMARY.match(line):
+            found = True
+            total += int(cargo[1]) + int(cargo[2])
+        elif GO_TEST_CASE.fullmatch(line):
+            found = True
+            total += 1
+        index += 1
+    return total if found else None
+
+
+def collect_job_log_tests(receipt):
+    if receipt.get('mode') != 'runner' or receipt.get('tests_source') is not None or receipt.get('tests_ran') != 0:
+        return
+    github = receipt.get('github') or {}
+    repo, job_id = github.get('repo') or receipt.get('repo'), github.get('job_id')
+    if not repo or '/' not in repo or type(job_id) is not int or job_id <= 0:
+        return
+    try:
+        ran = job_log_tests_ran(fetch_job_log(repo, job_id))
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        print(f"coldbox: job log tests unavailable for {receipt.get('id')}: {error}", file=sys.stderr, flush=True)
+        return
+    if ran is not None:
+        receipt.update(tests_ran=ran, tests_source='job-log')
+
+
+def strict_receipt(name, repo, timeout=120):
     folder = repo.split('/')[-1]
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', folder) or folder in ('.', '..'):
         return None
@@ -1450,7 +1889,7 @@ def strict_receipt(name, repo):
         fresh = subprocess.run(ic_exec(name, 'bash', '-c',
                                        'test -f "$3" && test "$1/$2" -nt "$3" && '
                                        'tracked=$(git -C "$1" ls-files -- "$2") && test -z "$tracked"',
-                                       'bash', checkout, report, JOB_STARTED, timeout=120), capture_output=True)
+                                       'bash', checkout, report, JOB_STARTED, timeout=timeout), capture_output=True)
         if fresh.returncode == 0:
             strict['tests_ran'] = count
     return strict
@@ -1523,7 +1962,7 @@ def post_check_run(repo, body, receipt=None, path=None, *, app_only=False):
     if path is None:
         return gh('-X', 'POST', endpoint, body=body)
     save_verification(path, receipt, state='sending', repo=repo, head=body['head_sha'], name=body['name'],
-                      tree=body['external_id'], app_id=github_app_id())
+                      tree=body['external_id'], app_id=app_credentials(endpoint)[1])
     posted = gh('-X', 'POST', endpoint, body=body, _retries=[0])
     save_verification(path, receipt, state='posted', check_id=posted['id'])
     return posted
@@ -1650,7 +2089,7 @@ def reusable_coldverify_check(repo, number, base, head, fingerprint, claim):
         return None
     tree = fingerprint['tree']
     try:
-        if github_app_id() != str(COLDVERIFY_APP):
+        if app_credentials(f'repos/{repo}')[1] != str(COLDVERIFY_APP):
             return None
         parameters = urllib.parse.urlencode(dict(check_name=COLDVERIFY_CHECK, app_id=COLDVERIFY_APP,
                                                   filter='all', per_page=100))
@@ -1778,13 +2217,17 @@ def start_coldverify(host, repo, job, run, head, tree):
                  'coldbox = runpy.run_path(sys.argv[1])\n'
                  'coldbox["stop_on_signals"]()\n'
                  'coldbox["publish_coldverify"](*json.loads(sys.argv[2]))\n')
-        previous = signal.signal(signal.SIGTERM, lambda *_: DRAINING.set())
+        on_main = threading.current_thread() is threading.main_thread()
+        previous = signal.signal(signal.SIGTERM, lambda *_: DRAINING.set()) if on_main else None
         try:
-            COLDVERIFY_CHILDREN.append(subprocess.Popen(
+            child_proc = subprocess.Popen(
                 [sys.executable, '-I', '-c', child, str(Path(__file__).resolve()), arguments],
-                stdin=subprocess.DEVNULL, start_new_session=True))
+                stdin=subprocess.DEVNULL, start_new_session=True)
+            with COLDVERIFY_LOCK:
+                COLDVERIFY_CHILDREN.append(child_proc)
         finally:
-            signal.signal(signal.SIGTERM, previous)
+            if on_main:
+                signal.signal(signal.SIGTERM, previous)
     except (OSError, ValueError, KeyError, TypeError, argparse.ArgumentTypeError, RuntimeError) as error:
         print(f'coldbox: {COLDVERIFY_CHECK} not started on {head}: {error}', file=sys.stderr, flush=True)
 
@@ -1919,6 +2362,12 @@ def settle(receipt):
     if found == 'no_tests':
         receipt['reason'] = NO_TESTS if receipt.get('tests_ran') == 0 else 'the test count could not be read'
     receipt['reason_code'] = reason_code(receipt)
+    receipt.pop('tests_missing_reason', None)
+    if receipt['verdict'] == 'incomplete' and not receipt.get('tests_ran') and not receipt.get('tests'):
+        if receipt.get('tests_ran') is None:
+            receipt['tests_missing_reason'] = 'test_count_unavailable'
+        elif not receipt.get('tests_source'):
+            receipt['tests_missing_reason'] = 'no_test_report'
 
 
 def git(path, *args):
@@ -1928,6 +2377,8 @@ def git(path, *args):
 def admit_or_wait(target, name, memory, submissions=None):
     deadline = time.monotonic() + RUN_WAIT_SECONDS
     while not admit(target, name, 'once', memory=memory, submissions=submissions, sample_cpu=True):
+        if yield_warm_job() and admit(target, name, 'once', memory=memory, submissions=submissions, sample_cpu=True):
+            return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             if submissions is not None:
@@ -2100,11 +2551,19 @@ def finish_receipt_check(path, receipt, target=None, *, coldverify=None):
 
 
 def run_local_revision(args, path, repo, sha, size, command, mode='local', **options):
-    name, (memory, config) = new_id(), sizing(args, size)
-    admit_or_wait(repo, name, memory)
+    memory, config = sizing(args, size)
+    pooled = not (config or args.offline or mode != 'local')
+    claimed = claim_warm_job(repo, 'once', args.ttl, offline=False, memory=memory) if pooled else None
+    if claimed:
+        name = claimed
+        fill_warm_pool_later()
+    else:
+        name = new_id()
+        admit_or_wait(repo, name, memory)
     return job(mode, name, args.ttl, command, repo=repo, sha=sha,
                archive=git(path, 'archive', '--format=tar', sha), offline=args.offline,
-               cwd='/home/runner/repo', receipts=args.receipts, config=config, **options)
+               cwd='/home/runner/repo', receipts=args.receipts, config=config, pooled=pooled,
+               **({'warm_claimed': True} if claimed else {}), **options)
 
 
 def shell_stopped(signum, _):
@@ -2209,9 +2668,16 @@ def run_repo(args):
         raise SystemExit('coldbox: --repo needs the network to clone; drop --offline')
     if args.name:
         stop_on_signals()
-    name, (memory, config) = args.name or new_id(), sizing(args)
+    memory, config = sizing(args)
     receipts = Path(args.receipts or STATE / 'receipts')
-    admit_or_wait(args.repo, name, memory, receipts / 'submissions' if args.name else None)
+    pooled = not (config or args.name)
+    claimed = claim_warm_job(args.repo, 'once', args.ttl, offline=False, memory=memory) if pooled else None
+    if claimed:
+        name = claimed
+        fill_warm_pool_later()
+    else:
+        name = args.name or new_id()
+        admit_or_wait(args.repo, name, memory, receipts / 'submissions' if args.name else None)
     command, extra = ['coldbox', 'checks'], {}
     profile = getattr(args, 'profile', None)
     if profile is not None:
@@ -2220,7 +2686,8 @@ def run_repo(args):
     token = repo_token(args.repo)
     receipt = job('local', name, args.ttl, command, repo=args.repo, sha=args.sha, extra=extra,
                   clone=(args.repo, args.sha, token or ''), cwd='/home/runner/repo',
-                  receipts=args.receipts, config=config, cache=direct_cache(args.repo, args.sha, token))
+                  receipts=args.receipts, config=config, cache=direct_cache(args.repo, args.sha, token),
+                  pooled=pooled, **({'warm_claimed': True} if claimed else {}))
     return exit_code(receipt)
 
 
@@ -2333,10 +2800,10 @@ def api_submit(args, receipts):
             if os.fork() == 0:
                 try:
                     os.setsid()
-                    os.dup2(log.fileno(), 1)
                     os.dup2(log.fileno(), 2)
-                    with open(os.devnull, 'rb') as devnull:
+                    with open(os.devnull, 'rb+') as devnull:
                         os.dup2(devnull.fileno(), 0)
+                        os.dup2(devnull.fileno(), 1)
                     os.execve(sys.executable, command, env)
                 except OSError as error:
                     print(f'coldbox: {type(error).__name__}: {error}', file=sys.stderr, flush=True)
@@ -2402,10 +2869,18 @@ def api_cmd(args):
 def run_adhoc(args):
     if args.path is not None:
         raise SystemExit('coldbox: give a repo PATH or -- COMMAND, not both')
-    name, (memory, config) = new_id(), sizing(args)
-    admit_or_wait('adhoc', name, memory)
+    memory, config = sizing(args)
+    pooled = not (config or args.offline)
+    claimed = claim_warm_job('adhoc', 'once', args.ttl, offline=False, memory=memory) if pooled else None
+    if claimed:
+        name = claimed
+        fill_warm_pool_later()
+    else:
+        name = new_id()
+        admit_or_wait('adhoc', name, memory)
     receipt = job('adhoc', name, args.ttl, args.command, repo='adhoc', offline=args.offline, cwd=f'/home/{RUNNER}',
-                  extra=dict(command=args.command), receipts=args.receipts, config=config)
+                  extra=dict(command=args.command), receipts=args.receipts, config=config, pooled=pooled,
+                  **({'warm_claimed': True} if claimed else {}))
     return 125 if 'error' in receipt or 'exit' not in receipt or not receipt['vm']['destroyed'] else receipt['exit']
 
 
@@ -2559,8 +3034,8 @@ def incus_config(limits):
 
 
 def adhoc_vms():
-    return {vm['name']: vm for vm in json.loads(ic('list', '--format', 'json'))
-            if vm['name'].startswith('cbx-') and (vm.get('config') or {}).get(ADHOC) == 'true'}
+    return {vm['name']: vm for vm in json.loads(ic('list', '--format', 'json')) if vm['name'].startswith('cbx-')
+            and ((vm.get('config') or {}).get(ADHOC) == 'true' or (vm.get('config') or {}).get(WARM) == 'claimed')}
 
 
 def require_listed(kind, value):
@@ -2577,6 +3052,438 @@ def require_listed(kind, value):
         query(f'/1.0/{path}?project={PROJECT}')
     except subprocess.CalledProcessError as error:
         raise SystemExit(f'coldbox: {kind} {value} is listed in {VM_ALLOW} but does not exist on this host') from error
+
+
+def warm_shapes():
+    try:
+        words = VM_WARM.read_text().split()
+    except FileNotFoundError:
+        return []
+    if len(words) > 2 or any(word not in ('online', 'offline') for word in words):
+        raise ValueError(f'{VM_WARM} must list at most two of online and offline, not {" ".join(words)!r}')
+    return words
+
+
+def warm_build():
+    """What a warm VM is started from: this CLI, the base snapshot, the coldbox profile and the guest overlay."""
+    digest = hashlib.sha256(Path(__file__).read_bytes())
+    snapshot = query(f"/1.0/instances/{BASE.replace('/', '/snapshots/', 1)}?project={PROJECT}")
+    profile = query(f'/1.0/profiles/coldbox?project={PROJECT}')
+    digest.update(json.dumps([snapshot['created_at'], profile.get('config'), profile.get('devices')],
+                             sort_keys=True).encode())
+    for top, names, files in os.walk(GUEST_FILES):
+        names.sort()
+        for entry in sorted(names + files):
+            path = os.path.join(top, entry)
+            stat = os.lstat(path)
+            digest.update(f'{path}\0{stat.st_mode}\0{stat.st_size}\0{stat.st_ino}\0{stat.st_ctime_ns}\0'.encode())
+    return digest.hexdigest()[:32]
+
+
+def claim_warm(shape, ttl):
+    """Take one ready warm VM of this shape and the current build for a vm up, or None. Under the host lock its mark
+    becomes claimed, so no other vm up takes it and no refill keeps it; it becomes the caller's ad-hoc VM only after
+    the ACL, isolation and agent checks pass and the mark is still claimed. vm down or its TTL deletes it."""
+    with host_lock():
+        try:
+            build = f'{shape}:{warm_build()}'
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+            print(f'coldbox: not using a warm VM: {error}', file=sys.stderr)
+            return None
+        ready = [vm['name'] for vm in json.loads(ic('list', '--format', 'json')) if vm['name'].startswith('cbx-')
+                 and vm['status'] == 'Running' and (vm.get('config') or {}).get(WARM) == build]
+        if not ready or past_vm_max(ready[0], live_workers(STATE / 'workers')):
+            return None
+        name = ready[0]
+        ic('config', 'set', name, f'{EXPIRES}={int(time.time() + ttl)}', f'{WARM}=claimed')
+    try:
+        sync_acl()
+        isolated(name, shape == 'offline')
+        if subprocess.run(ic_exec(name, 'true', user=None, timeout=10), capture_output=True).returncode:
+            raise RuntimeError('its agent did not answer')
+        with host_lock():
+            if ic('config', 'get', name, WARM).strip() != 'claimed':
+                raise RuntimeError('a refill retired it')
+            ic('config', 'set', name, f'{ADHOC}=true', f'{WARM}=')
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+        destroy(name)
+        print(f'coldbox: deleted warm VM {name}: {error}; starting a new one', file=sys.stderr)
+        return None
+    return name
+
+
+def yield_warm():
+    """Delete one warm VM so a vm up that needs a different VM gets its place. Returns whether one was deleted."""
+    with host_lock():
+        warm = [vm['name'] for vm in json.loads(ic('list', '--format', 'json')) if vm['name'].startswith('cbx-')
+                and (vm.get('config') or {}).get(WARM) not in (None, '', 'claimed')]
+        if warm:
+            ic('config', 'set', warm[0], f'{WARM}=retired')
+    return bool(warm) and destroy(warm[0])
+
+
+def fill_warm():
+    """Keep the warm VMs that /etc/coldbox/vm-warm lists, each from the current warm_build(), and delete every other
+    warm VM. Returns the number of failures."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(os.open(STATE / 'vm-warm.lock', os.O_RDONLY | os.O_CREAT, 0o644)) as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        failed = 0
+        try:
+            policy = fleet()
+            wanted = [] if policy and policy[0] == os.uname().nodename else warm_shapes()
+            build = warm_build() if wanted else None
+        except (RuntimeError, ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
+            print(f'coldbox: keeping no warm VMs: {error}', file=sys.stderr)
+            wanted, build, failed = [], None, 1
+        retire = []
+        with host_lock():
+            for vm in json.loads(ic('list', '--format', 'json')):
+                value = (vm.get('config') or {}).get(WARM)
+                if not value or not vm['name'].startswith('cbx-'):
+                    continue
+                shape, expires = value.partition(':')[0], (vm.get('config') or {}).get(EXPIRES, '')
+                if value == 'claimed' and expires.isdigit() and int(expires) > time.time():
+                    continue
+                if (shape in wanted and value == f'{shape}:{build}' and vm['status'] == 'Running'
+                        and expires.isdigit() and int(expires) > time.time() + 600):
+                    wanted.remove(shape)
+                else:
+                    ic('config', 'set', vm['name'], f'{WARM}=retired')
+                    retire.append(vm['name'])
+        for name in retire:
+            failed += not destroy(name)
+        for shape in wanted:
+            name = new_id()
+            if not admit('warm', name, 'warm'):
+                break
+            try:
+                boot(name, int(time.time() + WARM_BOOT), shape == 'offline', '--config', f'{WARM}=booting')
+                push_guest_files(name, mode='vm')
+                if warm_build() != build:
+                    raise RuntimeError('the warm VM build changed while it started')
+                with host_lock():
+                    if ic('config', 'get', name, WARM).strip() != 'booting':
+                        raise RuntimeError('the warm VM was retired while it started')
+                    ic('config', 'set', name, f'{EXPIRES}={int(time.time() + WARM_TTL)}', f'{WARM}={shape}:{build}')
+            except BaseException as error:
+                failed += 1
+                destroy(name)
+                if not isinstance(error, Exception):
+                    raise
+                print(f'coldbox: could not start a warm VM: {error}', file=sys.stderr)
+        return failed
+
+
+def fill_warm_later():
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if os.fork():
+        return
+    try:
+        os.setsid()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+        fill_warm()
+    finally:
+        os._exit(0)
+
+
+def warm_pool_size(path=None):
+    env_value = os.environ.get('COLDBOX_WARM_POOL_SIZE') if path is None else None
+    if env_value is not None and env_value.strip() != '':
+        text = env_value.strip()
+        if not text.isdigit():
+            raise ValueError(f'COLDBOX_WARM_POOL_SIZE must hold a whole number of VMs, not {text!r}')
+        return int(text)
+    target = WARM_POOL if path is None else Path(path)
+    try:
+        text = target.read_text().strip()
+    except FileNotFoundError:
+        return 0
+    if not text:
+        return 0
+    if text.isdigit():
+        return int(text)
+    try:
+        data = tomllib.loads(text)
+    except ValueError as error:
+        raise ValueError(f'{target} must hold a whole number or warm_pool_size = N, not {text!r}') from error
+    if list(data.keys()) != ['warm_pool_size'] or type(data['warm_pool_size']) is not int or data['warm_pool_size'] < 0:
+        raise ValueError(f'{target} must hold a whole number or warm_pool_size = N, not {text!r}')
+    return data['warm_pool_size']
+
+
+def warm_pool_on():
+    try:
+        return warm_pool_size() > 0
+    except (OSError, ValueError):
+        return False
+
+
+def pool_counters():
+    try:
+        seen = json.loads((STATE / 'warm-pool.json').read_text())
+        if isinstance(seen['since'], str) and all(isinstance(entry, dict) for entry in seen['last'].values()) \
+                and all(type(count) is int for key in ('counts', 'reaped') for count in seen[key].values()):
+            return seen
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return dict(since=None, counts={}, reaped={}, last={})
+
+
+def note_pool(event, **detail):
+    """Count one warm pool event for coldbox pool status. A count is never worth a job, so a failed write is dropped."""
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with os.fdopen(os.open(STATE / 'warm-pool.json.lock', os.O_RDONLY | os.O_CREAT, 0o644)) as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            seen = pool_counters()
+            seen['since'] = seen['since'] or now_iso()
+            seen['counts'][event] = seen['counts'].get(event, 0) + 1
+            if event == 'reaped':
+                seen['reaped'][detail['reason']] = seen['reaped'].get(detail['reason'], 0) + 1
+            seen['last'][event] = dict(at=now_iso(), **detail)
+            staged = STATE / f'.warm-pool.{os.getpid()}'
+            staged.write_text(json.dumps(seen))
+            os.replace(staged, STATE / 'warm-pool.json')
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def guest_overlay_content_digest():
+    digest = hashlib.sha256()
+    if not GUEST_FILES.is_dir():
+        digest.update(b'absent')
+        return digest.hexdigest()
+    for top, names, files in os.walk(GUEST_FILES):
+        names.sort()
+        for entry in sorted(names + files):
+            path = Path(top, entry)
+            relative = str(path.relative_to(GUEST_FILES))
+            st = path.lstat()
+            digest.update(f'{relative}\0{st.st_mode}\0'.encode())
+            if path.is_symlink():
+                digest.update(b'L' + os.fsencode(os.readlink(path)) + b'\0')
+            elif path.is_file():
+                digest.update(b'F')
+                with path.open('rb') as data:
+                    while chunk := data.read(65536):
+                        digest.update(chunk)
+                digest.update(b'\0')
+    return digest.hexdigest()
+
+
+def warm_job_stamp(*, base=BASE, offline=False):
+    digest = hashlib.sha256(Path(__file__).read_bytes())
+    snapshot = query(f"/1.0/instances/{base.replace('/', '/snapshots/', 1)}?project={PROJECT}")
+    profile = query(f'/1.0/profiles/coldbox?project={PROJECT}')
+    snap_cfg = snapshot.get('config') or {}
+    metadata = [base, 'offline' if offline else 'online', snapshot['created_at'],
+                snap_cfg.get('volatile.base_image'), snap_cfg.get('volatile.uuid'),
+                profile.get('config'), profile.get('devices'), guest_overlay_content_digest()]
+    digest.update(json.dumps(metadata, sort_keys=True).encode())
+    digest.update(HOST_CHECKS.read_bytes() if HOST_CHECKS.is_file() else b'no-checks')
+    return f"{'offline' if offline else 'online'}:{digest.hexdigest()[:32]}"
+
+
+def warm_claim_alive(value, expires):
+    if not (expires.isdigit() and int(expires) > time.time()):
+        return False
+    if value == 'claimed':
+        return True
+    parts = value.split(':')
+    if len(parts) != 3 or parts[0] != 'claimed' or not parts[1].isdigit() or not parts[2]:
+        return False
+    return process_start(int(parts[1])) == parts[2]
+
+
+def claimable(vm, stamp, now):
+    """Whether a job may take this VM now: a running standby of this stamp with over a minute left. A VM with no
+    warm pool mark is never claimable, whatever the stamp."""
+    config = vm.get('config') or {}
+    expires = config.get(EXPIRES, '')
+    return bool(stamp) and vm.get('name', '').startswith('cbx-') and vm.get('status') == 'Running' \
+        and config.get(WARM_JOB) == stamp and expires.isdigit() and int(expires) > now + 60
+
+
+def claim_warm_job(target, kind, ttl, *, offline=False, writers=None, memory=None, preferred=None):
+    """Take one ready standby of the current stamp for a job, or None. Under the host lock its mark becomes this
+    process's claim, which a refill honors only while this process lives and for WARM_CLAIM seconds, so an abandoned
+    claim is deleted soon after. The VM is the caller's once its ACL, isolation and agent pass and, under the host
+    lock again, the mark is still that claim, the deadline has not passed and the stamp is unchanged. The mark is then
+    cleared for good, so no VM is handed out twice."""
+    try:
+        if warm_pool_size() <= 0:
+            return None
+        stamp = warm_job_stamp(offline=offline)
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f'coldbox: not using warm pool: {error}', file=sys.stderr)
+        return None
+    pid = os.getpid()
+    claim_token = f'claimed:{pid}:{process_start(pid) or "0"}'
+    name = None
+    try:
+        with host_lock():
+            reserved = {worker.name for worker in live_workers(STATE / 'workers', prune=False) if worker.pid != pid}
+            now = time.time()
+            ready = [vm['name'] for vm in json.loads(ic('list', '--format', 'json'))
+                     if vm.get('name') not in reserved and claimable(vm, stamp, now)]
+            if not ready:
+                return None
+            chosen = preferred if preferred in ready else ready[0]
+            deadline = int(now + WARM_CLAIM)
+            ic('config', 'set', chosen, f'{EXPIRES}={deadline}', f'{WARM_JOB}={claim_token}')
+            name = chosen
+            note_worker(pid, target, name, kind, writers, memory)
+        sync_acl()
+        isolated(name, offline)
+        if subprocess.run(ic_exec(name, 'true', user=None, timeout=10), capture_output=True).returncode:
+            raise RuntimeError('its agent did not answer')
+        with host_lock():
+            if ic('config', 'get', name, WARM_JOB).strip() != claim_token:
+                raise RuntimeError('a refill retired it')
+            if warm_job_stamp(offline=offline) != stamp:
+                raise RuntimeError('the warm pool stamp changed during claim')
+            if time.time() >= deadline:
+                raise RuntimeError('the claim took too long')
+            ic('config', 'set', name, f'{EXPIRES}={int(time.time() + ttl)}', f'{WARM_JOB}=')
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+        if name is None:
+            print(f'coldbox: not using warm pool: {error}', file=sys.stderr)
+            return None
+        destroy(name)
+        (STATE / 'ready' / name).unlink(missing_ok=True)
+        with host_lock():
+            (STATE / 'workers' / str(pid)).unlink(missing_ok=True)
+        note_pool('reaped', vm=name, reason='unhealthy')
+        print(f'coldbox: deleted warm pool VM {name}: {error}; starting a new one', file=sys.stderr)
+        return None
+    return name
+
+
+def standby_warm_vms(workers, *, stamp=None):
+    if not WARM_POOL.exists() and not os.environ.get('COLDBOX_WARM_POOL_SIZE'):
+        return [], []
+    reserved = {worker.name for worker in workers}
+    try:
+        listed = json.loads(ic('list', '--format', 'json'))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return [], []
+    now = time.time()
+    ready, evictable = [], []
+    for vm in listed:
+        name = vm.get('name', '')
+        value = (vm.get('config') or {}).get(WARM_JOB)
+        if not name.startswith('cbx-') or name in reserved or not value or value.startswith('claimed') or value == 'retired':
+            continue
+        (ready if claimable(vm, stamp, now) else evictable).append(name)
+    return ready, evictable
+
+
+def yield_warm_job():
+    try:
+        if warm_pool_size() <= 0:
+            return False
+    except (OSError, ValueError):
+        return False
+    with host_lock():
+        reserved = {worker.name for worker in live_workers(STATE / 'workers', prune=False)}
+        warm = [vm['name'] for vm in json.loads(ic('list', '--format', 'json')) if vm['name'].startswith('cbx-')
+                and vm['name'] not in reserved and (value := (vm.get('config') or {}).get(WARM_JOB))
+                and not value.startswith('claimed') and value != 'retired']
+        if warm:
+            ic('config', 'set', warm[0], f'{WARM_JOB}=retired')
+    if not warm:
+        return False
+    gone = destroy(warm[0])
+    (STATE / 'ready' / warm[0]).unlink(missing_ok=True)
+    note_pool('reaped', vm=warm[0], reason='yielded')
+    return gone
+
+
+def fill_warm_pool(count=None):
+    STATE.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(os.open(STATE / 'warm-pool.lock', os.O_RDONLY | os.O_CREAT, 0o644)) as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        failed = 0
+        try:
+            wanted = warm_pool_size() if count is None else count
+            stamp = warm_job_stamp(offline=False) if wanted else None
+        except (RuntimeError, ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
+            print(f'coldbox: keeping no warm pool VMs: {error}', file=sys.stderr)
+            note_pool('refill_failed', error=str(error))
+            wanted, stamp, failed = 0, None, 1
+        keep, retire = 0, []
+        with host_lock():
+            for vm in json.loads(ic('list', '--format', 'json')):
+                value = (vm.get('config') or {}).get(WARM_JOB)
+                if not value or not vm['name'].startswith('cbx-'):
+                    continue
+                expires = (vm.get('config') or {}).get(EXPIRES, '')
+                if warm_claim_alive(value, expires):
+                    continue
+                fresh = vm['status'] == 'Running' and expires.isdigit() and int(expires) > time.time() + 600
+                if keep < wanted and value == stamp and fresh:
+                    keep += 1
+                    continue
+                if value == 'retired':
+                    retire.append((vm['name'], None))
+                    continue
+                ic('config', 'set', vm['name'], f'{WARM_JOB}=retired')
+                retire.append((vm['name'], 'abandoned' if value == 'booting' or value.startswith('claimed') else
+                               'stale' if stamp and value != stamp else 'expired' if not fresh else 'excess'))
+        for name, reason in retire:
+            gone = destroy(name)
+            (STATE / 'ready' / name).unlink(missing_ok=True)
+            if reason:
+                note_pool('reaped', vm=name, reason=reason)
+            failed += not gone
+        pid = os.getpid()
+        for _ in range(max(0, wanted - keep)):
+            name = new_id()
+            if not admit('warm-pool', name, 'warm-pool'):
+                break
+            try:
+                boot(name, int(time.time() + WARM_BOOT), False, '--config', f'{WARM_JOB}=booting')
+                ic('file', 'push', str(Path(__file__).resolve()), f'{name}/usr/local/bin/coldbox', '--mode', '0755')
+                push_guest_files(name, mode='warm-pool')
+                if warm_job_stamp(offline=False) != stamp:
+                    raise RuntimeError('the warm pool stamp changed while it started')
+                with host_lock():
+                    if ic('config', 'get', name, WARM_JOB).strip() != 'booting':
+                        raise RuntimeError('the warm pool VM was retired while it started')
+                    mark_ready(name)
+                    (STATE / 'workers' / str(pid)).unlink(missing_ok=True)
+                    ic('config', 'set', name, f'{EXPIRES}={int(time.time() + WARM_TTL)}', f'{WARM_JOB}={stamp}')
+            except BaseException as error:
+                failed += 1
+                destroy(name)
+                (STATE / 'ready' / name).unlink(missing_ok=True)
+                with host_lock():
+                    (STATE / 'workers' / str(pid)).unlink(missing_ok=True)
+                if not isinstance(error, Exception):
+                    raise
+                note_pool('refill_failed', error=str(error))
+                print(f'coldbox: could not start a warm pool VM: {error}', file=sys.stderr)
+        return failed
+
+
+def fill_warm_pool_later():
+    child = 'import runpy, sys; runpy.run_path(sys.argv[1])["fill_warm_pool"]()'
+    try:
+        subprocess.Popen([sys.executable, '-I', '-c', child, str(Path(__file__).resolve())],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         close_fds=True, start_new_session=True)
+    except OSError as error:
+        print(f'coldbox: could not start warm pool refill: {error}', file=sys.stderr)
 
 
 def vm_cmd(args):
@@ -2602,9 +3509,19 @@ def vm_cmd(args):
             raise SystemExit(f'coldbox: {error}') from error
         if policy and policy[0] == os.uname().nodename:
             raise SystemExit(f'coldbox: this host is the CI primary in {CI_HOSTS}; run ad-hoc VMs on another host')
+        try:
+            shapes = warm_shapes()
+        except ValueError as error:
+            print(f'coldbox: {error}', file=sys.stderr)
+            shapes = []
+        shape = 'offline' if args.offline else 'online'
+        if not options and shape in shapes and (name := claim_warm(shape, args.ttl)):
+            print(name)
+            fill_warm_later()
+            return 0
         name, refusal = new_id(), 'coldbox: the host is at its job VM ceiling; try again when a job finishes'
         try:
-            admitted = admit('vm', name, 'vm')
+            admitted = admit('vm', name, 'vm') or shapes and yield_warm() and admit('vm', name, 'vm')
         except SystemExit as limit:
             admitted, refusal = False, str(limit)
         if not admitted:
@@ -2624,7 +3541,7 @@ def vm_cmd(args):
                  *['--profile', 'coldbox'] * bool(args.image),
                  **{key: value for key, value in (('base', args.image), ('bridge', args.network), ('disk', args.disk))
                     if value})
-            push_guest_files(name, managed=args.image is None)
+            push_guest_files(name, mode='vm' if args.image is None else 'image')
             if args.image and subprocess.run(ic_exec(name, 'sudo', '-n', 'true', timeout=60),
                                              capture_output=True).returncode:
                 raise RuntimeError(f'{args.image} has no {RUNNER} user with passwordless sudo')
@@ -2633,7 +3550,7 @@ def vm_cmd(args):
             raise
         print(name)
         return 0
-    vms = adhoc_vms()
+    vms = {name: vm for name, vm in adhoc_vms().items() if not (vm.get('config') or {}).get(WARM)}
     if args.action == 'list':
         for vm in vms.values():
             left = int(vm['config'].get('user.coldbox.expires', 0)) - time.time()
@@ -2670,41 +3587,61 @@ def app_jwt(app_id, key=None):
     return (message + b'.' + encode(signed.stdout)).decode()
 
 
-def app_request(path, token, method='GET', body=None):
+def app_request(path, token, method='GET', body=None, *, complete=False):
     request = urllib.request.Request(f'https://api.github.com/{path}', method=method,
                                     data=json.dumps(body or {}).encode() if method == 'POST' else None,
                                     headers={'Authorization': f'Bearer {token}', 'User-Agent': 'coldbox',
                                              'Accept': 'application/vnd.github+json',
                                              'X-GitHub-Api-Version': '2022-11-28'})
     with urllib.request.urlopen(request, timeout=60) as response:
+        if complete and (response.status != 200 or response.headers.get('Link')):
+            raise Unsafe('incomplete GitHub policy response')
         return json.load(response)
 
 
+def app_settings(env):
+    if not env.exists():
+        return {}
+    return dict(line.strip().split('=', 1) for line in env.read_text().splitlines() if '=' in line)
+
+
 def github_app_id():
-    if app_id := os.environ.get('COLDBOX_GITHUB_APP_ID'):
-        return app_id
-    if APP_ENV.exists():
-        for line in APP_ENV.read_text().splitlines():
-            if line.strip().startswith('COLDBOX_GITHUB_APP_ID='):
-                app_id = line.strip().split('=', 1)[1]
-    return app_id
+    return os.environ.get('COLDBOX_GITHUB_APP_ID') or app_settings(APP_ENV).get('COLDBOX_GITHUB_APP_ID')
+
+
+def org_app_files(owner):
+    if not ORG_LOGIN.fullmatch(owner):
+        raise ConfigError('expected a GitHub organization login')
+    stem = f'github-app-{owner.lower()}'
+    return APP_ENV.with_name(stem + '.env'), APP_KEY.with_name(stem + '.pem')
+
+
+def app_credentials(path):
+    match = re.match(r'(?:repos|orgs|users)/([^/?]+)', path)
+    owner = match[1].casefold() if match else ''
+    if ORG_LOGIN.fullmatch(owner):
+        env, key = org_app_files(owner)
+        if env.exists() or key.exists() or env.is_symlink() or key.is_symlink():
+            app_id = app_settings(env).get('COLDBOX_GITHUB_APP_ID')
+            if not app_id or not key.is_file() or env.is_symlink() or key.is_symlink():
+                raise RuntimeError('GitHub App: incomplete organization credentials')
+            return owner, app_id, key
+    return owner, github_app_id(), APP_KEY
 
 
 def app_token(path='', scope=None):
     try:
-        app_id = github_app_id()
-        if not app_id or not APP_KEY.exists():
+        owner, app_id, key = app_credentials(path)
+        if not app_id or not key.exists():
             return None
         if not app_id.isdecimal():
             raise RuntimeError('GitHub App: COLDBOX_GITHUB_APP_ID must be numeric')
-        match = re.match(r'(?:repos|orgs|users)/([^/?]+)', path)
-        owner = match[1].casefold() if match else ''
         with APP_LOCK:
             cache_key = (app_id, owner, json.dumps(scope))
             cached = APP_TOKENS.get(cache_key)
             if cached and time.time() < cached[1] - 300:
                 return cached[0]
-            jwt = app_jwt(app_id)
+            jwt = app_jwt(app_id, key)
             installations, page = [], 1
             while True:
                 batch = app_request(f'app/installations?per_page=100&page={page}', jwt)
@@ -2716,6 +3653,8 @@ def app_token(path='', scope=None):
             if not matches or owner and len(matches) != 1:
                 raise RuntimeError('GitHub App: no unique installation for the target owner')
             token = app_request(f"app/installations/{matches[0]['id']}/access_tokens", jwt, 'POST', scope)
+            if scope and scope.get('permissions', {}).get('members') and token.get('permissions', {}).get('members') != 'read':
+                raise RuntimeError('GitHub App: token does not confirm organization Members: read')
             expires = datetime.fromisoformat(token['expires_at'].replace('Z', '+00:00')).timestamp()
             if not isinstance(token['token'], str) or not token['token'] or expires <= time.time() + 300:
                 raise RuntimeError('GitHub App: invalid or expired installation token')
@@ -2750,15 +3689,25 @@ ORG_APP_PERMISSIONS = dict(APP_PERMISSIONS, organization_self_hosted_runners='wr
 
 
 def setup_app(args):
+    member = getattr(args, 'sole_member', None)
+    key_path, env_path = APP_KEY, APP_ENV
+    wanted = ORG_APP_PERMISSIONS if args.org else APP_PERMISSIONS
+    if member is not None:
+        if not args.org or not ORG_LOGIN.fullmatch(member):
+            raise ConfigError('setup-app: --sole-member requires --org and a GitHub login')
+        env_path, key_path = org_app_files(args.org)
+        wanted = dict(APP_PERMISSIONS, members='read')
     if args.app_id is None and args.key is None:
-        query = urllib.parse.urlencode(dict(name=f'coldbox-{os.uname().nodename}', url='https://github.com/TayHCode/coldbox',
+        query = urllib.parse.urlencode(dict(name=f'coldbox-{args.org if member else os.uname().nodename}',
+                                            url=f'https://github.com/{args.org}' if member else 'https://github.com/TayHCode/coldbox',
                                             public='false', webhook_active='false',
-                                            **(ORG_APP_PERMISSIONS if args.org else APP_PERMISSIONS)))
+                                            **wanted))
         owner = f'organizations/{urllib.parse.quote(args.org)}/settings' if args.org else 'settings'
         print(f'1. Open https://github.com/{owner}/apps/new?{query}')
         print('   The form is filled in with only the permissions Coldbox needs. Click "Create GitHub App".')
         print('2. Note the App ID, then click "Generate a private key" and copy the .pem file to this host.')
-        print(f"3. sudo coldbox setup-app{f' --org {args.org}' if args.org else ''} --app-id <App ID> --key <path to .pem>")
+        print(f"3. sudo coldbox setup-app{f' --org {args.org}' if args.org else ''}"
+              f"{' --sole-member ' + member if member else ''} --app-id <App ID> --key <path to .pem>")
         return 0
     if args.app_id is None or args.key is None:
         raise ConfigError('setup-app: give both --app-id and --key, or neither to print the setup steps')
@@ -2766,9 +3715,24 @@ def setup_app(args):
         raise ConfigError('setup-app: --app-id must be the numeric App ID')
     if os.geteuid() != 0:
         raise SystemExit('coldbox setup-app: run with sudo')
-    if APP_KEY.exists() or APP_ENV.exists():
-        raise ConfigError(f'setup-app: GitHub App auth is already configured; remove {APP_KEY} and {APP_ENV} to replace it')
+    for path in (key_path, env_path):
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ConfigError(f'setup-app: expected a regular file at {path}')
+    has_key, has_env = key_path.exists(), env_path.exists()
+    if has_key and has_env:
+        raise ConfigError(f'setup-app: GitHub App auth is already configured; remove {key_path} and {env_path} to replace it')
     key = Path(args.key)
+    owner = pwd.getpwnam(os.environ.get('SUDO_USER') or 'root')
+    app_env = f'COLDBOX_GITHUB_APP_ID={args.app_id}\n'
+    if member:
+        app_env += f'COLDBOX_SOLE_MEMBER={member}\n'
+    if has_key or has_env:
+        present, missing_path = (key_path, env_path) if has_key else (env_path, key_path)
+        diagnosis = f'setup-app: partial setup: found {present}, missing {missing_path}'
+        print(diagnosis)
+        if has_env and env_path.read_bytes() != app_env.encode():
+            setting = 'App ID or sole member' if member else 'App ID'
+            raise ConfigError(f'{diagnosis}; a different {setting} is already configured; inspect {env_path}')
     try:
         app = app_request('app', app_jwt(args.app_id, key))
     except urllib.error.HTTPError as error:
@@ -2776,7 +3740,9 @@ def setup_app(args):
     except (urllib.error.URLError, TimeoutError, ConnectionError):
         raise RuntimeError('setup-app: could not reach api.github.com') from None
     granted = app.get('permissions', {})
-    wanted = ORG_APP_PERMISSIONS if args.org else APP_PERMISSIONS
+    if member and (app.get('owner', {}).get('type') != 'Organization'
+                   or app['owner'].get('login', '').casefold() != args.org.casefold()):
+        raise ConfigError('setup-app: App owner does not match the organization')
     extra = sorted(f'{name}:{level}' for name, level in granted.items()
                    if level not in {'read': ('read',), 'write': ('read', 'write')}.get(wanted.get(name), ()))
     missing = sorted(f'{name}:{level}' for name, level in wanted.items()
@@ -2785,21 +3751,32 @@ def setup_app(args):
         raise ConfigError('setup-app: change the App\'s permissions in its settings and run this again: '
                           + '; '.join(f"{label} {', '.join(items)}" for label, items in
                                       (('remove', extra), ('add', missing)) if items))
-    owner = pwd.getpwnam(os.environ.get('SUDO_USER') or 'root')
-    APP_KEY.parent.mkdir(parents=True, exist_ok=True)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
     pem = key.read_bytes()
-    descriptor = os.open(APP_KEY, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(descriptor, 'wb') as out:
-            out.write(pem)
-        os.chown(APP_KEY, owner.pw_uid, owner.pw_gid)
-        APP_ENV.write_text(f'COLDBOX_GITHUB_APP_ID={args.app_id}\n')
-        APP_ENV.chmod(0o644)
-    except BaseException:
-        APP_KEY.unlink(missing_ok=True)
-        APP_ENV.unlink(missing_ok=True)
-        raise
-    print(f"GitHub App {app['slug']} configured: {APP_KEY} (mode 600, owner {owner.pw_name}) and {APP_ENV}")
+    if has_key:
+        with key_path.open('rb') as installed:
+            st = os.fstat(installed.fileno())
+            if (st.st_mode & 0o7777 != 0o600 or st.st_uid not in (0, owner.pw_uid) or
+                    st.st_nlink != 1 or installed.read() != pem):
+                raise ConfigError(f'{diagnosis}; check the existing key, its owner and mode 600 before retrying')
+            if st.st_uid != owner.pw_uid:
+                os.chown(installed.fileno(), owner.pw_uid, owner.pw_gid)
+    else:
+        descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, 'wb') as out:
+                os.chown(out.fileno(), owner.pw_uid, owner.pw_gid)
+                out.write(pem)
+        except BaseException:
+            key_path.unlink()
+            raise
+    if not has_env:
+        with tempfile.NamedTemporaryFile(dir=env_path.parent, mode='w') as out:
+            out.write(app_env)
+            out.flush()
+            os.fchmod(out.fileno(), 0o644)
+            os.link(out.name, env_path)
+    print(f"GitHub App {app['slug']} configured: {key_path} (mode 600, owner {owner.pw_name}) and {env_path}")
     print(f"Next: install it on the repos to register at https://github.com/apps/{app['slug']}/installations/new")
     return 0
 
@@ -2915,10 +3892,51 @@ def guard(target, allow_public):
         raise SystemExit(f'coldbox: refusing: {error}') from None
 
 
+class OrgPublicWriters(list):
+    pass
+
+
+def sole_org_member(target):
+    org, repo = target.split('/')
+    expected = app_settings(org_app_files(org)[0]).get('COLDBOX_SOLE_MEMBER')
+    if not expected:
+        raise Unsafe(f'{target} is owned by an organization without a configured sole member')
+    token = app_token(f'repos/{target}', dict(repositories=[repo], permissions=dict(members='read', metadata='read')))
+    if not token:
+        raise Unsafe('organization membership requires an installation token with Members: read')
+    query = """query($org: String!) { organization(login: $org) {
+        membersWithRole(first: 2) { totalCount pageInfo { hasNextPage } nodes { login } }
+    } }"""
+    response = app_request('graphql', token, 'POST', dict(query=query, variables=dict(org=org)), complete=True)
+    members = response['data']['organization']['membersWithRole']
+    if (response.get('errors') or type(members['totalCount']) is not int or members['totalCount'] != 1
+            or members['pageInfo']['hasNextPage'] is not False
+            or len(members['nodes']) != 1 or members['nodes'][0]['login'].casefold() != expected.casefold()):
+        raise Unsafe(f'{org} must have exactly the configured member')
+    if app_request(f'repos/{target}/collaborators?affiliation=outside&per_page=1', token, complete=True) != []:
+        raise Unsafe(f'{target} must have no outside collaborators')
+    return expected
+
+
 def public_writers(get, target, repo):
-    if (repo.get('owner') or {}).get('type') != 'User':
-        raise Unsafe(f'{target} is owned by an organization, whose members can skip GitHub\'s approval of '
-                         'outside pull requests; --allow-public serves only repos owned by a user account')
+    owner_type = (repo.get('owner') or {}).get('type')
+    if owner_type == 'User':
+        return repo_writers(get, target)
+    if owner_type != 'Organization' or repo.get('visibility') != 'public':
+        raise Unsafe(f'{target} has an unsupported owner or visibility')
+    try:
+        expected = sole_org_member(target)
+        writers = repo_writers(get, target)
+        if len(writers) != 1 or writers[0].casefold() != expected.casefold():
+            raise Unsafe(f'{target} must have only the configured member as a writer')
+        return OrgPublicWriters(writers)
+    except Unsafe:
+        raise
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError, IndexError, AttributeError, subprocess.SubprocessError):
+        raise Unsafe(f'could not verify the public organization policy for {target}') from None
+
+
+def repo_writers(get, target):
     policy = get(f'repos/{target}/actions/permissions/fork-pr-contributor-approval').get('approval_policy')
     if policy != APPROVAL:
         raise Unsafe(f'{target} runs some outside pull requests without approval (approval_policy {policy}). '
@@ -2933,13 +3951,30 @@ def public_writers(get, target, repo):
         page += 1
 
 
+def runner_state(log_path):
+    try:
+        receipt = json.loads(log_path.with_suffix('.json').read_text())
+        if isinstance(receipt, dict) and 'job_result' in receipt:
+            return receipt.get('job_name'), receipt['job_result']
+    except (OSError, ValueError):
+        pass
+    with log_path.open('rb') as file:
+        assigned = result = None
+        for line in iter(lambda: file.readline(CONSOLE_CHUNK), b''):
+            if b'Running job: ' in line:
+                assigned = running_job(line) or assigned
+            if b' completed with result: ' in line:
+                result = job_outcome(line)[1] or result
+    return assigned, result
+
+
 def stop_once(*_):
     if not DRAINING.is_set() and ACTIVE_LOG is not None:
         try:
-            log = ACTIVE_LOG.read_bytes()
+            assigned, result = runner_state(ACTIVE_LOG)
         except OSError:
-            log = b''
-        if running_job(log) and job_outcome(log) == (None, None):
+            assigned = result = None
+        if assigned and not result:
             DRAINING.set()
             return
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -3020,9 +4055,12 @@ def idle_released(*_):
 
 
 def wait_for_coldverify():
-    while COLDVERIFY_CHILDREN:
-        COLDVERIFY_CHILDREN[-1].wait()
-        COLDVERIFY_CHILDREN.pop()
+    while True:
+        with COLDVERIFY_LOCK:
+            if not COLDVERIFY_CHILDREN:
+                return
+            child = COLDVERIFY_CHILDREN.pop()
+        child.wait()
 
 
 def serve(args):
@@ -3035,9 +4073,20 @@ def serve(args):
     try:
         return serve_worker(args, primary)
     finally:
-        if COLDVERIFY_CHILDREN:
+        with COLDVERIFY_LOCK:
+            has_coldverify = bool(COLDVERIFY_CHILDREN)
+        if has_coldverify or TEARDOWN_REAPER is not None:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            wait_for_teardowns(close=True)
             wait_for_coldverify()
+
+
+def org_job_recheck(args, writers):
+    try:
+        current = public_rules(GitHub(), args)
+        return isinstance(current, OrgPublicWriters) and current == writers
+    except (ValueError, KeyError, TypeError, AttributeError, RuntimeError, OSError, subprocess.SubprocessError):
+        return False
 
 
 def serve_worker(args, primary):
@@ -3046,21 +4095,35 @@ def serve_worker(args, primary):
     memory, limits = vm_shape(args.size)
     labels = runner_labels(args.size)
     while True:
-        COLDVERIFY_CHILDREN[:] = [child for child in COLDVERIFY_CHILDREN if child.poll() is None]
+        with COLDVERIFY_LOCK:
+            COLDVERIFY_CHILDREN[:] = [child for child in COLDVERIFY_CHILDREN if child.poll() is None]
         writers = guard(args.target, args.allow_public)
-        name = args.name or new_id()
         kind = 'burst' if args.idle else 'once' if args.once else 'base'
-        if not admit(args.target, name, kind, writers, memory):
-            if args.once:
-                raise SystemExit('coldbox: the host is at its job VM ceiling; not starting another')
-            print('coldbox: the host is at its job VM ceiling; waiting', file=sys.stderr, flush=True)
-            time.sleep(30)
-            continue
-        if not args.once and compile(Path(__file__).read_bytes(), __file__, 'exec') != LOADED_CODE:
+        reload_pending = not args.once and compile(Path(__file__).read_bytes(), __file__, 'exec') != LOADED_CODE
+        pooled = not (reload_pending or limits)
+        claimed = claim_warm_job(args.target, kind, args.ttl, offline=False, writers=writers, memory=memory,
+                                 preferred=args.name) if pooled else None
+        if claimed:
+            name = claimed
+            fill_warm_pool_later()
+        else:
+            name = args.name or new_id()
+            if args.name and (getattr(args, 'standby', False) or (
+                    (WARM_POOL.exists() or os.environ.get('COLDBOX_WARM_POOL_SIZE')) and args.name in host_vms())):
+                name = new_id()
+            if not admit(args.target, name, kind, writers, memory) and not (
+                    yield_warm_job() and admit(args.target, name, kind, writers, memory)):
+                if args.once:
+                    raise SystemExit('coldbox: the host is at its job VM ceiling; not starting another')
+                print('coldbox: the host is at its job VM ceiling; waiting', file=sys.stderr, flush=True)
+                time.sleep(30)
+                continue
+        if reload_pending or (not args.once and compile(Path(__file__).read_bytes(), __file__, 'exec') != LOADED_CODE):
             extra = (['--idle', str(args.idle)] if args.idle else []) + (['--name', args.name] if args.name else []) + \
                 (['--size', args.size] if args.size != 'default' else [])
             with host_lock():
                 (STATE / 'workers' / str(os.getpid())).unlink(missing_ok=True)
+            wait_for_teardowns(close=True)
             wait_for_coldverify()
             os.execv(sys.executable, worker_argv(args, *extra))
         admission = runner_admission(args.target, name, time.time() + args.ttl)
@@ -3079,6 +4142,13 @@ def serve_worker(args, primary):
         stop_watch = threading.Event()
         watcher = threading.Thread(target=watch_guest, daemon=True,
                                    args=(args.target, runner['runner']['id'], guest_fingerprint(), stop_watch))
+        reaper = None if args.once else get_teardown_reaper()
+        job_extra = dict(pooled=pooled)
+        if reaper is not None:
+            job_extra.update(teardown=reaper,
+                             on_teardown=lambda done, target=args.target, vm_name=name: publish_verify(target, vm_name, done))
+        if claimed:
+            job_extra['warm_claimed'] = True
         try:
             if idle:
                 idle.daemon = True
@@ -3089,7 +4159,9 @@ def serve_worker(args, primary):
                           env=env + ([f"COLDBOX_PUBLIC_WRITERS={','.join(writers)}"] if writers is not None else []),
                           extra=dict(runner_id=runner['runner']['id'], admission=admission),
                           on_ready=lambda: [idle.start() if idle else None, watcher.start()],
-                          config=incus_config(limits), cache=cache_folder(args.target, args.allow_public))
+                          config=incus_config(limits), cache=cache_folder(args.target, args.allow_public),
+                          recheck_org=(lambda: org_job_recheck(args, writers)) if isinstance(writers, OrgPublicWriters) else None,
+                          **job_extra)
         finally:
             with RELEASING:
                 stop_watch.set()
@@ -3099,12 +4171,15 @@ def serve_worker(args, primary):
                 gh('-X', 'DELETE', f"{scope(args.target)}/actions/runners/{runner['runner']['id']}")
             except RuntimeError:
                 pass
-        publish_verify(args.target, name, receipt)
+        async_teardown = (receipt.get('vm') or {}).get('teardown') == 'async'
+        if not async_teardown:
+            publish_verify(args.target, name, receipt)
         if DRAINING.is_set():
+            wait_for_teardowns(close=True)
             return 143
         if args.once:
             return exit_code(receipt)
-        if receipt['vm']['destroyed']:
+        if (receipt.get('vm') or {}).get('destroyed') or async_teardown:
             with host_lock():
                 (STATE / 'workers' / str(os.getpid())).unlink(missing_ok=True)
         if 'job_seconds' not in receipt and receipt.get('error') != IDLE_RELEASED:
@@ -3543,15 +4618,15 @@ def live_workers(folder, prune=True):
 
 
 def note_worker(pid, target, name, kind, writers=None, memory=None):
-    folder = STATE / 'workers'
-    folder.mkdir(parents=True, exist_ok=True)
+    folder = state_folder('workers')
     staged = folder / f'.{pid}.{os.getpid()}'
     staged.write_text(json.dumps([target, process_start(pid), name, kind, writers] + ([memory] if memory else [])))
     os.replace(staged, folder / str(pid))
 
 
 def orphan(vm, live):
-    return vm['name'] not in live and (vm.get('config') or {}).get(ADHOC) != 'true'
+    config = vm.get('config') or {}
+    return vm['name'] not in live and config.get(ADHOC) != 'true' and not config.get(WARM) and not config.get(WARM_JOB)
 
 
 def past_ttl(receipt, now):
@@ -3588,7 +4663,7 @@ def waiting(worker):
     if worker.kind != 'base':
         return False
     try:
-        return not running_job((STATE / 'receipts' / f'{worker.name}.log').read_bytes())
+        return not runner_state(STATE / 'receipts' / f'{worker.name}.log')[0]
     except FileNotFoundError:
         return True
 
@@ -3608,13 +4683,14 @@ def vm_bytes(worker, memory):
 
 
 def additional_vm_memory(workers, memory, vms=None, retiring=None):
+    retiring_set = {retiring} if isinstance(retiring, str) else set(retiring or ())
     sizes = {worker.name: vm_bytes(worker, memory) for worker in workers}
     owned = (host_vms() if vms is None else vms) | set(sizes)
     committed = 0
     for vm in query('/1.0/instances?recursion=1&all-projects=true'):
         if vm['type'] != 'virtual-machine' or vm['status'] != 'Running':
             continue
-        if vm['project'] == PROJECT and vm['name'] == retiring:
+        if vm['project'] == PROJECT and vm['name'] in retiring_set:
             continue
         counted = sizes.get(vm['name'], memory) if vm['project'] == PROJECT and vm['name'] in owned else 0
         limit = (vm.get('expanded_config') or {}).get('limits.memory') or (vm.get('config') or {}).get('limits.memory')
@@ -3641,9 +4717,10 @@ def capacity_used(workers):
 def host_room(workers, memory, need, load, reserve, vms=None, retiring=None):
     """Room for job VMs of need bytes beside workers and every Coldbox VM on this host, by each admission check."""
     host, vms = host_memory(), host_vms() if vms is None else vms
-    if retiring is not None:
-        vms = vms - {retiring}
-        workers = [worker for worker in workers if worker.name != retiring]
+    retiring_set = {retiring} if isinstance(retiring, str) else set(retiring or ())
+    if retiring_set:
+        vms = vms - retiring_set
+        workers = [worker for worker in workers if worker.name not in retiring_set]
     untracked = vms - {worker.name for worker in workers}
     extra = additional_vm_memory(workers, memory, vms, retiring)
     committed = sum(vm_bytes(worker, memory) for worker in workers) + len(untracked) * memory + extra
@@ -3690,12 +4767,9 @@ def admit(target, name, kind, writers=None, memory=None, submissions=None, *, sa
             return True
         workers = [worker for worker in workers if worker.pid != me.pid]
         memory = vm_memory()
-        if kind == 'vm' and VM_MAX.exists():
-            cap = host_setting(VM_MAX, 'VMs')
-            if len({name} | {worker.name for worker in workers if worker.kind == 'vm'} | set(adhoc_vms())) > cap:
-                raise SystemExit(f'coldbox: {cap} ad-hoc VM(s) already running, the limit in {VM_MAX}; '
-                                 'coldbox vm down one first')
-        ci = kind != 'vm'
+        if kind == 'vm' and (refusal := past_vm_max(name, workers)):
+            raise SystemExit(refusal)
+        ci = kind not in ('vm', 'warm')
         cpu_load = host_cpu_load() if sample_cpu else 0
         load = max(cpu_load, os.getloadavg()[0]) if ci else 0
         room = host_room(workers, memory, vm_bytes(me, memory), load, host_setting(RESERVE, 'CPU threads') if ci else 0)
@@ -3713,6 +4787,15 @@ def admit(target, name, kind, writers=None, memory=None, submissions=None, *, sa
         if queued:
             write_json(submissions / 'queue.json', queue[1:])
         return True
+
+
+def past_vm_max(name, workers):
+    if not VM_MAX.exists():
+        return None
+    cap = host_setting(VM_MAX, 'VMs')
+    if len({name} | {worker.name for worker in workers if worker.kind == 'vm'} | set(adhoc_vms())) > cap:
+        return f'coldbox: {cap} ad-hoc VM(s) already running, the limit in {VM_MAX}; coldbox vm down one first'
+    return None
 
 
 def host_lock():
@@ -3802,6 +4885,9 @@ def autoscale(github, args, bursts):
               file=sys.stderr, flush=True)
     idle = collections.Counter()
     if seen:
+        for burst in bursts:
+            if (record := worker_record(folder / str(burst.pid))) is not None:
+                burst.name = record[2]
         runners = listing(github, f'repos/{args.target}/actions/runners?', 'runners')
         idle = free_runners(runners, bursts, time.time())
     github.forget_unused()
@@ -3812,6 +4898,10 @@ def autoscale(github, args, bursts):
         first_spawn = len(bursts)
         size_memory, _ = vm_shape(size)
         reclaimed = None
+        pool_stamp = None
+        if size == 'default' and warm_pool_on():
+            with contextlib.suppress(OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError):
+                pool_stamp = warm_job_stamp(offline=False)
         with host_lock() as lock:
             workers, memory = live_workers(folder), vm_memory()
             need = size_memory or memory
@@ -3820,6 +4910,36 @@ def autoscale(github, args, bursts):
             load = max(cpu_load, raw_load) + booting
             room = host_room(workers, memory, need, load, reserve)
             stopping = STOPPING.is_set()
+            claimable_standbys = []
+            if not stopping and (burst_count(extra, room) < extra or size == 'default'):
+                ready_standbys, evictable = standby_warm_vms(workers, stamp=pool_stamp)
+                if ready_standbys:
+                    candidate = ready_standbys[:extra]
+                    with_standbys = host_room(workers, memory, need, load, reserve, retiring=candidate)
+                    usable = min(len(candidate), burst_count(extra, with_standbys))
+                    claimable_standbys = candidate[:usable]
+                    if claimable_standbys:
+                        room = host_room(workers, memory, need, load, reserve, retiring=claimable_standbys)
+                if burst_count(extra, room) < extra and evictable:
+                    per_job = max(1, math.ceil(need / memory))
+                    evict_names = evictable[:(extra - burst_count(extra, room)) * per_job]
+                    for standby_name in evict_names:
+                        ic('config', 'set', standby_name, f'{WARM_JOB}=retired')
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    for standby_name in evict_names:
+                        destroy(standby_name)
+                        (STATE / 'ready' / standby_name).unlink(missing_ok=True)
+                        note_pool('reaped', vm=standby_name, reason='yielded')
+                    raw_load, cpu_load = os.getloadavg()[0], host_cpu_load()
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    workers = live_workers(folder)
+                    reserved_now = {worker.name for worker in workers}
+                    claimable_standbys = [name for name in claimable_standbys if name not in reserved_now]
+                    booting = sum(worker.kind == 'burst' and starting(worker.name, time.time()) for worker in workers)
+                    (vms, warm) = host_load(workers)
+                    load = max(cpu_load, raw_load) + booting
+                    room = host_room(workers, memory, need, load, reserve, retiring=claimable_standbys)
+                    stopping = STOPPING.is_set()
             if (not stopping and not reclaim_attempted and warm and room['ceiling'] == 0
                     and room['memory'] > 0 and room['load'] > 0 and ramp_room(1, vms) and storage_room(workers)[0]):
                 reclaim_attempted = True
@@ -3836,21 +4956,23 @@ def autoscale(github, args, bursts):
                     booting = sum(worker.kind == 'burst' and starting(worker.name, time.time()) for worker in workers)
                     (vms, warm) = host_load(workers)
                     load = max(cpu_load, raw_load) + booting
-                    room = host_room(workers, memory, need, load, reserve)
+                    room = host_room(workers, memory, need, load, reserve, retiring=claimable_standbys)
                     stopping = STOPPING.is_set()
             add = 0 if stopping else burst_count(extra, room)
             refusal = None
-            if add:
+            reuse = min(add, len(claimable_standbys))
+            if add - reuse:
                 disks, refusal = storage_room(workers)
                 if refusal:
                     print(refusal, file=sys.stderr, flush=True)
-                add = min(add, disks)
+                add = reuse + min(add - reuse, disks)
             uncapped = add
-            add = ramp_room(add, vms)
-            for _ in range(add):
-                name = new_id()
+            add = ramp_room(add, max(0, vms - reuse))
+            for index in range(add):
+                name = claimable_standbys[index] if index < len(claimable_standbys) else new_id()
                 burst = subprocess.Popen(worker_argv(args, '--once', '--idle', str(BURST_IDLE_SECONDS), '--name',
-                                                     name, *(['--size', size] if size != 'default' else [])))
+                                                     name, *['--standby'] * (index < len(claimable_standbys)),
+                                                     *(['--size', size] if size != 'default' else [])))
                 burst.name, burst.size = name, size
                 note_worker(burst.pid, args.target, name, 'burst', None, size_memory)
                 bursts.append(burst)
@@ -4090,7 +5212,8 @@ def register_locked(args):
 
 
 def unregister(args):
-    if not (github_app_id() and APP_KEY.exists()):
+    _, app_id, key = app_credentials(scope(args.target))
+    if not (app_id and key.exists()):
         personal_login()
     unit = f'coldbox-runner@{instance(args.target)}.service'
     subprocess.run(['sudo', 'systemctl', 'disable', '--now', unit], check=False)
@@ -4125,7 +5248,7 @@ def reap(args):
         failed += 1
         print(f'coldbox reap: FAILED to mark Incus objects {MANAGED}=true {EXPIRES}=never: {error}', file=sys.stderr)
     with host_lock():
-        live = {worker.name for worker in live_workers(STATE / 'workers')}
+        live = {worker.name for worker in live_workers(STATE / 'workers')} | tearing_down()
         unreadable = unreadable_live_workers(STATE / 'workers')
         listed = json.loads(ic('list', '--format', 'json'))
         vms = [vm for vm in listed if vm['name'].startswith('cbx-')]
@@ -4133,6 +5256,8 @@ def reap(args):
         print(f"coldbox reap: kept worker-less VMs: cannot read the records of live worker(s) {', '.join(unreadable)}",
               file=sys.stderr)
     for vm in vms:
+        if (vm.get('config') or {}).get(WARM) or (vm.get('config') or {}).get(WARM_JOB):
+            continue
         if orphan(vm, live) and not unreadable:
             gone = destroy(vm['name'])
             failed += not gone
@@ -4174,7 +5299,11 @@ def reap(args):
         fcntl.flock(lock, fcntl.LOCK_EX)
         with host_lock():
             workers = STATE / 'workers'
-            live, present = {worker.name for worker in live_workers(workers)}, host_vms()
+            live = {worker.name for worker in live_workers(workers)} | tearing_down()
+            present = host_vms()
+            for marker in (STATE / 'ready').glob('cbx-*'):
+                if marker.name not in live | present:
+                    marker.unlink(missing_ok=True)
             candidates = [] if unreadable_live_workers(workers) else list(unreconciled(live | present, checks=True))
             reap_evidence(live | present | {receipt['id'] for _, receipt in candidates}, args.keep_days)
         for path, receipt in candidates:
@@ -4189,6 +5318,19 @@ def reap(args):
                 print(f"coldbox reap: finalized {receipt['id']} receipt as {receipt['verdict']}: VM gone, no live worker")
             if receipt['verification']['state'] in ('pending', 'sending'):
                 finish_receipt_check(path, receipt)
+    try:
+        if VM_WARM.exists() or any((vm.get('config') or {}).get(WARM) for vm in vms):
+            failed += fill_warm()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        failed += 1
+        print(f'coldbox reap: FAILED to refill warm VMs: {error}', file=sys.stderr)
+    try:
+        if WARM_POOL.exists() or os.environ.get('COLDBOX_WARM_POOL_SIZE') \
+                or any((vm.get('config') or {}).get(WARM_JOB) for vm in vms):
+            failed += fill_warm_pool()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        failed += 1
+        print(f'coldbox reap: FAILED to refill warm pool: {error}', file=sys.stderr)
     return int(bool(failed))
 
 
@@ -4716,20 +5858,76 @@ def pack_guest_files():
     raise RuntimeError(f'{GUEST_FILES} changed while it was packed, twice')
 
 
-def push_guest_files(name, *, managed=False):
+OVERLAY_STAMP = 'user.coldbox.guest-files'
+OVERLAY_STAT = r'''import hashlib, os, stat, sys
+os.chdir(sys.argv[1])
+if not stat.S_ISREG(os.lstat(sys.argv[2]).st_mode):
+    sys.exit(1)
+digest = hashlib.sha256()
+for path in sys.stdin.buffer.read().split(b'\0'):
+    entry = os.lstat(path)
+    identity = (entry.st_dev, entry.st_ino, entry.st_mode, entry.st_uid, entry.st_gid)
+    if not stat.S_ISDIR(entry.st_mode):
+        identity += (entry.st_size, entry.st_mtime_ns, entry.st_ctime_ns)
+    digest.update(repr(identity).encode())
+print(digest.hexdigest())
+'''
+
+
+def guest_files_paths():
+    root = os.fsencode(GUEST_FILES)
+    paths = [b'.']
+    for top, names, files in os.walk(root):
+        names.sort()
+        paths += [os.path.join(top, entry)[len(root) + 1:] for entry in sorted(names + files)]
+    return paths
+
+
+def overlay_state(name, link):
+    paths = [*guest_files_paths(), os.fsencode(OVERLAY_DIRS_RECORD), *([os.fsencode(link)] if link else [])]
+    result = subprocess.run(ic_exec(name, '/usr/bin/python3', '-I', '-B', '-S', '-c', OVERLAY_STAT, '/',
+                                     OVERLAY_DIRS_RECORD, user=None), input=b'\0'.join(paths), capture_output=True)
+    if not result.returncode and re.fullmatch(rb'[0-9a-f]{64}\n', result.stdout):
+        return result.stdout.decode().strip()
+
+
+def push_guest_files(name, *, mode='image', strict_stamp=False):
     if not GUEST_FILES.is_dir():
+        if strict_stamp:
+            try:
+                stamp = query(f'/1.0/instances/{name}?project={PROJECT}', timeout=10)['config'].get(OVERLAY_STAMP)
+            except UNREADABLE as error:
+                raise WarmOverlayMismatch(f'could not verify warm VM overlay stamp: {error}') from error
+            if stamp:
+                raise WarmOverlayMismatch('guest overlay was removed after warm VM preparation')
         return
     dirs, archive = pack_guest_files()
-    if managed:
+    tool, link = 'opt/coldverify/coldverify', 'usr/local/bin/coldverify'
+    make_link = os.path.lexists(GUEST_FILES / tool) and not os.path.lexists(GUEST_FILES / link)
+    if mode != 'image':
+        source = hashlib.sha256(dirs + hashlib.sha256(archive).digest() + bytes([make_link])).hexdigest()
+    if mode not in ('image', 'build-base'):
+        try:
+            stamp = query(f'/1.0/instances/{name}?project={PROJECT}', timeout=10)['config'][OVERLAY_STAMP]
+        except UNREADABLE:
+            stamp = ''
+        if isinstance(stamp, str) and stamp.startswith(source + ':'):
+            guest = overlay_state(name, link if make_link else None)
+            if guest and stamp == f'{source}:{guest}':
+                return
+        if strict_stamp:
+            raise WarmOverlayMismatch('guest overlay changed after warm VM preparation')
+    if mode in ('runner', 'vm', 'warm-pool'):
         handler = ('/usr/bin/python3', '-I', '-B', '-S', '-c', MANAGED_OVERLAY_DIRS)
     else:
         handler = ('sh', '-c', GUEST_OVERLAY_DIRS, 'sh')
     subprocess.run(ic_exec(name, *handler, '/', OVERLAY_DIRS_RECORD, user=None), input=dirs, check=True)
     subprocess.run(ic_exec(name, 'tar', '-C', '/', '-x', '--no-overwrite-dir', '--keep-directory-symlink',
                            user=None), input=archive, check=True)
-    tool, link = 'opt/coldverify/coldverify', 'usr/local/bin/coldverify'
-    if os.path.lexists(GUEST_FILES / tool) and not os.path.lexists(GUEST_FILES / link):
+    if make_link:
         subprocess.run(ic_exec(name, 'ln', '-sf', f'/{tool}', f'/{link}', user=None), check=True)
+    if mode in ('build-base', 'warm-pool') and (guest := overlay_state(name, link if make_link else None)):
+        ic('config', 'set', name, f'{OVERLAY_STAMP}={source}:{guest}')
 
 
 def cache_folder(target, allow_public):
@@ -4852,7 +6050,7 @@ def build_new_base():
         if tools:
             subprocess.run(ic_exec(new, 'bash', '-s', *(str(f) for tool in tools for f in (tool[0], *tool[2:])),
                                    user=None), input=TOOL_SETUP.encode(), check=True)
-        push_guest_files(new)
+        push_guest_files(new, mode='build-base')
         packages = subprocess.run(ic_exec(new, 'dpkg-query', '-W', '-f', '${Package} ${Version}\\n', user=None),
                                   check=True, capture_output=True, text=True).stdout
         packages += ''.join(f'toolcache/{directory}/{spec} {resolved}\n' for directory, spec, resolved, *_ in tools)
@@ -4967,7 +6165,8 @@ def check_visibility(registration, check, repo=None):
             check(False, f"{target} is {repo['visibility']} and registered without --allow-public, so no jobs run",
                   f"{hosted}, or, with the owner's approval, set its fork-pr-contributor-approval to {APPROVAL} "
                   f"and run coldbox register {target} --slots {registration['slots']} --allow-public"
-                  if (repo.get('owner') or {}).get('type') == 'User' else
+                  if (repo.get('owner') or {}).get('type') == 'User' or app_settings(
+                      org_app_files(target.split('/')[0])[0]).get('COLDBOX_SOLE_MEMBER') else
                   f'{hosted}; --allow-public serves only repos owned by a user account')
         else:
             writers = public_writers(gh, target, repo)
@@ -5057,7 +6256,7 @@ def workflow_requires_tests(file):
 def merge_enforcement(target, repo):
     path = scope(target)
     try:
-        token, app_id = app_token(path), github_app_id()
+        token, app_id = app_token(path), app_credentials(path)[1]
         if not token or not app_id:
             return 'UNVERIFIED; no GitHub App installation token or App ID'
         app_id = int(app_id)
@@ -5264,6 +6463,104 @@ def read_queue_health(path):
     return ('STALLED' if queue['stalled'] else 'FRESH'), queue
 
 
+def pool_report(listed=None):
+    """The warm pool as coldbox pool status and coldbox status show it: what is configured, what a job could claim
+    now, what is on its way in or out, what should already be gone, and the event counts. It changes nothing."""
+    now = time.time()
+    checks = []
+    try:
+        configured = warm_pool_size()
+    except (OSError, ValueError) as error:
+        configured = None
+        checks.append(dict(ok=False, message=str(error),
+                           fix=f'write a whole number or warm_pool_size = N to {WARM_POOL}, or delete it'))
+    if listed is None:
+        listed = json.loads(ic('list', '--format', 'json'))
+    pool = [vm for vm in listed if vm['name'].startswith('cbx-') and (vm.get('config') or {}).get(WARM_JOB)]
+    stamp = base = None
+    if configured or pool:
+        try:
+            snapshot = query(f"/1.0/instances/{BASE.replace('/', '/snapshots/', 1)}?project={PROJECT}")
+            base = dict(snapshot=BASE, created_at=snapshot['created_at'],
+                        image=(snapshot.get('config') or {}).get('volatile.base_image'))
+            stamp = warm_job_stamp(offline=False)
+            checks.append(dict(ok=True, message=f"warm pool stamp {stamp} for {BASE} created {base['created_at']}"))
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as error:
+            checks.append(dict(ok=False, message=f'warm pool stamp unreadable, so no standby VM can be claimed: {error}',
+                               fix='coldbox status'))
+    standbys = dict.fromkeys(('ready', 'booting', 'claimed', 'stale', 'retired'), 0)
+    overdue, born = [], []
+    for vm in pool:
+        value, expires = vm['config'][WARM_JOB], vm['config'].get(EXPIRES, '')
+        standbys['ready' if claimable(vm, stamp, now) else value if value in ('booting', 'retired') else
+                 'claimed' if value.startswith('claimed') else 'stale'] += 1
+        if not expires.isdigit() or int(expires) <= now:
+            overdue.append(vm['name'])
+        with contextlib.suppress(IndexError, ValueError):
+            born.append(int(vm['name'].split('-')[1]))
+    if configured or pool:
+        checks.append(dict(ok=not overdue, message=f"{len(overdue)} warm pool VM(s) past their expiry"
+                           f"{': ' if overdue else ''}{' '.join(overdue)}", **({'fix': 'coldbox reap'} if overdue else {})))
+    live, waits, abandoned = tearing_down(prune=False), [], 0
+    for record in (STATE / 'teardown').glob('cbx-*'):
+        if record.name not in live:
+            abandoned += 1
+            continue
+        with contextlib.suppress(OSError):
+            waits.append(now - record.stat().st_mtime)
+    seen = pool_counters()
+    return dict(configured=configured, ready=standbys['ready'], standbys=standbys, overdue=overdue, stamp=stamp,
+                base=base, oldest_standby_seconds=round(now - min(born)) if born else None,
+                teardown=dict(pending=len(live), abandoned=abandoned,
+                              oldest_seconds=round(max(waits)) if waits else None),
+                metrics=dict(since=seen['since'], hits=seen['counts'].get('hit', 0), misses=seen['counts'].get('miss', 0),
+                             reaped=seen['reaped'], refill_failures=seen['counts'].get('refill_failed', 0),
+                             last=seen['last']),
+                checks=checks)
+
+
+def pool_lines(report):
+    standbys, teardown, metrics = report['standbys'], report['teardown'], report['metrics']
+    if report['configured'] == 0 and not any(standbys.values()):
+        lines = [f'coldbox pool: off; write a number of VMs to {WARM_POOL} to keep that many standby VMs']
+    else:
+        size = 'an unreadable number' if report['configured'] is None else report['configured']
+        lines = [f"coldbox pool: {report['ready']} of {size} standby VM(s) ready ({WARM_POOL})"]
+    for check in report['checks']:
+        lines.append(f"{'PASS' if check['ok'] else 'FAIL'}  {check['message']}")
+        if not check['ok']:
+            lines.append(f"      fix: {check['fix']}")
+    age = report['oldest_standby_seconds']
+    lines.append('  standby VMs: ' + ', '.join(f'{count} {state}' for state, count in standbys.items())
+                 + (f'; oldest {age / 60:.0f} min' if age is not None else ''))
+    if report['base']:
+        lines.append(f"  base image: {report['base']['image'] or 'unknown'}")
+    wait = teardown['oldest_seconds']
+    lines.append(f"  teardowns: {teardown['pending']} pending" + (f', oldest {wait} s' if wait is not None else '')
+                 + f"; {teardown['abandoned']} left by a dead worker for coldbox reap")
+    if metrics['since'] is None:
+        lines.append('  events: none recorded')
+    else:
+        reaped = ', '.join(f'{count} {reason}' for reason, count in sorted(metrics['reaped'].items()))
+        lines.append(f"  events since {metrics['since']}: {metrics['hits']} hit(s), {metrics['misses']} miss(es), "
+                     f"{sum(metrics['reaped'].values())} reaped{f' ({reaped})' if reaped else ''}, "
+                     f"{metrics['refill_failures']} failed refill(s)")
+        for event, entry in sorted(metrics['last'].items()):
+            detail = ' '.join(str(value) for key, value in entry.items() if key != 'at')
+            lines.append(f"  last {event.replace('_', ' ')}: {entry.get('at')} {detail}")
+    return lines
+
+
+def pool_cmd(args):
+    report = pool_report()
+    failed = any(not check['ok'] for check in report['checks'])
+    if args.json:
+        print(json.dumps(dict(schema_version=1, verdict='FAIL' if failed else 'PASS', **report)))
+    else:
+        print('\n'.join(pool_lines(report)))
+    return int(failed)
+
+
 def status(args):
     monitor = bool(args and args.hosts)
     as_json = getattr(args, 'json', False)
@@ -5368,7 +6665,10 @@ def status(args):
         except ValueError as error:
             settings[path] = 0
             check(False, str(error), f'write a number of {unit} to {path}, or delete it')
-    live = {worker.name for worker in live_workers(STATE / 'workers', prune=False)}
+    pool = pool_report(listed)
+    for finding in pool['checks']:
+        check(finding['ok'], finding['message'], finding.get('fix'))
+    live = {worker.name for worker in live_workers(STATE / 'workers', prune=False)} | tearing_down(prune=False)
     orphans = [vm['name'] for vm in vms if orphan(vm, live)]
     check(not orphans, f"{len(orphans)} job VM(s) without a live worker{': ' if orphans else ''}{' '.join(orphans)}",
           'coldbox reap')
@@ -5408,6 +6708,9 @@ def status(args):
         show(f'  reserve: bursts leave {settings[RESERVE]} CPU thread(s) to other work ({RESERVE})')
     if VM_MAX.exists():
         show(f'  vm-max: at most {settings[VM_MAX]} ad-hoc VM(s) from coldbox vm up ({VM_MAX})')
+    if pool['configured'] or any(pool['standbys'].values()):
+        show(f"  warm-pool: {pool['ready']}/{pool['configured'] or 0} standby VM(s) ready ({WARM_POOL}); "
+             'coldbox pool status shows the rest')
     cap_path = STATE / 'ramp-cap.json'
     if cap_path.exists():
         show(f'  capacity cap ({cap_path}): {cap_path.read_text().strip()}')
@@ -5444,7 +6747,8 @@ def status(args):
     show('\nJob VMs')
     for vm in vms:
         left = int((vm.get('config') or {}).get('user.coldbox.expires', 0)) - time.time()
-        show(f"  {vm['name']:24} {vm['status']:10} expires in {max(0, left) / 60:.0f} min")
+        show(f"  {vm['name']:24} {vm['status']:10} expires in {max(0, left) / 60:.0f} min"
+             + ('  warm pool' if (vm.get('config') or {}).get(WARM_JOB) else ''))
     if not vms:
         show('  none')
     show('\nRecent receipts')
@@ -5751,6 +7055,7 @@ def phase_stats(jobs):
 
 def request_stats(receipts, folders, cutoff, now, local=False, waiting=()):
     records, snapshots = {}, {}
+    reasons = {}
     unreadable = 0
     unlinked, unassigned = set(), set()
     log_only = set()
@@ -5794,6 +7099,7 @@ def request_stats(receipts, folders, cutoff, now, local=False, waiting=()):
                     if not isinstance(result.get('cause'), str):
                         raise ValueError('missing submission outcome')
                     records['vm', path.stem] = accepted, False, 'incomplete'
+                    reasons['vm', path.stem] = result['cause']
                 except (OSError, ValueError, AttributeError):
                     unreadable += 1
         for path in folder.glob('cbx-*.submit.log'):
@@ -5807,6 +7113,8 @@ def request_stats(receipts, folders, cutoff, now, local=False, waiting=()):
             except OSError:
                 unreadable += 1
                 terminal = None
+            if terminal:
+                reasons[key] = 'receipt_not_observed'
             log_only.add(key)
             records[key] = accepted, False, terminal
 
@@ -5843,12 +7151,23 @@ def request_stats(receipts, folders, cutoff, now, local=False, waiting=()):
         previous = records.get(key)
         if not previous or not previous[1] or not previous[2] or terminal:
             records[key] = accepted, True, terminal
+            reasons[key] = r.get('reason_code') or r.get('cause')
 
-    cohort = [(assigned, verdict) for accepted, assigned, verdict in records.values()
-              if accepted is not None and cutoff <= accepted <= now]
-    definitive = sum(verdict in ('pass', 'fail') for _, verdict in cohort)
-    return dict(accepted=len(cohort), assigned=sum(assigned for assigned, _ in cohort),
-                terminal=sum(verdict is not None for _, verdict in cohort), definitive=definitive,
+    cohort = {key: (assigned, verdict) for key, (accepted, assigned, verdict) in records.items()
+              if accepted is not None and cutoff <= accepted <= now}
+    missing = []
+    for key, (assigned, verdict) in sorted(cohort.items()):
+        if verdict in ('pass', 'fail'):
+            continue
+        reason = reasons.get(key) or verdict or ('terminal_not_observed' if assigned else 'assignment_not_observed')
+        entry = dict(source=key[0], id=key[-1], verdict=verdict, reason=reason)
+        if key[0] == 'github':
+            entry['repo'] = key[1]
+        missing.append(entry)
+    definitive = len(cohort) - len(missing)
+    return dict(accepted=len(cohort), assigned=sum(assigned for assigned, _ in cohort.values()),
+                terminal=sum(verdict is not None for _, verdict in cohort.values()), definitive=definitive,
+                missing_observations=missing,
                 definitive_pct=round(100 * definitive / len(cohort), 1) if cohort else None,
                 unidentified_queued=sum(unknown for _, unknown in snapshots.values()), unlinked_runner_jobs=len(unlinked),
                 assignment_unknown=len(unassigned), log_only_submissions=len(log_only), unreadable_queue_sources=unreadable,
@@ -5866,7 +7185,7 @@ def outcomes(settled):
 
 
 def read_receipts(folders, cutoff, now, local=False):
-    found, unreadable = [], 0
+    found, unreadable = {}, 0
     for folder in folders:
         try:
             paths = sorted(Path(folder).iterdir())
@@ -5883,13 +7202,15 @@ def read_receipts(folders, cutoff, now, local=False):
                 receipt = json.loads(path.read_text())
                 if not isinstance(receipt, dict) or (receipt.get('vm') is not None and not isinstance(receipt['vm'], dict)):
                     raise ValueError('invalid receipt VM record')
-                if vm_span(receipt, now)[1] >= cutoff:
-                    if not local:
-                        receipt['log'] = str(path.with_suffix('.log'))
-                    found.append(receipt)
+                rank = not running(receipt), vm_span(receipt, now)[1]
+                if not local:
+                    receipt['log'] = str(path.with_suffix('.log'))
+                key = receipt['id'] if isinstance(receipt.get('id'), str) and receipt['id'] else path.resolve()
+                if key not in found or rank > found[key][0]:
+                    found[key] = rank, receipt
             except (OSError, ValueError, KeyError, TypeError):
                 unreadable += 1
-    return found, unreadable
+    return [receipt for (_, end), receipt in found.values() if end >= cutoff], unreadable
 
 
 def stats_report(receipts, since, now, folders=(), local=False, rate=None, unreadable=0):
@@ -6073,12 +7394,27 @@ def incus_group_exec(argv):
     os.execvp('sg', ['sg', 'incus-admin', '-c', shlex.join([sys.executable, str(Path(__file__).resolve()), *argv])])
 
 
+def json_incomplete(error):
+    print(json.dumps(dict(schema_version=1, verdict='INCOMPLETE', error=str(error))))
+    return 2
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     words, command = argv, []
     if argv[:1] == ['run'] and '--' in argv:
         words, command = argv[:argv.index('--')], argv[argv.index('--') + 1:]
-    parser = argparse.ArgumentParser(prog='coldbox', description=__doc__)
+    json_flags = ('--j', '--js', '--jso', '--json') if words[:1] in (['stats'], ['status'], ['pool']) else ('--json',)
+    json_requested = any(word.partition('=')[0] in json_flags
+                         for word in itertools.takewhile(lambda word: word != '--', words))
+
+    class Parser(argparse.ArgumentParser):
+        def error(self, message):
+            if json_requested:
+                self.exit(json_incomplete(message))
+            super().error(message)
+
+    parser = Parser(prog='coldbox', description=__doc__)
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION} (build {build_id()})')
     sub = parser.add_subparsers(dest='cmd', required=True)
     p = sub.add_parser('detect', help='print a suggested coldbox.toml for a repo')
@@ -6147,6 +7483,7 @@ def main(argv=None):
             p.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
             p.add_argument('--idle', type=int, default=0, help=argparse.SUPPRESS)
             p.add_argument('--name', help=argparse.SUPPRESS)
+            p.add_argument('--standby', action='store_true', help=argparse.SUPPRESS)
             p.add_argument('--size', choices=SIZES, default='default', help=argparse.SUPPRESS)
     p = sub.add_parser('unregister', help="stop the runner service and delete this host's coldbox runners on GitHub")
     p.add_argument('target')
@@ -6176,8 +7513,14 @@ def main(argv=None):
     p.add_argument('--hosts', action='store_true', help=f'one row per host in {CI_HOSTS}: build, verdict, orphans, '
                    'last receipt and jobs in the last 24 h, with build, queue and merge enforcement findings '
                    '(check only this host without that file)')
+    p = sub.add_parser('pool', help='the warm pool of standby VMs for CI jobs: status').add_subparsers(
+        dest='action', required=True).add_parser(
+        'status', help='configured and ready standby VMs, their stamp and age, pending teardowns and hit, miss and '
+        'reap counts; reads only')
+    p.add_argument('--json', action='store_true', help='print the report as JSON')
     p = sub.add_parser('setup-app', help='set up least-privilege GitHub App auth: print the steps, then install its key (sudo)')
     p.add_argument('--org', help='create the App under this organization (for org-wide runners)')
+    p.add_argument('--sole-member', help='expected sole member for public repos served by this organization App')
     p.add_argument('--app-id', help='the numeric App ID shown after creating the App')
     p.add_argument('--key', help='the private key .pem downloaded from the App settings')
     p = sub.add_parser('stats', help='outcomes, queue wait, boot, job time, slowest steps and host load from recent receipts')
@@ -6239,15 +7582,14 @@ def main(argv=None):
             print(json.dumps(dict(junit_summary(args.dirs, args.newer, args.archived),
                                   cold_verify=cold_verify_counts(args.dirs, args.newer, args.archived))))
             return 0
-        if args.cmd in ('status', 'stats') and args.json:
+        if args.cmd in ('status', 'stats', 'pool') and args.json:
             try:
-                return (status if args.cmd == 'status' else stats)(args)
+                return dict(status=status, stats=stats, pool=pool_cmd)[args.cmd](args)
             except (OSError, ValueError, LookupError, TypeError, AttributeError, OverflowError, ConfigError,
                     RuntimeError, subprocess.SubprocessError) as error:
-                print(json.dumps(dict(schema_version=1, verdict='INCOMPLETE', error=str(error))))
-                return 2
+                return json_incomplete(error)
         return dict(api=api_cmd, detect=detect_cmd, run=run_repo if args.cmd == 'run' and (args.repo or args.sha) else run_adhoc if command else run_local, serve=serve, register=register, unregister=unregister,
-                    reap=reap, status=status, stats=stats, shell=shell, selftest=selftest, **{'setup-app': setup_app}, vm=vm_cmd, **{'build-base': build_base})[args.cmd](args)
+                    reap=reap, status=status, stats=stats, shell=shell, selftest=selftest, **{'setup-app': setup_app}, vm=vm_cmd, **{'build-base': build_base}, pool=pool_cmd)[args.cmd](args)
     except ConfigError as error:
         print(f'coldbox: {error}', file=sys.stderr)
         return 2

@@ -37,6 +37,8 @@ os.environ['COLDBOX_STATE'] = tempfile.mkdtemp()
 os.environ['COLDBOX_GITHUB_APP_ENV'] = str(Path(tempfile.mkdtemp()) / 'github-app.env')
 os.environ['COLDBOX_RESERVE'] = str(Path(tempfile.mkdtemp()) / 'reserve')
 os.environ['COLDBOX_TOOLCACHE'] = str(Path(tempfile.mkdtemp()) / 'toolcache')
+os.environ['COLDBOX_WARM_POOL'] = str(Path(tempfile.mkdtemp()) / 'warm-pool')
+os.environ.pop('COLDBOX_WARM_POOL_SIZE', None)
 for inherited_from_a_coldbox_job in ('PYTEST_ADDOPTS', 'COLDBOX_JOB_DIR', 'COLDBOX_JUNIT', 'GITHUB_EVENT_NAME'):
     os.environ.pop(inherited_from_a_coldbox_job, None)
 
@@ -468,7 +470,7 @@ class JobGuestFiles(unittest.TestCase):
             return 0
 
         with mock.patch.multiple(cb, STATE=state, GUEST_FILES=files, boot=lambda *a: None,
-                                 ic=lambda *a: None, ic_exec=in_vm, tee=command, pull=lambda *a: None,
+                                 query=lambda *a, **kw: {'config': {}}, ic=lambda *a: None, ic_exec=in_vm, tee=command, pull=lambda *a: None,
                                  destroy=lambda name: True):
             quiet(cb.job, mode, 'cbx-overlay', 60, ['true'], 'me/repo')
         return calls, json.loads((state / 'receipts/cbx-overlay.json').read_text())
@@ -517,7 +519,7 @@ class JobGuestFiles(unittest.TestCase):
         seen = []
         with mock.patch.multiple(cb, boot=mock.DEFAULT, ic=mock.DEFAULT, destroy=lambda name: True,
                                  vm_resources=lambda name: {},
-                                 push_guest_files=lambda name: seen.append(json.loads(path.read_text())['vm'])), \
+                                 push_guest_files=lambda name, *, mode: seen.append(json.loads(path.read_text())['vm'])), \
                 mock.patch.object(cb.subprocess, 'run', side_effect=OSError('pull failed')), \
                 contextlib.redirect_stderr(io.StringIO()):
             cb.job('local', 'cbx-1-test', 60, ['job-command'], repo='me/app', receipts=folder.name)
@@ -1079,6 +1081,65 @@ class IncusNames(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual('removed' in result.stdout, removed, result.stdout)
                 self.assertEqual('kept=coldbox uninstall: FAIL' in result.stdout, not removed, result.stdout)
+
+
+class UninstallApp(unittest.TestCase):
+    def test_retention_removal_and_absent_paths(self):
+        with tempfile.TemporaryDirectory() as root:
+            etc = Path(root, 'etc/coldbox')
+            etc.mkdir(parents=True)
+            paths = [etc / 'github-app.pem', etc / 'github-app.env']
+            for path in paths:
+                path.write_text('unique-private-test-marker')
+                path.chmod(0o400)
+            script = (Path(__file__).resolve().parents[1] / 'uninstall.sh').read_text()
+            for prefix in ('/etc/', '/usr/local/', '/var/lib/'):
+                script = script.replace(prefix, root + prefix)
+            script = script.replace('$EUID', '0')
+            stubs = ('systemctl() { return 0; }\n'
+                     'incus() { echo "Error: Project not found" >&2; return 1; }\n')
+            for args, outcome in (([], 'Kept'), (['--remove-app-credentials'], 'Removed'),
+                                  (['--remove-app-credentials'], 'Absent')):
+                result = subprocess.run(['bash', '-c', stubs + script, 'uninstall.sh', *args],
+                                        stdin=subprocess.DEVNULL, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0)
+                self.assertTrue('unique-private-test-marker' not in result.stdout + result.stderr)
+                for path in paths:
+                    self.assertIn(f'{outcome}: {path}', result.stdout)
+                    if outcome == 'Kept':
+                        self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+                        self.assertTrue(path.read_text() == 'unique-private-test-marker')
+                    else:
+                        self.assertFalse(path.exists())
+
+    def test_remove_app_credentials_does_not_prompt_on_tty(self):
+        with tempfile.TemporaryDirectory() as root:
+            etc = Path(root, 'etc/coldbox')
+            etc.mkdir(parents=True)
+            paths = [etc / 'github-app.pem', etc / 'github-app.env']
+            for path in paths:
+                path.write_text('unique-private-test-marker')
+                path.chmod(0o400)
+            script = (Path(__file__).resolve().parents[1] / 'uninstall.sh').read_text()
+            for prefix in ('/etc/', '/usr/local/', '/var/lib/'):
+                script = script.replace(prefix, root + prefix)
+            script = script.replace('$EUID', '0')
+            stubs = ('systemctl() { return 0; }\n'
+                     'incus() { echo "Error: Project not found" >&2; return 1; }\n')
+            master, slave = pty.openpty()
+            try:
+                try:
+                    result = subprocess.run(['bash', '-c', stubs + script, 'uninstall.sh', '--remove-app-credentials'],
+                                            stdin=slave, capture_output=True, text=True, timeout=5)
+                except subprocess.TimeoutExpired as error:
+                    self.fail(f'uninstall.sh prompted on tty: {error.stderr!r}')
+            finally:
+                os.close(master)
+                os.close(slave)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for path in paths:
+                self.assertIn(f'Removed: {path}', result.stdout)
+                self.assertFalse(path.exists())
 
 
 class InstallRoutes(unittest.TestCase):
@@ -1832,11 +1893,43 @@ class Tests(unittest.TestCase):
             package.writestr(info + 'METADATA', 'Metadata-Version: 2.1\nName: coldbox-fixture-dep\nVersion: 1.0\n')
             package.writestr(info + 'WHEEL', 'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
             package.writestr(info + 'RECORD', '')
+        stub_pytest = (
+            'import importlib.util, os, pathlib, shlex, sys\n'
+            'from xml.etree import ElementTree as ET\n'
+            'if __name__ == "__main__":\n'
+            '    args = shlex.split(os.environ.get("PYTEST_ADDOPTS", "")) + sys.argv[1:]\n'
+            '    junit = next((a.split("=", 1)[1] for a in args if a.startswith("--junitxml=")), None)\n'
+            '    targets = [pathlib.Path(a) for a in sys.argv[1:] if not a.startswith("-")] or sorted(pathlib.Path(".").glob("test_*.py"))\n'
+            '    suite = ET.Element("testsuite", name="pytest")\n'
+            '    failed = 0\n'
+            '    for path in targets:\n'
+            '        spec = importlib.util.spec_from_file_location(path.stem, path)\n'
+            '        mod = importlib.util.module_from_spec(spec)\n'
+            '        spec.loader.exec_module(mod)\n'
+            '        for name, fn in list(vars(mod).items()):\n'
+            '            if name.startswith("test_") and callable(fn):\n'
+            '                case = ET.SubElement(suite, "testcase", classname=path.stem, name=name)\n'
+            '                try:\n'
+            '                    fn()\n'
+            '                except Exception as err:\n'
+            '                    failed += 1\n'
+            '                    ET.SubElement(case, "failure", message=str(err))\n'
+            '    if junit:\n'
+            '        dest = pathlib.Path(junit)\n'
+            '        dest.parent.mkdir(parents=True, exist_ok=True)\n'
+            '        ET.ElementTree(suite).write(dest, encoding="unicode")\n'
+            '    sys.exit(1 if failed else 0)\n'
+        )
         for config in ('', '[commands]\ntest = "python3 -m pytest -q test_dependency.py"\n'):
             with self.subTest(config=config), tempfile.TemporaryDirectory() as tmp:
                 (root / 'coldbox.toml').write_text(config)
                 job = Path(tmp)
-                with mock.patch.dict(os.environ, TMPDIR=tmp, PIP_NO_INDEX='1', PIP_REQUIRE_VIRTUALENV='1'):
+                stub = job / 'pytest-stub'
+                stub.mkdir()
+                (stub / 'pytest.py').write_text(stub_pytest)
+                pythonpath = os.pathsep.join(filter(None, [str(stub), os.environ.get('PYTHONPATH')]))
+                with mock.patch.dict(os.environ, TMPDIR=tmp, PIP_NO_INDEX='1', PIP_REQUIRE_VIRTUALENV='1',
+                                     PYTHONPATH=pythonpath):
                     code = cb.run_checks(root, job / 'checks.json')
                 self.assertEqual(code, 0)
                 summary = cb.junit_summary([job / 'junit'])
@@ -2315,6 +2408,50 @@ class Verdict(unittest.TestCase):
                          ('incomplete', 0, None, cb.NO_TESTS))
         self.assertEqual(self.run_job(None, [0])['verdict'], 'incomplete')
 
+    def test_missing_report_and_unreadable_count_are_distinguishable(self):
+        self.assertEqual(self.run_job(None, []).get('tests_missing_reason'), 'no_test_report')
+        unreadable = self.run_job(None, [None])
+        self.assertEqual(unreadable['tests_missing_reason'], 'test_count_unavailable')
+        self.assertEqual(unreadable['tests_source'], 'cold-verify')
+
+    def test_empty_junit_keeps_the_report_that_was_observed(self):
+        receipt = self.run_job(0, [])
+        self.assertIn('tests', receipt)
+        self.assertEqual(receipt['tests']['files'], ['report.xml'])
+        self.assertEqual(receipt['tests']['total'], 0)
+        self.assertEqual(receipt['verdict'], 'incomplete')
+
+    def test_interrupted_runner_keeps_test_evidence_and_request_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = root / 'report.xml'
+            report.write_text('<testsuite><testcase name="observed"/></testsuite>')
+            metadata = dict(repo='me/app', sha='a' * 40, run_id='21', run_attempt='1')
+            def execute(name, *command, **kwargs):
+                if command[:2] == ('coldbox', 'junit'):
+                    return [sys.executable, str(ROOT / 'coldbox'), 'junit', str(root)]
+                return ['true']
+
+            def github_jobs(path):
+                saved = json.loads((root / 'receipts/cbx-test.json').read_text())
+                self.assertTrue(saved['vm']['destroyed'])
+                self.assertEqual(saved['tests_ran'], 1)
+                return {'jobs': [dict(id=12, runner_name='cbx-test')]}
+
+            with mock.patch.multiple(cb, STATE=root, boot=mock.DEFAULT, ic=mock.DEFAULT, ic_exec=execute,
+                    tee=mock.Mock(side_effect=KeyboardInterrupt), destroy=lambda name: True,
+                    pull=lambda name, path: metadata if path.endswith('/job.json') else None,
+                    runner_admission=lambda *a: dict(host='ci-host'),
+                    gh=github_jobs), self.assertRaises(KeyboardInterrupt):
+                quiet(cb.job, 'runner', 'cbx-test', 60, ['true'], 'me/app')
+            receipt = json.loads((root / 'receipts/cbx-test.json').read_text())
+        self.assertEqual(receipt['verdict'], 'incomplete')
+        self.assertTrue(receipt['vm']['destroyed'])
+        self.assertIn('tests', receipt)
+        self.assertEqual(receipt['tests']['results'][0]['name'], 'observed')
+        self.assertEqual(receipt['tests_ran'], 1)
+        self.assertEqual(receipt['github']['job_id'], 12)
+
     def test_an_unreadable_cold_verify_result_is_incomplete_not_zero(self):
         receipt = self.run_job(None, [412, None])
         self.assertEqual(receipt['verdict'], 'incomplete')
@@ -2389,6 +2526,13 @@ class Verdict(unittest.TestCase):
                                    b'2026-11-08 16:52:21Z: Running job: verify')
         self.assertEqual((busy['error'], busy['verdict'], busy['job_name']), ('stopped', 'incomplete', 'verify'))
 
+    def test_another_interrupt_while_collecting_still_destroys_the_vm(self):
+        with mock.patch.object(cb, 'pull', side_effect=SystemExit(130)):
+            receipt = self.stopped_runner(b'Running job: verify')
+        self.assertTrue(receipt['vm']['destroyed'])
+        self.assertEqual(receipt['verdict'], 'incomplete')
+        self.assertEqual(receipt.get('tests_missing_reason'), 'test_count_unavailable')
+
     def test_forced_stop_preserves_github_run_identity(self):
         github = dict(repo='me/app', sha='abc', run_id=123)
         with mock.patch.object(cb, 'pull', return_value=github):
@@ -2402,6 +2546,76 @@ class Verdict(unittest.TestCase):
         self.assertEqual(cb.job_outcome(b'Listening for Jobs\n'), (None, None))
         self.assertEqual(cb.job_outcome(b'2026-11-05 01:19:03Z: Job test (3.12) completed with result: Failed\n'),
                          ('test (3.12)', 'Failed'))
+
+
+class ConsoleRetention(unittest.TestCase):
+    def job(self, data, *, runner=False, code=0):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        state = Path(folder.name)
+        receipts = state / 'receipts'
+        def execute(_, *args, **kw):
+            if args == ('fixture',):
+                return [sys.executable, '-c', 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1])); '
+                        'sys.exit(int(sys.argv[2]))', data.hex(), str(code)]
+            if 'junit' in args:
+                return ["echo", json.dumps(cb.junit_summary([]))]
+            return ['true']
+        output = io.BytesIO()
+        with mock.patch.multiple(cb, STATE=state, boot=lambda *a: None, ic=lambda *a: None, ic_exec=execute,
+                                 push_guest_files=lambda *a, **kw: None, pull=lambda *a: None,
+                                 runner_admission=lambda *a: dict(host='host'), vm_resources=lambda *a: {},
+                                 copy_artifacts=lambda *a: ([], True), destroy=lambda _: True), \
+                mock.patch.object(cb, 'CONSOLE_BYTES', 256, create=True), \
+                mock.patch.object(sys, 'stdout', buffer=output), contextlib.redirect_stderr(io.StringIO()):
+            receipt = cb.job('runner' if runner else 'adhoc', 'cbx-fixture', 60, ['fixture'], 'fixture')
+        self.assertEqual(json.loads((receipts / 'cbx-fixture.json').read_text()), receipt)
+        self.assertTrue(receipt['vm']['destroyed'])
+        return receipt, Path(receipt['log']).read_bytes(), output.getvalue()
+
+    def test_noisy_job_retains_head_and_tail_within_cap(self):
+        data = b'head' + b'x' * 25000 + b'tail'
+        receipt, log, stdout = self.job(data)
+        self.assertEqual(stdout, data)
+        self.assertLessEqual(len(log), 256)
+        self.assertTrue(log.startswith(b'head') and log.endswith(b'tail'))
+        self.assertIn(cb.CONSOLE_MARKER, log)
+        self.assertEqual(receipt['console_truncated_bytes'], len(data) - len(log) + len(cb.CONSOLE_MARKER))
+        self.assertEqual(receipt['verdict'], 'pass')
+
+    def test_cap_holds_during_writes_and_keeps_the_exact_tail_after_wraps(self):
+        data = bytes(range(251)) * 17
+        limit = 256
+        for length in (limit - 1, limit, limit + 1, len(data)):
+            with self.subTest(length=length), tempfile.TemporaryFile() as file, \
+                    mock.patch.object(cb, 'CONSOLE_BYTES', limit):
+                log = cb.ConsoleLog(file)
+                for start in range(0, length, 53):
+                    log.write(data[start:min(start + 53, length)])
+                    self.assertLessEqual(os.fstat(file.fileno()).st_size, limit)
+                log.finish()
+                file.seek(0)
+                saved = file.read()
+                if length <= limit:
+                    self.assertEqual(saved, data[:length])
+                else:
+                    head, marker, tail = saved.partition(cb.CONSOLE_MARKER)
+                    self.assertEqual(marker, cb.CONSOLE_MARKER)
+                    self.assertEqual((head, tail), (data[:len(head)], data[length - len(tail):length]))
+                    self.assertEqual(len(saved), limit)
+
+    def test_exact_cap_keeps_every_byte_and_exit_code(self):
+        data = bytes(range(256))
+        receipt, log, stdout = self.job(data, code=1)
+        self.assertEqual((log, stdout, receipt['verdict']), (data, data, 'fail'))
+        self.assertEqual(receipt.get('console_truncated_bytes', 0), 0)
+
+    def test_runner_result_survives_in_discarded_middle(self):
+        data = b'a' * 400 + b'\nRunning job: verify\nJob verify completed with result: Failed\n' + b'z' * 400
+        receipt, log, stdout = self.job(data, runner=True)
+        self.assertEqual(stdout, log)
+        self.assertEqual((receipt['job_name'], receipt['job_result'], receipt['verdict']), ('verify', 'Failed', 'fail'))
+        self.assertNotIn(b'completed', log)
 
 
 class Destroy(unittest.TestCase):
@@ -2757,6 +2971,15 @@ class Reap(unittest.TestCase):
                                    if expires == 'never' or int(expires) > now)]))
         self.assertEqual((receipts / 'cbx-new.artifacts' / 'out' / 'report.txt').read_text(), 'saved')
         return result, calls, receipts
+
+    def test_reap_leaves_warm_vms_to_the_refill_which_deletes_them_when_the_host_lists_none(self):
+        self.assertFalse(cb.VM_WARM.exists(), f'{cb.VM_WARM} on the test host')
+        warm = {'name': 'cbx-w', 'config': {'user.coldbox.expires': str(int(time.time()) - 5), cb.WARM: 'offline:b1'}}
+        result, calls, _ = self.reap('#!/bin/sh\necho "[]"\n', extra=[warm], expected_deletes=['cbx-w'],
+                                     orphans=['cbx-w'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        retired = calls.index(f'--force-local --project coldbox config set cbx-w {cb.WARM}=retired')
+        self.assertLess(retired, calls.index('--force-local --project coldbox delete cbx-w --force'))
 
     def test_reap_gives_coldbox_incus_objects_an_expiry_and_leaves_unmanaged_ones_alone(self):
         mark = ' user.coldbox.managed=true user.coldbox.expires=never'
@@ -3550,7 +3773,7 @@ class BuildBase(unittest.TestCase):
         calls.clear()
         with mock.patch.multiple(cb, STATE=Path(tempfile.mkdtemp()), fetch_json=lambda url: None,
                                  runner_release=lambda _: ('2.340.0', 'u', 'd'), wait_ready=lambda *a, **k: None,
-                                 destroy=lambda name: True, push_guest_files=lambda name: None,
+                                 destroy=lambda name: True, push_guest_files=lambda name, *, mode: None,
                                  seed_cloud_init_on_create_only=lambda name: None, ic=lambda *a, **k: calls.append(a)), \
                 mock.patch.object(cb.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='')):
             cb.build_new_base()
@@ -3580,7 +3803,7 @@ class BuildBase(unittest.TestCase):
         calls = []
         with mock.patch.multiple(cb, STATE=Path(tempfile.mkdtemp()), fetch_json=lambda url: None, runner_release=lambda _: ('2.340.0', 'u', 'd'),
                                  wait_ready=lambda *a, **k: None, destroy=lambda name: True,
-                                 push_guest_files=lambda name: calls.append(('guest-files', name)),
+                                 push_guest_files=lambda name, *, mode: calls.append(('guest-files', name)),
                                  seed_cloud_init_on_create_only=lambda name: calls.append(('seed', name)),
                                  ic=lambda *a, **k: calls.append(a)), \
                 mock.patch.object(cb.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='')):
@@ -3605,7 +3828,7 @@ class BuildBase(unittest.TestCase):
                 return {'templates': {'/var/lib/cloud/seed/nocloud-net/meta-data': {'when': ['create', 'copy']}}}
             with self.subTest(failing=failing), \
                     mock.patch.multiple(cb, fetch_json=lambda url: None, runner_release=lambda _: ('2.340.0', 'u', 'd'),
-                                        wait_ready=lambda *a, **k: None, push_guest_files=lambda name: None,
+                                        wait_ready=lambda *a, **k: None, push_guest_files=lambda name, *, mode: None,
                                         destroy=lambda name: destroyed.append(name) or True, query=query,
                                         ic=lambda *a, **k: calls.append(a)), \
                     mock.patch.object(cb.subprocess, 'run', side_effect=run):
@@ -5469,6 +5692,26 @@ class QueueDuration(unittest.TestCase):
         self.assertEqual(metadata['queued_at'], '2026-01-01T00:00:00Z')
         self.assertEqual(metadata['job_id'], 2)
         api.assert_called_once_with('repos/me/app/actions/runs/123/attempts/2/jobs?per_page=100&page=1')
+
+    def test_reversed_timestamps_keep_job_id_but_do_not_enter_cohort_timing(self):
+        metadata = dict(repo='me/app', run_id='21', run_attempt='1')
+        job = dict(id=12, runner_name='cbx-test', started_at='2026-11-21T03:59:59Z', created_at='2026-11-21T04:00:01Z')
+        with mock.patch.object(cb, 'gh', return_value={'jobs': [job]}):
+            quiet(cb.record_queue_wait, metadata, 'cbx-test')
+        self.assertEqual(metadata.get('job_id'), 12)
+        for key in ('queued_at', 'runner_started_at', 'queue_wait_seconds'):
+            self.assertNotIn(key, metadata)
+
+    def test_missing_start_time_preserves_job_identity_queue_time_and_steps(self):
+        metadata = dict(repo='me/app', run_id='21', run_attempt='1')
+        job = dict(id=12, runner_name='cbx-test', started_at=None, created_at='2026-11-21T04:00:01Z',
+                   steps=[dict(name='test', conclusion='failure')])
+        with mock.patch.object(cb, 'gh', return_value={'jobs': [job]}):
+            quiet(cb.record_queue_wait, metadata, 'cbx-test')
+        self.assertEqual(metadata.get('job_id'), 12)
+        self.assertEqual(metadata['queued_at'], job['created_at'])
+        self.assertEqual(metadata['steps'][0]['conclusion'], 'failure')
+        self.assertNotIn('queue_wait_seconds', metadata)
 
     def test_runner_receipt_and_log_include_queue_duration(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -7969,7 +8212,7 @@ class Toolcache(unittest.TestCase):
 
         with mock.patch.multiple(cb, STATE=state, TOOLCACHE=path, fetch_json=self.fetch,
                                  runner_release=lambda _: ('2.340.0', 'u', 'd'), wait_ready=lambda *a, **k: None,
-                                 push_guest_files=lambda name: None, seed_cloud_init_on_create_only=lambda name: None,
+                                 push_guest_files=lambda name, *, mode: None, seed_cloud_init_on_create_only=lambda name: None,
                                  destroy=lambda name: calls.append(('destroy', name)) or True,
                                  ic=lambda *a, **k: calls.append(a)), \
                 mock.patch.object(cb.subprocess, 'run', side_effect=run), \
@@ -8483,6 +8726,13 @@ class HostMemoryAdmission(unittest.TestCase):
         (self.state / 'vm-max').write_text('0')
         self.assertTrue(cb.admit('repo', 'cbx-new', 'once'))
 
+    def test_a_warm_refill_ignores_the_ad_hoc_limit_and_does_not_use_it_up(self):
+        (self.state / 'vm-max').write_text('0')
+        self.assertTrue(cb.admit('warm', 'cbx-w', 'warm'))
+        (self.state / 'vm-max').write_text('1')
+        cb.note_worker(os.getppid(), 'warm', 'cbx-booting', 'warm')
+        self.assertTrue(cb.admit('vm', 'cbx-new', 'vm'))
+
     def test_vm_up_is_refused_on_the_ci_primary(self):
         hosts = self.state / 'ci-hosts.json'
         hosts.write_text(json.dumps(dict(primary=os.uname().nodename, overflow=['other'])))
@@ -8659,14 +8909,14 @@ class AdhocVm(unittest.TestCase):
         calls = []
         with mock.patch.multiple(cb, admit=lambda *a: True, new_id=lambda: 'cbx-9-z',
                                  boot=lambda name, *a: calls.append(('boot', name)),
-                                 push_guest_files=lambda name, *, managed=False: calls.append(('overlay', name))):
+                                 push_guest_files=lambda name, *, mode: calls.append(('overlay', name))):
             self.assertEqual(quiet(cb.main, ['vm', 'up']), (0, 'cbx-9-z\n'))
         self.assertEqual(calls, [('boot', 'cbx-9-z'), ('overlay', 'cbx-9-z')])
 
     def test_up_whose_overlay_push_fails_destroys_the_vm_and_prints_no_name(self):
         destroyed = []
 
-        def fail(name, *, managed=False):
+        def fail(name, *, mode):
             raise subprocess.CalledProcessError(2, ['incus', 'exec', name, '--', 'tar'])
         with mock.patch.multiple(cb, admit=lambda *a: True, new_id=lambda: 'cbx-9-z', boot=lambda *a: None,
                                  push_guest_files=fail, destroy=destroyed.append):
@@ -10254,6 +10504,33 @@ class VmResources(unittest.TestCase):
 class Stats(unittest.TestCase):
     NOW = cb.at('2026-11-11T12:00:00+00:00')
 
+    def test_json_usage_errors_have_a_versioned_error(self):
+        for argv, message in (
+            (['stats', '--since', 'bad', '--json'], '--since'),
+            (['stats', '--since', 'bad', '--j'], '--since'),
+            (['stats', '--json=false'], '--json'),
+            (['stats', '--json', '--receipts'], '--receipts'),
+            (['stats', '--json', '--unknown'], '--unknown'),
+            (['status', '--json', '--unknown'], '--unknown'),
+            (['--json'], 'cmd'),
+        ):
+            with self.subTest(argv=argv):
+                result = subprocess.run([sys.executable, ROOT / 'coldbox', *argv],
+                                        stdin=subprocess.DEVNULL, capture_output=True, text=True)
+                self.assertEqual((result.returncode, result.stderr), (2, ''))
+                report = json.loads(result.stdout)
+                self.assertEqual((report['schema_version'], report['verdict']), (1, 'INCOMPLETE'))
+                self.assertIn(message, report['error'])
+
+    def test_human_usage_errors_go_to_stderr(self):
+        for argv in (['stats', '--since', 'bad'], ['stats', '--since', 'bad', '--', '--json']):
+            with self.subTest(argv=argv):
+                result = subprocess.run([sys.executable, ROOT / 'coldbox', *argv],
+                                        stdin=subprocess.DEVNULL, capture_output=True, text=True)
+                self.assertEqual((result.returncode, result.stdout), (2, ''))
+                self.assertIn('usage: coldbox stats', result.stderr)
+                self.assertIn('error: argument --since:', result.stderr)
+
     def test_stats_json_exit_distinguishes_complete_orphan_and_unreadable(self):
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         with mock.patch.object(cb.time, 'time', return_value=self.NOW), \
@@ -10458,6 +10735,31 @@ class Stats(unittest.TestCase):
                      'VM teardown: 7 s (1/3 jobs measured)', 'request coverage: unobserved requests unknown'):
             self.assertIn(line, display)
 
+    def test_each_nondefinitive_request_keeps_its_identity_and_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / 'receipts'
+            folder.mkdir()
+            queue = root / 'queues/me/app.json'
+            queue.parent.mkdir(parents=True)
+            stamp = datetime.fromtimestamp(self.NOW - 60, timezone.utc).isoformat()
+            cb.write_json(queue, dict(observed_at=stamp, queued=1, accepted_jobs=[dict(id=1, created_at=stamp)]))
+            for job_id, verdict in ((2, 'incomplete'), (3, 'canceled'), (4, 'pass')):
+                receipt = self.runner(f'cbx-{job_id}', 1000, 2, 30, 20, verdict=verdict)
+                receipt['github'].update(job_id=job_id, queued_at=stamp)
+                if job_id == 2:
+                    receipt.update(cause='no_tests', reason_code='no_usable_tests')
+                cb.write_json(folder / f"cbx-{job_id}.json", receipt)
+            with mock.patch.object(cb.time, 'time', return_value=self.NOW), mock.patch.object(cb, 'STATE', root):
+                _, raw = quiet(cb.main, ['stats', '--since', '1h', '--json'])
+        requests = json.loads(raw)['requests']
+        self.assertIn('missing_observations', requests)
+        missing = requests['missing_observations']
+        self.assertEqual(requests['accepted'], requests['definitive'] + len(missing))
+        self.assertEqual({(r['repo'], r['id'], r['reason']) for r in missing},
+                         {('me/app', 1, 'assignment_not_observed'), ('me/app', 2, 'no_usable_tests'),
+                          ('me/app', 3, 'canceled')})
+
     def runner(self, name, start, queue, ready, wall, host='host-p', repo='me/app', primary='host-p', **extra):
         started = self.NOW - 3000 + start
         stamp = lambda offset: datetime.fromtimestamp(started + offset, timezone.utc).isoformat()
@@ -10469,6 +10771,54 @@ class Stats(unittest.TestCase):
                        seconds=ready + wall + 20, vm=dict(ready_seconds=ready, host_ceiling=40, destroyed=True), github=github,
                        admission=dict(host=host, primary=primary), checks=[])
         return dict(receipt, **extra)
+
+    def test_overlapping_receipt_folders_count_each_receipt_once(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        original, copy = state / 'receipts', state / 'copy'
+        for folder in (original, copy):
+            folder.mkdir()
+            cb.write_json(folder / 'cbx-1.json', self.runner('cbx-1', 0, 10, 40, 100))
+        cb.write_json(copy / 'cbx-2.json', self.runner('cbx-2', 50, 30, 60, 300))
+        with mock.patch.object(cb.time, 'time', return_value=self.NOW), \
+                mock.patch.object(cb, 'STATS_CONFIG', state / 'stats.toml'):
+            code, output = quiet(cb.main, ['stats', '--json', '--receipts', str(original), '--receipts', str(copy)])
+        report = json.loads(output)
+        self.assertEqual((code, report['jobs'], report['vms'], report['repos']['me/app']['jobs']), (0, 2, 2, 2))
+
+    def read_copies(self, first, second):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        folders = [state / 'a', state / 'b']
+        for folder, receipt in zip(folders, (first, second)):
+            folder.mkdir()
+            (folder / 'cbx-1.json').write_text(json.dumps(receipt))
+        return cb.read_receipts(folders, self.NOW - 3600, self.NOW)
+
+    def test_overlapping_receipt_folders_keep_the_settled_copy_in_either_order(self):
+        settled = self.runner('cbx-1', 0, 10, 40, 100)
+        in_progress = dict(settled, vm=dict(settled['vm'], destroyed=False))
+        del in_progress['seconds']
+        for first, second in ((in_progress, settled), (settled, in_progress)):
+            with self.subTest(first_settled=first is settled):
+                found, unreadable = self.read_copies(first, second)
+                self.assertEqual(([r.get('seconds') for r in found], unreadable), ([settled['seconds']], 0))
+
+    def test_an_unreadable_or_stale_first_copy_does_not_hide_a_valid_one(self):
+        valid = self.runner('cbx-1', 0, 10, 40, 100)
+        broken = dict(valid)
+        del broken['started_at']
+        old = dict(valid, started_at='2026-11-01T00:00:00+00:00')
+        for first, expected_unreadable in ((broken, 1), (old, 0)):
+            with self.subTest(first=first.get('started_at')):
+                found, unreadable = self.read_copies(first, valid)
+                self.assertEqual(([r['started_at'] for r in found], unreadable),
+                                 ([valid['started_at']], expected_unreadable))
+
+    def test_receipts_without_a_string_id_are_kept_per_file(self):
+        unnamed = self.runner('cbx-1', 0, 10, 40, 100)
+        del unnamed['id']
+        listed = dict(unnamed, id=['cbx-1'])
+        found, unreadable = self.read_copies(unnamed, listed)
+        self.assertEqual((len(found), unreadable), (2, 0))
 
     def receipts(self):
         return [self.runner('cbx-1', 0, 10, 40, 100),
@@ -10688,12 +11038,13 @@ class VmUpOverlay(unittest.TestCase):
         return ['/bin/sh', '-c', 'log=$1; shift; exec "$@" 2>>"$log"', 'sh', str(self.stderr),
                 'env', f'PATH={self.bin}', 'LC_ALL=C', *command]
 
-    def up(self, *options):
+    def up(self, *options, config=None):
         profile = {('get', 'coldbox', 'limits.cpu'): '4', ('get', 'coldbox', 'limits.memory'): '8GiB',
                    ('device', 'get', 'coldbox', 'root', 'size'): '20GiB'}
         with mock.patch.multiple(cb, GUEST_FILES=self.files, VM_ALLOW=self.allow, fleet=lambda: None,
                                  admit=lambda *args: True, new_id=lambda: 'cbx-9-z', boot=lambda *args, **kwargs: None,
-                                 destroy=self.destroy, ic_exec=self.guest_exec, query=lambda _: {},
+                                 destroy=self.destroy, ic_exec=self.guest_exec,
+                                 query=lambda *a, **kw: {'config': config or {}},
                                  ic=lambda *args: profile[args[1:]], vm_memory=lambda: 8 * GIB, vm_disk=lambda: 20 * GIB):
             return quiet(cb.main, ['vm', 'up', '--here', '--offline', *options])
 
@@ -10702,6 +11053,95 @@ class VmUpOverlay(unittest.TestCase):
         self.assertEqual(self.marker.read_bytes(), os.fsencode(self.owned) + b'\nopt/coldverify\n')
         self.assertEqual((self.vm / self.new / 'coldverify').read_text(), 'overlay\n')
         self.assertEqual(os.readlink(self.vm / 'usr/local/bin/coldverify'), '/opt/coldverify/coldverify')
+
+    def build_base(self):
+        (self.bin / 'python3').symlink_to(sys.executable)
+        (self.bin / 'chmod').symlink_to(shutil.which('chmod'))
+        config = {}
+
+        def incus(*args):
+            if args[:2] == ('config', 'set'):
+                for setting in args[3:]:
+                    key, value = setting.split('=', 1)
+                    config[key] = value
+
+        with mock.patch.multiple(cb, STATE=self.files.parent, GUEST_FILES=self.files,
+                                 TOOLCACHE=self.files.parent / 'no-toolcache',
+                                 fetch_json=mock.Mock(), runner_release=lambda _: ('1', 'url', 'hash'),
+                                 wait_ready=mock.Mock(), destroy=mock.Mock(), ic=incus,
+                                 seed_cloud_init_on_create_only=mock.Mock(),
+                                 ic_exec=lambda name, *a, **kw: ['true'] if a[0] in ('env', 'dpkg-query')
+                                 else self.guest_exec(name, *a, **kw)):
+            cb.build_new_base()
+        return config
+
+    def stamped_base(self):
+        config = self.build_base()
+        self.assert_overlay()
+        return config
+
+    def test_overlay_without_coldverify_gets_a_stamped_base_whose_clones_skip_the_extract(self):
+        shutil.rmtree(self.files / self.new)
+        (self.files / self.owned / 'tool').write_text('tool\n')
+        config = self.build_base()
+        self.assertIn(cb.OVERLAY_STAMP, config)
+        self.assertFalse((self.vm / 'usr/local/bin/coldverify').exists())
+        with mock.patch.object(self, 'guest_exec', wraps=self.guest_exec) as calls:
+            self.assertEqual(self.up(config=config), (0, 'cbx-9-z\n'))
+            self.assertFalse(any(c.args[1] == 'tar' for c in calls.call_args_list))
+
+    def test_clone_skips_only_an_unchanged_base_overlay(self):
+        config = self.stamped_base()
+        with mock.patch.object(self, 'guest_exec', wraps=self.guest_exec) as calls:
+            self.assertEqual(self.up(config=config), (0, 'cbx-9-z\n'))
+            self.assertFalse(any(c.args[1] == 'tar' for c in calls.call_args_list))
+        tool = self.vm / self.new / 'coldverify'
+        tool.write_text('changed at boot')
+        self.assertEqual(self.up(config=config), (0, 'cbx-9-z\n'))
+        self.assert_overlay()
+
+    def test_host_overlay_change_reaches_a_clone_with_the_old_stamp(self):
+        config = self.stamped_base()
+        (self.files / self.new / 'coldverify').write_text('updated on host')
+        self.assertEqual(self.up(config=config), (0, 'cbx-9-z\n'))
+        self.assertEqual((self.vm / self.new / 'coldverify').read_text(), 'updated on host')
+
+    def test_clone_of_an_unchanged_host_overlay_is_checked_without_parsing_the_archive(self):
+        config = self.stamped_base()
+        with mock.patch.object(cb.tarfile, 'open', wraps=cb.tarfile.open) as parse, \
+                mock.patch.object(self, 'guest_exec', wraps=self.guest_exec) as calls:
+            self.assertEqual(self.up(config=config), (0, 'cbx-9-z\n'))
+        self.assertFalse(any(c.args[1] == 'tar' for c in calls.call_args_list))
+        parse.assert_not_called()
+
+    def test_host_overlay_rewritten_with_the_same_bytes_still_skips_the_extract(self):
+        config = self.stamped_base()
+        tool = self.files / self.new / 'coldverify'
+        folder = tool.parent.stat()
+        copy = tool.with_name('copy')
+        shutil.copy2(tool, copy)
+        copy.replace(tool)
+        os.utime(tool.parent, ns=(folder.st_atime_ns, folder.st_mtime_ns))
+        with mock.patch.object(self, 'guest_exec', wraps=self.guest_exec) as calls:
+            self.assertEqual(self.up(config=config), (0, 'cbx-9-z\n'))
+            self.assertFalse(any(c.args[1] == 'tar' for c in calls.call_args_list))
+
+    def test_host_byte_change_that_leaves_lstat_alone_still_reaches_the_clone(self):
+        config = self.stamped_base()
+        tool = self.files / self.new / 'coldverify'
+        stale = os.lstat(tool)
+        tool.write_text('OVERLAY\n')
+        lstat = os.lstat
+        with mock.patch.object(cb.os, 'lstat', lambda path, **kw: stale if os.fsencode(path) == os.fsencode(tool)
+                               else lstat(path, **kw)):
+            self.assertEqual(self.up(config=config), (0, 'cbx-9-z\n'))
+        self.assertEqual((self.vm / self.new / 'coldverify').read_text(), 'OVERLAY\n')
+
+    def test_explicit_base_image_always_receives_the_overlay(self):
+        config = self.stamped_base()
+        with mock.patch.object(self, 'guest_exec', wraps=self.guest_exec) as calls:
+            self.assertEqual(self.up('--image', cb.BASE, config=config), (0, 'cbx-9-z\n'))
+            self.assertTrue(any(c.args[1] == 'tar' for c in calls.call_args_list))
 
     def test_implicit_image_applies_the_overlay_without_external_chmod(self):
         (self.bin / 'python3').symlink_to(sys.executable)
@@ -10813,7 +11253,7 @@ class VmUpOptions(unittest.TestCase):
         profile = {('get', 'coldbox', 'limits.cpu'): '8\n', ('get', 'coldbox', 'limits.memory'): '16GiB\n',
                    ('device', 'get', 'coldbox', 'root', 'size'): '40GiB\n'}
         patches = dict(CI_HOSTS=self.tmp / 'missing', VM_ALLOW=self.allow, admit=mock.Mock(return_value=True),
-                       new_id=lambda: 'cbx-9-z', push_guest_files=lambda name, *, managed=False: None,
+                       new_id=lambda: 'cbx-9-z', push_guest_files=lambda name, *, mode: None,
                        vm_memory=lambda: 16 * GIB,
                        vm_disk=lambda: 40 * GIB, destroy=mock.Mock(return_value=True),
                        ic=lambda *args: profile[args[1:]], query=self.query,
@@ -10959,3 +11399,2067 @@ class BootOnANamedNetwork(unittest.TestCase):
     def test_default_boot_makes_no_overrides(self):
         calls = self.boot(cb.BRIDGE)
         self.assertEqual([call[0] for call in calls], ['copy', 'start'])
+
+
+class WarmVm(unittest.TestCase):
+    def setUp(self):
+        def hung(*_):
+            raise TimeoutError('WarmVm test ran past 60 s')
+        signal.signal(signal.SIGALRM, hung)
+        signal.alarm(60)
+        self.addCleanup(signal.alarm, 0)
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.rows = self.tmp / 'rows.json'
+        self.warm_file = self.tmp / 'vm-warm'
+        self.booted, self.destroyed = [], []
+        self.save([])
+        patches = dict(STATE=self.tmp / 'state', VM_WARM=self.warm_file, VM_MAX=self.tmp / 'vm-max',
+                       CI_HOSTS=self.tmp / 'ci-hosts.json', ic=self.ic, warm_build=lambda: 'b1',
+                       sync_acl=lambda: None, isolated=lambda name, offline: None, admit=lambda *a: True,
+                       boot=lambda name, expires, *a, **k: self.booted.append(name) or self.add(name, 'booting', expires),
+                       push_guest_files=lambda name, *, mode: None,
+                       destroy=lambda name: self.destroyed.append(name) or True)
+        for name, value in patches.items():
+            self.enterContext(mock.patch.object(cb, name, value))
+        self.enterContext(mock.patch.object(cb.subprocess, 'run', return_value=argparse.Namespace(returncode=0)))
+
+    def save(self, rows):
+        staged = self.tmp / 'rows.tmp'
+        staged.write_text(json.dumps(rows))
+        os.replace(staged, self.rows)
+
+    def add(self, name, warm, expires=None):
+        config = {cb.EXPIRES: str(expires or int(time.time()) + cb.WARM_TTL)}
+        config.update({cb.ADHOC: 'true'} if warm is None else {cb.WARM: warm})
+        self.save(json.loads(self.rows.read_text()) + [dict(name=name, status='Running', config=config)])
+
+    def config(self, name):
+        return next(row['config'] for row in json.loads(self.rows.read_text()) if row['name'] == name)
+
+    def ic(self, *args):
+        if args[0] == 'list':
+            listed = self.rows.read_text()
+            time.sleep(0.2)
+            return listed
+        if args[:2] == ('config', 'get'):
+            return self.config(args[2]).get(args[3], '') + '\n'
+        self.assertEqual(args[:2], ('config', 'set'))
+        rows = json.loads(self.rows.read_text())
+        for row in rows:
+            if row['name'] == args[2]:
+                for item in args[3:]:
+                    key, _, value = item.partition('=')
+                    row['config'][key] = value
+        self.save(rows)
+        return ''
+
+    def fork(self, target):
+        process = multiprocessing.get_context('fork').Process(target=target, daemon=True)
+        process.start()
+        self.addCleanup(process.join, 5)
+        self.addCleanup(process.kill)
+        return process
+
+    def claim_in_parallel(self, count):
+        results = multiprocessing.get_context('fork').Queue()
+        claimers = [self.fork(lambda: results.put(cb.claim_warm('offline', 600))) for _ in range(count)]
+        for claimer in claimers:
+            claimer.join(20)
+        return sorted([results.get(timeout=5) for _ in claimers], key=str)
+
+    def test_concurrent_vm_ups_never_get_the_same_warm_vm(self):
+        self.add('cbx-w1', 'offline:b1')
+        self.assertEqual(self.claim_in_parallel(2), [None, 'cbx-w1'])
+        self.add('cbx-w2', 'offline:b1')
+        self.add('cbx-w3', 'offline:b1')
+        self.assertEqual(self.claim_in_parallel(3), [None, 'cbx-w2', 'cbx-w3'])
+
+    def test_a_claim_takes_the_ttl_and_only_a_ready_vm_of_the_shape_and_current_build(self):
+        for name, warm in (('cbx-old', 'offline:b0'), ('cbx-boot', 'booting'), ('cbx-on', 'online:b1'),
+                           ('cbx-mine', None)):
+            self.add(name, warm)
+        self.assertIsNone(cb.claim_warm('offline', 600))
+        self.add('cbx-w1', 'offline:b1')
+        self.assertEqual(cb.claim_warm('offline', 600), 'cbx-w1')
+        self.assertEqual((self.config('cbx-w1')[cb.WARM], self.config('cbx-w1')[cb.ADHOC]), ('', 'true'))
+        self.assertAlmostEqual(int(self.config('cbx-w1')[cb.EXPIRES]), time.time() + 600, delta=5)
+        self.assertIn('cbx-w1', cb.adhoc_vms())
+        self.assertNotIn('cbx-old', cb.adhoc_vms())
+
+    def test_a_claimed_vm_is_nobodys_until_its_checks_pass(self):
+        self.add('cbx-w1', 'offline:b1')
+        seen = []
+
+        def agent(*_, **__):
+            self.warm_file.parent.joinpath('vm-max').write_text('1\n')
+            with self.assertRaisesRegex(SystemExit, 'no ad-hoc VM named cbx-w1'):
+                cb.main(['vm', 'down', 'cbx-w1'])
+            seen.append((self.config('cbx-w1')[cb.WARM], quiet(cb.main, ['vm', 'list']), cb.orphan(json.loads(
+                self.rows.read_text())[0], set()), bool(cb.past_vm_max('cbx-other', []))))
+            self.warm_file.parent.joinpath('vm-max').unlink()
+            return argparse.Namespace(returncode=0)
+        cb.subprocess.run.side_effect = agent
+        self.assertEqual(cb.claim_warm('offline', 600), 'cbx-w1')
+        self.assertEqual(seen, [('claimed', (0, ''), False, True)])
+        self.assertEqual(self.destroyed, [])
+
+    def test_a_vm_a_refill_retired_during_its_claim_is_deleted_not_handed_out(self):
+        self.add('cbx-w1', 'offline:b1')
+
+        def retire(*_, **__):
+            self.ic('config', 'set', 'cbx-w1', f'{cb.WARM}=retired')
+            return argparse.Namespace(returncode=0)
+        cb.subprocess.run.side_effect = retire
+        self.assertEqual(quiet(cb.claim_warm, 'offline', 600)[0], None)
+        self.assertEqual(self.destroyed, ['cbx-w1'])
+        self.assertNotIn('cbx-w1', cb.adhoc_vms())
+
+    def test_a_claim_uses_the_build_read_under_the_host_lock(self):
+        self.add('cbx-w1', 'offline:b1')
+        build = self.tmp / 'build'
+        build.write_text('b1')
+        context = multiprocessing.get_context('fork')
+        held, release = context.Event(), context.Event()
+
+        def hold():
+            with cb.host_lock():
+                held.set()
+                release.wait(20)
+        self.fork(hold)
+        self.assertTrue(held.wait(10))
+        with mock.patch.object(cb, 'warm_build', build.read_text):
+            claimer = self.fork(lambda: os._exit(0 if cb.claim_warm('offline', 600) is None else 1))
+            time.sleep(0.3)
+            build.write_text('b2')
+            release.set()
+            claimer.join(20)
+        self.assertEqual(claimer.exitcode, 0)
+        self.assertEqual(self.config('cbx-w1')[cb.WARM], 'offline:b1')
+
+    def test_a_claimed_vm_whose_agent_does_not_answer_is_deleted_not_handed_out(self):
+        self.add('cbx-w1', 'offline:b1')
+        cb.subprocess.run.return_value = argparse.Namespace(returncode=1)
+        self.assertEqual(quiet(cb.claim_warm, 'offline', 600)[0], None)
+        self.assertEqual(self.destroyed, ['cbx-w1'])
+
+    def test_a_claim_respects_the_ad_hoc_limit(self):
+        self.warm_file.parent.joinpath('vm-max').write_text('1\n')
+        self.add('cbx-mine', None)
+        self.add('cbx-w1', 'offline:b1')
+        self.assertIsNone(cb.claim_warm('offline', 600))
+        self.assertEqual(self.config('cbx-w1')[cb.WARM], 'offline:b1')
+
+    def test_a_pending_claim_counts_against_the_ad_hoc_limit(self):
+        self.warm_file.parent.joinpath('vm-max').write_text('1\n')
+        self.add('cbx-w1', 'claimed')
+        self.add('cbx-w2', 'offline:b1')
+        self.assertIsNone(cb.claim_warm('offline', 600))
+        self.assertEqual(self.config('cbx-w2')[cb.WARM], 'offline:b1')
+        self.assertEqual(quiet(cb.main, ['vm', 'list']), (0, ''))
+
+    def test_a_claimed_vm_is_never_returned_to_the_pool_and_is_replaced(self):
+        self.warm_file.write_text('offline\n')
+        self.add('cbx-w1', 'offline:b1')
+        self.assertEqual(cb.claim_warm('offline', 600), 'cbx-w1')
+        with mock.patch.object(cb, 'new_id', lambda: 'cbx-w2'):
+            self.assertEqual(cb.fill_warm(), 0)
+        self.assertEqual((self.booted, self.destroyed), (['cbx-w2'], []))
+        self.assertFalse(self.config('cbx-w1')[cb.WARM])
+        self.assertEqual(self.config('cbx-w2')[cb.WARM], 'offline:b1')
+        self.assertNotIn(cb.ADHOC, self.config('cbx-w2'))
+        self.assertAlmostEqual(int(self.config('cbx-w2')[cb.EXPIRES]), time.time() + cb.WARM_TTL, delta=5)
+        self.assertIsNone(cb.claim_warm('online', 600))
+        self.assertEqual(cb.claim_warm('offline', 600), 'cbx-w2')
+
+    def test_fill_deletes_warm_vms_of_an_old_build_unlisted_shape_leftover_boot_or_near_their_ttl(self):
+        self.warm_file.write_text('offline online\n')
+        self.add('cbx-old', 'offline:b0')
+        self.add('cbx-boot', 'booting')
+        self.add('cbx-due', 'online:b1', expires=int(time.time()) + 60)
+        self.add('cbx-keep', 'offline:b1')
+        self.add('cbx-extra', 'offline:b1')
+        self.add('cbx-mine', None)
+        self.add('cbx-claiming', 'claimed', expires=int(time.time()) + 600)
+        self.add('cbx-crashed', 'claimed', expires=int(time.time()) - 5)
+        with mock.patch.object(cb, 'new_id', lambda: 'cbx-new'):
+            self.assertEqual(cb.fill_warm(), 0)
+        self.assertEqual(self.destroyed, ['cbx-old', 'cbx-boot', 'cbx-due', 'cbx-extra', 'cbx-crashed'])
+        self.assertEqual(self.booted, ['cbx-new'])
+        self.assertEqual(self.config('cbx-new')[cb.WARM], 'online:b1')
+        self.assertEqual(self.config('cbx-keep')[cb.WARM], 'offline:b1')
+
+    def test_fill_keeps_no_warm_vms_without_the_file_on_the_primary_or_with_a_bad_file(self):
+        for text, ci_hosts, failed in ((None, None, 0), ('offline', {'primary': os.uname().nodename, 'overflow': []}, 0),
+                                       ('offline offline offline', None, 1), ('fast', None, 1)):
+            with self.subTest(text=text, ci_hosts=ci_hosts):
+                self.warm_file.unlink(missing_ok=True)
+                self.warm_file.parent.joinpath('ci-hosts.json').unlink(missing_ok=True)
+                if text:
+                    self.warm_file.write_text(text)
+                if ci_hosts:
+                    cb.write_json(self.tmp / 'ci-hosts.json', ci_hosts)
+                self.save([])
+                self.add('cbx-w1', 'offline:b1')
+                self.destroyed.clear()
+                self.assertEqual(quiet(cb.fill_warm)[0], failed)
+                self.assertEqual((self.booted, self.destroyed), ([], ['cbx-w1']))
+
+    def test_a_refill_admits_as_warm_and_gives_a_boot_five_minutes(self):
+        self.warm_file.write_text('offline\n')
+        admitted, deadlines = [], []
+        original = cb.boot
+
+        def boot(name, expires, *args, **kwargs):
+            deadlines.append(expires)
+            return original(name, expires, *args, **kwargs)
+        with mock.patch.multiple(cb, new_id=lambda: 'cbx-new', admit=lambda *a: admitted.append(a) or True, boot=boot):
+            self.assertEqual(cb.fill_warm(), 0)
+        self.assertEqual(admitted, [('warm', 'cbx-new', 'warm')])
+        self.assertAlmostEqual(deadlines[0], time.time() + cb.WARM_BOOT, delta=5)
+
+    def test_a_cold_vm_up_refused_at_the_ceiling_takes_a_warm_vms_place(self):
+        self.warm_file.write_text('offline\n')
+        self.add('cbx-w1', 'offline:b1')
+        answers = iter([False, True])
+        with mock.patch.multiple(cb, admit=lambda *a: next(answers), new_id=lambda: 'cbx-cold'):
+            self.assertEqual(quiet(cb.main, ['vm', 'up', '--here']), (0, 'cbx-cold\n'))
+        self.assertEqual((self.destroyed, self.booted), (['cbx-w1'], ['cbx-cold']))
+
+    def test_a_vm_retired_while_it_started_is_deleted_not_published(self):
+        self.warm_file.write_text('offline\n')
+        with mock.patch.multiple(cb, new_id=lambda: 'cbx-new',
+                                 push_guest_files=lambda name, *, mode: cb.yield_warm()):
+            self.assertEqual(quiet(cb.fill_warm)[0], 1)
+        self.assertEqual(self.config('cbx-new')[cb.WARM], 'retired')
+        self.assertEqual(self.destroyed, ['cbx-new', 'cbx-new'])
+
+    def test_a_vm_whose_build_changed_while_it_started_is_deleted(self):
+        self.warm_file.write_text('offline\n')
+        builds = iter(['b1', 'b2'])
+        with mock.patch.multiple(cb, new_id=lambda: 'cbx-new', warm_build=lambda: next(builds)):
+            self.assertEqual(quiet(cb.fill_warm)[0], 1)
+        self.assertEqual(self.destroyed, ['cbx-new'])
+        self.assertEqual(self.config('cbx-new')[cb.WARM], 'booting')
+
+    def test_vm_up_uses_a_warm_vm_only_when_listed_and_asked_for_nothing_else(self):
+        refill = mock.Mock()
+        with mock.patch.multiple(cb, fill_warm_later=refill, new_id=lambda: 'cbx-cold',
+                                 claim_warm=mock.Mock(return_value='cbx-w1')):
+            self.assertEqual(quiet(cb.main, ['vm', 'up', '--offline']), (0, 'cbx-cold\n'))
+            cb.claim_warm.assert_not_called()
+            self.warm_file.write_text('offline\n')
+            self.assertEqual(quiet(cb.main, ['vm', 'up', '--offline', '--ttl', '60']), (0, 'cbx-w1\n'))
+            cb.claim_warm.assert_called_once_with('offline', 60)
+            refill.assert_called_once_with()
+            self.assertEqual(self.booted, ['cbx-cold'])
+            for argv in (['--offline', '--disk', '1GiB'], []):
+                with self.subTest(argv=argv), mock.patch.object(cb, 'vm_disk', lambda: 40 * GIB):
+                    self.assertEqual(quiet(cb.main, ['vm', 'up', *argv]), (0, 'cbx-cold\n'))
+            self.assertEqual(cb.claim_warm.call_count, 1)
+
+    def test_vm_list_exec_and_down_never_see_a_warm_vm(self):
+        self.add('cbx-w1', 'offline:b1')
+        self.assertEqual(quiet(cb.main, ['vm', 'list']), (0, ''))
+        for args in (['down', 'cbx-w1'], ['exec', 'cbx-w1', 'true']):
+            with self.subTest(args=args), self.assertRaisesRegex(SystemExit, 'no ad-hoc VM named cbx-w1'):
+                cb.main(['vm', *args])
+        self.assertEqual(self.destroyed, [])
+
+
+class WarmBuild(unittest.TestCase):
+    def test_the_build_changes_with_the_guest_overlay_but_not_without_a_change(self):
+        guest = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, guest)
+        (guest / 'opt').mkdir()
+        tool = guest / 'opt' / 'tool'
+        tool.write_text('one')
+        rows = {'created_at': 't1', 'config': {}, 'devices': {}}
+        with mock.patch.multiple(cb, GUEST_FILES=guest, query=lambda _: rows):
+            first = cb.warm_build()
+            self.assertEqual(cb.warm_build(), first)
+            builds = {first}
+            for change in (lambda: tool.write_text('three'), lambda: tool.chmod(0o755),
+                           lambda: (guest / 'opt' / 'new').write_text('x'), lambda: rows.update(created_at='t2')):
+                change()
+                builds.add(cb.warm_build())
+            self.assertEqual(len(builds), 5)
+
+
+class WarmOrphan(unittest.TestCase):
+    def test_reap_does_not_take_a_warm_vm_for_an_orphan(self):
+        self.assertFalse(cb.orphan({'name': 'cbx-w', 'config': {'user.coldbox.warm': 'offline:b1'}}, set()))
+        self.assertTrue(cb.orphan({'name': 'cbx-x', 'config': {}}, set()))
+
+
+class JobLogTests(unittest.TestCase):
+    def run_runner(self, junit, cold_verify, log_text, *, log_error=None, job_result='Succeeded'):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.addCleanup(cb.CLEANUP.clear)
+        summary = json.dumps(dict(cb.junit_summary([Path(folder.name) / 'none']), total=junit or 0, skipped=0,
+                                  files=[] if junit is None else ['report.xml'], cold_verify=cold_verify))
+
+        def run(command, *args, **kwargs):
+            return subprocess.CompletedProcess(command, 0, summary if 'junit' in command else '', '')
+
+        def runner(command, out, data=None):
+            out.write(f'Running job: verify\nJob verify completed with result: {job_result}\n'.encode())
+            out.flush()
+            return 0
+
+        github = dict(repo='org/app', sha='f' * 40, run_id='4507', run_attempt='2', refused=None)
+        jobs = {'jobs': [dict(id=77, runner_name='cbx-1-test', created_at='2026-01-01T00:00:00Z',
+                              started_at='2026-01-01T00:00:10Z', completed_at='2026-01-01T00:01:40Z')]}
+        opened = []
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def open(self, request, timeout=30):
+                opened.append(request)
+                if log_error is not None:
+                    raise log_error
+                return Response(log_text.encode())
+
+        with mock.patch.multiple(cb, boot=mock.DEFAULT, ic=mock.DEFAULT, destroy=lambda name: True,
+                                 runner_admission=lambda *a: dict(host='h'), gh=lambda *a, **kw: jobs,
+                                 app_token=lambda path='': 'tok',
+                                 pull=lambda name, path: github if path.endswith('job.json') else None,
+                                 tee=runner), \
+                mock.patch.object(cb.subprocess, 'run', run), \
+                mock.patch.object(cb.urllib.request, 'build_opener', return_value=Opener()), \
+                mock.patch.object(cb.time, 'sleep'):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                cb.job('runner', 'cbx-1-test', 60, ['run.sh'], repo='org/app', receipts=folder.name)
+        return json.loads((Path(folder.name) / 'cbx-1-test.json').read_text()), opened
+
+    def test_runner_job_log_supplies_unittest_count_when_no_structured_report_exists(self):
+        log = '\n'.join([
+            '\ufeff2026-11-24T12:18:17.6071701Z ##[group]Run python3 -m unittest discover -s tests -v',
+            '2026-11-24T12:18:17.6074969Z python3 -m unittest discover -s tests -v',
+            '2026-11-24T12:18:17.6130987Z shell: /usr/bin/bash -e {0}',
+            '2026-11-24T12:18:17.6131860Z ##[endgroup]',
+            '2026-11-24T12:18:17.8708938Z \x1b[32mtest_one (test_app.AppTest.test_one) ... ok\x1b[0m',
+            '2026-11-24T12:19:50.8354708Z ----------------------------------------------------------------------',
+            '2026-11-24T12:19:50.8357014Z Ran 25 tests in 92.988s',
+            '2026-11-24T12:19:50.8357894Z ',
+            '2026-11-24T12:19:50.8358784Z OK',
+            '2026-11-24T12:19:50.9452428Z Post job cleanup.',
+        ])
+        receipt, opened = self.run_runner(None, [], log)
+        self.assertEqual((receipt['tests_ran'], receipt['tests_source'], receipt['verdict']),
+                         (25, 'job-log', 'pass'))
+        self.assertNotIn('reason', receipt)
+        self.assertNotIn('tests_missing_reason', receipt)
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(opened[0].full_url, 'https://api.github.com/repos/org/app/actions/jobs/77/logs')
+
+    def test_job_log_parser_sums_multiple_unittest_runs_and_subtracts_skips(self):
+        multi = '\n'.join([
+            '2026-11-24T14:26:40.8716565Z ----------------------------------------------------------------------',
+            '2026-11-24T14:26:40.8718533Z Ran 130 tests in 59.566s',
+            '2026-11-24T14:26:40.8719185Z ',
+            '2026-11-24T14:26:40.8719604Z OK',
+            '2026-11-24T14:27:28.6942322Z ----------------------------------------------------------------------',
+            '2026-11-24T14:27:28.6943915Z Ran 9 tests in 36.430s',
+            '2026-11-24T14:27:28.6945309Z ',
+            '2026-11-24T14:27:28.6945746Z OK',
+        ])
+        self.assertEqual(cb.job_log_tests_ran(multi), 139)
+        self.assertEqual(cb.job_log_tests_ran('----------\nRan 1 test in 0.001s\n\nOK\n'), 1)
+        self.assertEqual(cb.job_log_tests_ran('----------\nRan 10 tests in 0.050s\n\nOK (skipped=3)\n'), 7)
+        self.assertEqual(cb.job_log_tests_ran('----------\nRan 5 tests in 0.010s\n\nOK (skipped=5)\n'), 0)
+        self.assertEqual(cb.job_log_tests_ran('----------\nRan 0 tests in 0.000s\n\nNO TESTS RAN\n'), 0)
+        self.assertEqual(cb.job_log_tests_ran('----------\nRan 12 tests in 0.500s\n\nFAILED (failures=1, skipped=2)\n'), 10)
+        echoed = '\n'.join([
+            '2026-11-24T15:36:20.9575320Z ##[group]Run printf "----------\\nRan 99 tests in 1.0s\\n\\nOK\\n"',
+            '2026-11-24T15:36:20.9580000Z ----------',
+            '2026-11-24T15:36:20.9581000Z Ran 99 tests in 1.000s',
+            '2026-11-24T15:36:20.9582000Z ',
+            '2026-11-24T15:36:20.9583000Z OK',
+            '2026-11-24T15:36:20.9630541Z ##[endgroup***',
+            '2026-11-24T15:37:14.8876934Z Export screen exited 0',
+        ])
+        self.assertIsNone(cb.job_log_tests_ran(echoed))
+
+    def test_job_log_parser_counts_pytest_cargo_and_go_and_ignores_non_test_logs(self):
+        self.assertEqual(cb.job_log_tests_ran('2026-11-24T00:00:01Z ====== 12 passed, 2 skipped in 0.45s ======\n'), 12)
+        self.assertEqual(cb.job_log_tests_ran('2026-11-24T00:00:01Z 5 passed, 1 failed, 1 warning in 1.20s\n'), 6)
+        self.assertEqual(cb.job_log_tests_ran('2026-11-24T00:00:01Z 10 passed in 75.00s (0:01:15)\n'), 10)
+        self.assertEqual(cb.job_log_tests_ran('2026-11-24T00:00:01Z 3 skipped in 0.01s\n'), 0)
+        cargo = ('2026-11-24T00:00:01Z test result: ok. 12 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'
+                 '2026-11-24T00:00:02Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n')
+        self.assertEqual(cb.job_log_tests_ran(cargo), 12)
+        go = ('2026-11-24T00:00:01Z --- PASS: TestOne (0.00s)\n'
+              '2026-11-24T00:00:02Z     --- FAIL: TestTwo/sub (0.01s)\n'
+              '2026-11-24T00:00:03Z --- SKIP: TestThree (0.00s)\n')
+        self.assertEqual(cb.job_log_tests_ran(go), 2)
+        self.assertIsNone(cb.job_log_tests_ran('2026-11-24T00:00:01Z live check: 7 pages at https://example.com\n'))
+        self.assertIsNone(cb.job_log_tests_ran('2026-11-24T00:00:01Z ====== 2 warnings in 0.01s ======\n'))
+
+    def test_structured_reports_take_precedence_over_job_log(self):
+        log = '----------\nRan 25 tests in 1.000s\n\nOK\n'
+        for junit, cold_verify, expected in (
+                (0, [], (0, 'junit', 'incomplete')),
+                (5, [], (5, 'junit', 'pass')),
+                (None, [0], (0, 'cold-verify', 'incomplete')),
+                (None, [None], (None, 'cold-verify', 'incomplete')),
+                (None, [412], (412, 'cold-verify', 'pass'))):
+            with self.subTest(junit=junit, cold_verify=cold_verify):
+                receipt, opened = self.run_runner(junit, cold_verify, log)
+                self.assertEqual((receipt.get('tests_ran'), receipt['tests_source'], receipt['verdict']), expected)
+                self.assertEqual(opened, [])
+
+    def test_job_log_unavailable_and_all_skipped_stay_incomplete(self):
+        error = cb.urllib.error.HTTPError('https://api.github.com/repos/org/app/actions/jobs/77/logs', 404, 'Not Found', {}, None)
+        receipt, opened = self.run_runner(None, [], '', log_error=error)
+        self.assertEqual((receipt['tests_ran'], receipt['tests_source'], receipt['verdict'],
+                          receipt.get('tests_missing_reason')), (0, None, 'incomplete', 'no_test_report'))
+        self.assertNotIn('error', receipt)
+        self.assertEqual(len(opened), 3)
+        skipped, _ = self.run_runner(None, [], '----------\nRan 4 tests in 0.010s\n\nOK (skipped=4)\n')
+        self.assertEqual((skipped['tests_ran'], skipped['tests_source'], skipped['verdict']),
+                         (0, 'job-log', 'incomplete'))
+
+    def test_log_redirect_strips_auth_and_rejects_plain_http(self):
+        handler = cb.LogRedirect()
+        request = cb.urllib.request.Request(
+            'https://api.github.com/repos/org/app/actions/jobs/77/logs',
+            headers={'Authorization': 'Bearer secret', 'X-GitHub-Api-Version': '2022-11-28',
+                     'Accept': 'application/vnd.github+json', 'User-Agent': 'coldbox'})
+        moved = handler.redirect_request(request, None, 302, 'Found', {}, 'https://logs.example.test/job.txt?sig=1')
+        self.assertIsNotNone(moved)
+        headers = {k.lower() for k in list(moved.headers) + list(moved.unredirected_hdrs)}
+        self.assertNotIn('authorization', headers)
+        self.assertNotIn('x-github-api-version', headers)
+        self.assertNotIn('accept', headers)
+        self.assertIn('user-agent', headers)
+        with self.assertRaises(cb.urllib.error.HTTPError) as rejected:
+            handler.redirect_request(request, None, 302, 'Found', {}, 'http://logs.example.test/job.txt')
+        rejected.exception.close()
+
+
+class AsyncTeardown(unittest.TestCase):
+    def test_job_returns_before_slow_destroy_and_background_reaper_finalizes_receipt(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.addCleanup(cb.CLEANUP.clear)
+        destroy_started = cb.threading.Event()
+        allow_destroy = cb.threading.Event()
+        callbacks = []
+
+        def slow_destroy(name):
+            destroy_started.set()
+            allow_destroy.wait(10)
+            return True, None, 0.25
+
+        reaper = cb.TeardownReaper(max_workers=2, max_pending=2)
+        self.addCleanup(reaper.drain, 5, close=True)
+        with mock.patch.multiple(cb, STATE=state, HOST_CHECKS=state / 'no-checks',
+                                 GUEST_FILES=state / 'no-guest', boot=lambda *a, **k: {},
+                                 ic=mock.DEFAULT, ic_exec=lambda *a, **k: ['true'],
+                                 tee=lambda *a: 0, pull=lambda *a: None, collect_tests=mock.DEFAULT,
+                                 vm_resources=lambda name: {}, copy_artifacts=lambda name, folder: ([], True),
+                                 destroy_job=slow_destroy):
+            receipt = quiet(lambda: cb.job('adhoc', 'cbx-1-async', 60, ['true'], 'adhoc',
+                                           receipts=state / 'receipts', teardown=reaper,
+                                           on_teardown=callbacks.append))[0]
+            self.assertEqual(receipt['vm']['teardown'], 'async')
+            self.assertFalse(receipt['vm']['destroyed'])
+            self.assertTrue(destroy_started.wait(5))
+            self.assertIn('cbx-1-async', cb.tearing_down(state / 'teardown', prune=False))
+            allow_destroy.set()
+            self.assertTrue(reaper.drain(timeout=5, close=True))
+
+        self.assertEqual(cb.tearing_down(state / 'teardown', prune=False), set())
+        saved = json.loads((state / 'receipts' / 'cbx-1-async.json').read_text())
+        self.assertTrue(saved['vm']['destroyed'])
+        self.assertEqual(saved['vm']['destroy_seconds'], 0.25)
+        self.assertEqual(saved['verdict'], 'pass')
+        self.assertEqual(len(callbacks), 1)
+        self.assertTrue(callbacks[0]['vm']['destroyed'])
+
+    def test_reaper_enforces_bounded_concurrency_and_clean_shutdown_drain(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        lock = cb.threading.Lock()
+        active = peak = 0
+        done = []
+        started = [cb.threading.Event() for _ in range(4)]
+        release = cb.threading.Event()
+
+        def make_task(index):
+            def run():
+                nonlocal active, peak
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                started[index].set()
+                release.wait(10)
+                with lock:
+                    active -= 1
+                    done.append(index)
+            return run
+
+        reaper = cb.TeardownReaper(max_workers=2, max_pending=3)
+        self.addCleanup(reaper.drain, 5, close=True)
+        with mock.patch.object(cb, 'STATE', state):
+            for i in range(3):
+                reaper.submit(f'cbx-1-t{i}', make_task(i))
+            self.assertTrue(started[0].wait(5))
+            self.assertTrue(started[1].wait(5))
+            self.assertFalse(started[2].wait(0.1))
+            self.assertEqual(peak, 2)
+            fourth_done = cb.threading.Event()
+            def submit_fourth():
+                reaper.submit('cbx-1-t3', make_task(3))
+                fourth_done.set()
+            waiter = cb.threading.Thread(target=submit_fourth, daemon=True)
+            waiter.start()
+            self.assertFalse(fourth_done.wait(0.1))
+            release.set()
+            self.assertTrue(fourth_done.wait(5))
+            self.assertTrue(reaper.drain(timeout=5, close=True))
+            self.assertEqual(sorted(done), [0, 1, 2, 3])
+            self.assertLessEqual(peak, 2)
+            self.assertEqual(cb.tearing_down(state / 'teardown', prune=False), set())
+            sync_ran = []
+            reaper.submit('cbx-1-sync', lambda: sync_ran.append(True))
+            self.assertEqual(sync_ran, [True])
+            self.assertEqual(cb.tearing_down(state / 'teardown', prune=False), set())
+
+    def test_reap_respects_live_async_teardown_and_reclaims_crashed_teardown(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (state / 'workers').mkdir(parents=True)
+        (state / 'receipts').mkdir(parents=True)
+        (state / 'teardown').mkdir(parents=True)
+        future = str(int(time.time()) + 3600)
+        for vm_name in ('cbx-1-live', 'cbx-1-crashed'):
+            cb.write_json(state / 'receipts' / f'{vm_name}.json',
+                          dict(schema='coldbox.receipt/v1', id=vm_name, mode='local', repo='me/app',
+                               verdict='incomplete', started_at=cb.now_iso(),
+                               vm=dict(name=vm_name, ttl_seconds=3600, destroyed=False)))
+        rows = [dict(name='cbx-1-live', status='Running', config={cb.MANAGED: 'true', cb.EXPIRES: future}),
+                dict(name='cbx-1-crashed', status='Running', config={cb.MANAGED: 'true', cb.EXPIRES: future})]
+        destroyed = []
+
+        def fake_destroy(name):
+            destroyed.append(name)
+            rows[:] = [row for row in rows if row['name'] != name]
+            return True
+
+        with mock.patch.multiple(cb, STATE=state, sync_acl=mock.DEFAULT, mark_host_objects=mock.DEFAULT,
+                                 ic=lambda *a: json.dumps(rows), destroy=fake_destroy,
+                                 VM_WARM=state / 'no-vm-warm', WARM_POOL=state / 'no-warm-pool'):
+            cb.note_teardown('cbx-1-live')
+            (state / 'teardown' / 'cbx-1-crashed').write_text(json.dumps([999999, 'stale-start', 'cbx-1-crashed']))
+            code, _ = quiet(cb.reap, argparse.Namespace(keep_days=0))
+        self.assertEqual(code, 0)
+        self.assertEqual(destroyed, ['cbx-1-crashed'])
+        self.assertTrue((state / 'teardown' / 'cbx-1-live').exists())
+        self.assertFalse((state / 'teardown' / 'cbx-1-crashed').exists())
+        self.assertFalse(json.loads((state / 'receipts' / 'cbx-1-live.json').read_text())['vm']['destroyed'])
+        crashed_receipt = json.loads((state / 'receipts' / 'cbx-1-crashed.json').read_text())
+        self.assertTrue(crashed_receipt['vm']['destroyed'])
+        self.assertEqual(crashed_receipt['cause'], 'worker_interrupted')
+
+    def test_serve_worker_async_teardown_starts_next_job_before_prior_vm_destroy_and_drains_on_stop(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.addCleanup(cb.CLEANUP.clear)
+        self.addCleanup(cb.DRAINING.clear)
+        self.addCleanup(cb.wait_for_teardowns, True)
+        handler_term = cb.signal.getsignal(cb.signal.SIGTERM)
+        handler_usr1 = cb.signal.getsignal(cb.signal.SIGUSR1)
+        self.addCleanup(cb.signal.signal, cb.signal.SIGTERM, handler_term)
+        self.addCleanup(cb.signal.signal, cb.signal.SIGUSR1, handler_usr1)
+        first_destroying = cb.threading.Event()
+        second_started = cb.threading.Event()
+        destroyed, published = [], []
+        names = iter(['cbx-1-first', 'cbx-2-second'])
+
+        def fake_destroy_job(name):
+            if name == 'cbx-1-first':
+                first_destroying.set()
+                self.assertTrue(second_started.wait(10), 'second job did not start while first VM was destroying')
+            destroyed.append(name)
+            return True, None, 0.1
+
+        def fake_tee(command, log, stdin=None):
+            if 'cbx-2-second' in command:
+                second_started.set()
+                cb.DRAINING.set()
+            log.write(b'Running job: verify\nJob verify completed with result: Succeeded\n')
+            log.flush()
+            return 0
+
+        def fake_run(command, *args, **kwargs):
+            if 'junit' in command:
+                return subprocess.CompletedProcess(command, 0, json.dumps(dict(
+                    cb.junit_summary([]), total=1, skipped=0, files=['r.xml'], cold_verify=[])), '')
+            return subprocess.CompletedProcess(command, 0, '', '')
+
+        def fake_pull(name, path):
+            if path.endswith('job.json'):
+                return dict(repo='me/app', sha='a' * 40, refused=None)
+            return None
+
+        args = argparse.Namespace(target='me/app', worker=True, slots=1, ttl=60, allow_public=False,
+                                  once=False, idle=0, name=None, size='default')
+        with mock.patch.multiple(cb, STATE=state, TEARDOWN_REAPER=None, HOST_CHECKS=state / 'no-checks',
+                                 GUEST_FILES=state / 'no-guest', WARM_POOL=state / 'no-warm-pool',
+                                 ci_host=lambda: ('h', 'h'), guard=lambda *a: None,
+                                 admit=lambda t, n, k, *a: cb.note_worker(os.getpid(), t, n, k) or True,
+                                 new_id=lambda: next(names),
+                                 gh=lambda *a, **k: {'runner': {'id': 7}, 'encoded_jit_config': 'tok'},
+                                 boot=lambda *a, **k: {}, ic=mock.DEFAULT,
+                                 ic_exec=lambda name, *cmd, **k: [name, *cmd],
+                                 tee=fake_tee, pull=fake_pull, strict_receipt=lambda *a: None,
+                                 record_queue_wait=mock.DEFAULT, vm_resources=lambda name: {},
+                                 copy_artifacts=lambda name, folder: ([], True),
+                                 destroy_job=fake_destroy_job,
+                                 publish_verify=lambda target, name, receipt: published.append((name, receipt['vm']['destroyed'], receipt['verdict'])),
+                                 host_cpus=lambda: 4), \
+                mock.patch.object(cb.subprocess, 'run', side_effect=fake_run):
+            code = quiet(cb.serve, args)[0]
+
+        self.assertEqual(code, 143)
+        self.assertTrue(first_destroying.is_set())
+        self.assertTrue(second_started.is_set())
+        self.assertEqual(sorted(destroyed), ['cbx-1-first', 'cbx-2-second'])
+        self.assertEqual(sorted(published), [('cbx-1-first', True, 'pass'), ('cbx-2-second', True, 'pass')])
+        self.assertEqual(cb.tearing_down(state / 'teardown', prune=False), set())
+
+    def test_interrupt_runs_teardown_synchronously(self):
+        state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.addCleanup(cb.CLEANUP.clear)
+        reaper = cb.TeardownReaper(max_workers=1, max_pending=2)
+        self.addCleanup(reaper.drain, 5, close=True)
+        destroyed = []
+        with mock.patch.multiple(cb, STATE=state, HOST_CHECKS=state / 'no-checks',
+                                 GUEST_FILES=state / 'no-guest', boot=lambda *a, **k: {},
+                                 ic=mock.DEFAULT, ic_exec=lambda *a, **k: ['true'],
+                                 tee=mock.Mock(side_effect=SystemExit(143)), pull=lambda *a: None,
+                                 vm_resources=lambda name: {}, copy_artifacts=lambda name, folder: ([], True),
+                                 destroy_job=lambda name: destroyed.append(name) or (True, None, 0.05)), \
+                mock.patch.object(cb.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')):
+            with self.assertRaises(SystemExit):
+                quiet(lambda: cb.job('adhoc', 'cbx-1-int', 60, ['true'], 'adhoc',
+                                     receipts=state / 'receipts', teardown=reaper))
+        self.assertEqual(destroyed, ['cbx-1-int'])
+        saved = json.loads((state / 'receipts' / 'cbx-1-int.json').read_text())
+        self.assertTrue(saved['vm']['destroyed'])
+        self.assertNotIn('teardown', saved['vm'])
+
+
+class WarmStandbyPool(unittest.TestCase):
+    def setUp(self):
+        def hung(*_):
+            raise TimeoutError('WarmStandbyPool test ran past 60 s')
+        signal.signal(signal.SIGALRM, hung)
+        signal.alarm(60)
+        self.addCleanup(signal.alarm, 0)
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.rows = self.tmp / 'rows.json'
+        self.pool_file = self.tmp / 'warm-pool'
+        self.booted, self.destroyed, self.pushed_modes = [], [], []
+        self.orig_warm_job_stamp = cb.warm_job_stamp
+        self.orig_push_guest_files = cb.push_guest_files
+        self.save([])
+        patches = dict(STATE=self.tmp / 'state', WARM_POOL=self.pool_file,
+                       HOST_CHECKS=self.tmp / 'no-checks', GUEST_FILES=self.tmp / 'no-guest',
+                       ic=self.ic, warm_job_stamp=lambda *, base=cb.BASE, offline=False: f"{'offline' if offline else 'online'}:s1",
+                       sync_acl=lambda: None, isolated=lambda name, offline: None,
+                       admit=lambda t, n, k, *a: cb.note_worker(os.getpid(), t, n, k) or True,
+                       boot=lambda name, expires, *a, **k: self.booted.append(name) or self.add(name, 'booting', expires),
+                       push_guest_files=lambda name, *, mode, strict_stamp=False: self.pushed_modes.append((name, mode)),
+                       destroy=lambda name: self.destroyed.append(name) or True)
+        for name, value in patches.items():
+            self.enterContext(mock.patch.object(cb, name, value))
+        self.enterContext(mock.patch.dict(os.environ, {'COLDBOX_WARM_POOL_SIZE': ''}))
+        self.enterContext(mock.patch.object(cb.subprocess, 'run',
+                                            return_value=subprocess.CompletedProcess([], 0, '', '')))
+
+    def save(self, rows):
+        staged = self.tmp / 'rows.tmp'
+        staged.write_text(json.dumps(rows))
+        os.replace(staged, self.rows)
+
+    def add(self, name, warm, expires=None, status='Running'):
+        config = {cb.EXPIRES: str(expires or int(time.time()) + cb.WARM_TTL)}
+        if warm is not None:
+            config[cb.WARM_JOB] = warm
+        self.save(json.loads(self.rows.read_text()) + [dict(name=name, status=status, config=config)])
+
+    def config(self, name):
+        return next(row['config'] for row in json.loads(self.rows.read_text()) if row['name'] == name)
+
+    def ic(self, *args):
+        if args[0] == 'list':
+            listed = self.rows.read_text()
+            time.sleep(0.05)
+            return listed
+        if args[:2] == ('config', 'get'):
+            return self.config(args[2]).get(args[3], '') + '\n'
+        if args[:2] == ('file', 'push'):
+            return ''
+        self.assertEqual(args[:2], ('config', 'set'))
+        rows = json.loads(self.rows.read_text())
+        for row in rows:
+            if row['name'] == args[2]:
+                for item in args[3:]:
+                    key, _, value = item.partition('=')
+                    row['config'][key] = value
+        self.save(rows)
+        return ''
+
+    def fork(self, target):
+        process = multiprocessing.get_context('fork').Process(target=target, daemon=True)
+        process.start()
+        self.addCleanup(process.join, 5)
+        self.addCleanup(process.kill)
+        return process
+
+    def test_warm_pool_defaults_to_zero_and_validates_config(self):
+        self.assertEqual(cb.warm_pool_size(), 0)
+        for text, expected in (('0\n', 0), ('2\n', 2), ('warm_pool_size = 3\n', 3), ('warm_pool_size = 0\n', 0), ('', 0)):
+            with self.subTest(text=text):
+                self.pool_file.write_text(text)
+                self.assertEqual(cb.warm_pool_size(), expected)
+        with mock.patch.dict(os.environ, {'COLDBOX_WARM_POOL_SIZE': '4'}):
+            self.assertEqual(cb.warm_pool_size(), 4)
+        for bad in ('-1\n', 'two\n', 'warm_pool_size = -1\n', 'other = 2\n', 'warm_pool_size = true\n'):
+            with self.subTest(bad=bad):
+                self.pool_file.write_text(bad)
+                with self.assertRaises(ValueError):
+                    cb.warm_pool_size()
+        with mock.patch.dict(os.environ, {'COLDBOX_WARM_POOL_SIZE': 'nope'}):
+            with self.assertRaises(ValueError):
+                cb.warm_pool_size()
+
+    def test_warm_job_stamp_changes_on_base_overlay_content_and_checks_changes(self):
+        guest = self.tmp / 'guest'
+        (guest / 'opt').mkdir(parents=True)
+        tool = guest / 'opt' / 'tool'
+        tool.write_text('aaa')
+        checks = self.tmp / 'checks.toml'
+        snapshot = {'created_at': 't1', 'config': {'volatile.base_image': 'a' * 64, 'volatile.uuid': 'u1'}}
+        profile = {'config': {'limits.cpu': '4'}, 'devices': {}}
+
+        def fake_query(path):
+            return snapshot if 'snapshots' in path else profile
+
+        with mock.patch.multiple(cb, GUEST_FILES=guest, HOST_CHECKS=checks, query=fake_query,
+                                 warm_job_stamp=self.orig_warm_job_stamp):
+            first = cb.warm_job_stamp(offline=False)
+            self.assertTrue(first.startswith('online:'))
+            self.assertEqual(cb.warm_job_stamp(offline=False), first)
+            stamps = {first, cb.warm_job_stamp(offline=True)}
+            for change in (
+                lambda: tool.write_text('bbb'),
+                lambda: tool.chmod(0o755),
+                lambda: (guest / 'opt' / 'extra').write_text('x'),
+                lambda: snapshot.update(created_at='t2'),
+                lambda: snapshot['config'].update({'volatile.base_image': 'b' * 64}),
+                lambda: checks.write_text('[checks]\nlint = false\n'),
+            ):
+                change()
+                stamps.add(cb.warm_job_stamp(offline=False))
+            self.assertEqual(len(stamps), 8)
+
+    def test_concurrent_claims_are_atomic_and_single_use(self):
+        self.pool_file.write_text('2\n')
+        self.add('cbx-w1', 'online:s1')
+        self.add('cbx-w2', 'online:s1')
+        results = multiprocessing.get_context('fork').Queue()
+        claimers = [self.fork(lambda: results.put(cb.claim_warm_job('me/app', 'base', 600))) for _ in range(3)]
+        for claimer in claimers:
+            claimer.join(20)
+        got = sorted([results.get(timeout=5) for _ in claimers], key=str)
+        self.assertEqual(got, [None, 'cbx-w1', 'cbx-w2'])
+        self.assertEqual(self.config('cbx-w1')[cb.WARM_JOB], '')
+        self.assertEqual(self.config('cbx-w2')[cb.WARM_JOB], '')
+        self.assertIsNone(cb.claim_warm_job('me/app', 'base', 600))
+        names = iter(['cbx-w3', 'cbx-w4'])
+        with mock.patch.object(cb, 'new_id', lambda: next(names)):
+            self.assertEqual(cb.fill_warm_pool(), 0)
+        self.assertEqual(self.booted, ['cbx-w3', 'cbx-w4'])
+        self.assertEqual(self.config('cbx-w3')[cb.WARM_JOB], 'online:s1')
+        self.assertEqual(self.config('cbx-w4')[cb.WARM_JOB], 'online:s1')
+
+    def test_fill_warm_pool_invalidates_stale_stamp_crashed_claims_and_excess_vms(self):
+        self.pool_file.write_text('warm_pool_size = 2\n')
+        live_claim = f'claimed:{os.getpid()}:{cb.process_start(os.getpid())}'
+        self.add('cbx-old', 'online:s0')
+        self.add('cbx-boot', 'booting')
+        self.add('cbx-due', 'online:s1', expires=int(time.time()) + 60)
+        self.add('cbx-keep1', 'online:s1')
+        self.add('cbx-keep2', 'online:s1')
+        self.add('cbx-extra', 'online:s1')
+        self.add('cbx-live-claim', live_claim, expires=int(time.time()) + 600)
+        self.add('cbx-dead-claim', 'claimed:999999:deadstart', expires=int(time.time()) + 600)
+        self.add('cbx-job', None)
+        self.assertEqual(cb.fill_warm_pool(), 0)
+        self.assertEqual(self.destroyed, ['cbx-old', 'cbx-boot', 'cbx-due', 'cbx-extra', 'cbx-dead-claim'])
+        self.assertEqual(self.booted, [])
+        self.assertEqual(self.config('cbx-live-claim')[cb.WARM_JOB], live_claim)
+        self.assertEqual(self.config('cbx-keep1')[cb.WARM_JOB], 'online:s1')
+        self.assertEqual(self.config('cbx-keep2')[cb.WARM_JOB], 'online:s1')
+
+        self.pool_file.write_text('3\n')
+        with mock.patch.object(cb, 'new_id', lambda: 'cbx-new3'):
+            self.assertEqual(cb.fill_warm_pool(), 0)
+        self.assertEqual(self.booted, ['cbx-new3'])
+        self.assertEqual(self.pushed_modes, [('cbx-new3', 'warm-pool')])
+        self.assertTrue((self.tmp / 'state' / 'ready' / 'cbx-new3').exists())
+        self.assertFalse((self.tmp / 'state' / 'workers' / str(os.getpid())).exists())
+
+    def test_claimed_warm_vm_that_fails_agent_or_stamp_check_is_destroyed(self):
+        self.pool_file.write_text('1\n')
+        self.add('cbx-w1', 'online:s1')
+        cb.subprocess.run.return_value = argparse.Namespace(returncode=1)
+        self.assertIsNone(quiet(cb.claim_warm_job, 'me/app', 'base', 600)[0])
+        self.assertEqual(self.destroyed, ['cbx-w1'])
+        self.assertFalse((self.tmp / 'state' / 'workers' / str(os.getpid())).exists())
+
+        self.destroyed.clear()
+        self.add('cbx-w2', 'online:s1')
+        cb.subprocess.run.return_value = argparse.Namespace(returncode=0)
+        stamps = iter(['online:s1', 'online:s2'])
+        with mock.patch.object(cb, 'warm_job_stamp', lambda *, base=cb.BASE, offline=False: next(stamps)):
+            self.assertIsNone(quiet(cb.claim_warm_job, 'me/app', 'base', 600)[0])
+        self.assertEqual(self.destroyed, ['cbx-w2'])
+        self.assertFalse((self.tmp / 'state' / 'workers' / str(os.getpid())).exists())
+
+    def test_job_uses_warm_claimed_vm_without_boot_and_destroys_after_single_job(self):
+        self.pool_file.write_text('1\n')
+        self.add('cbx-w1', 'online:s1')
+        receipts = self.tmp / 'receipts'
+        refilled = []
+        args = argparse.Namespace(path=None, command=['true'], ttl=60, offline=False, cpus=None, memory=None,
+                                  receipts=str(receipts))
+        with mock.patch.multiple(cb, fill_warm_pool_later=lambda: refilled.append(True),
+                                 ic_exec=lambda *a, **k: ['true'], tee=lambda *a: 0, pull=lambda *a: None,
+                                 collect_tests=mock.DEFAULT,
+                                 vm_resources=lambda name: {}, copy_artifacts=lambda name, folder: ([], True),
+                                 destroy_job=lambda name: self.destroyed.append(name) or (True, None, 0.1),
+                                 host_cpus=lambda: 4):
+            code = quiet(cb.run_adhoc, args)[0]
+        self.assertEqual(code, 0)
+        self.assertEqual(self.booted, [])
+        self.assertEqual(refilled, [True])
+        self.assertEqual(self.pushed_modes, [('cbx-w1', 'adhoc')])
+        self.assertEqual(self.destroyed, ['cbx-w1'])
+        saved = json.loads((receipts / 'cbx-w1.json').read_text())
+        self.assertEqual((saved['verdict'], saved['vm']['warm_claimed'], saved['vm']['boot_seconds'],
+                          saved['vm']['destroyed']), ('pass', True, 0.0, True))
+
+    def test_cold_job_yields_warm_pool_vm_at_ceiling_and_reap_manages_warm_pool(self):
+        self.pool_file.write_text('1\n')
+        self.add('cbx-w1', 'online:s1')
+        self.assertFalse(cb.orphan({'name': 'cbx-w1', 'config': {cb.WARM_JOB: 'online:s1'}}, set()))
+        answers = iter([False, True])
+        with mock.patch.object(cb, 'admit', side_effect=lambda *a, **k: next(answers)):
+            cb.admit_or_wait('me/app', 'cbx-cold', None)
+        self.assertEqual(self.destroyed, ['cbx-w1'])
+
+        self.destroyed.clear()
+        self.save([])
+        self.add('cbx-w2', 'online:s1')
+        self.pool_file.unlink()
+        with mock.patch.multiple(cb, sync_acl=mock.DEFAULT, mark_host_objects=mock.DEFAULT,
+                                 VM_WARM=self.tmp / 'no-vm-warm'):
+            code, _ = quiet(cb.reap, argparse.Namespace(keep_days=0))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.destroyed, ['cbx-w2'])
+
+    def test_push_guest_files_warm_pool_sets_overlay_stamp_for_fast_claim_skip(self):
+        guest = self.tmp / 'guest'
+        (guest / 'opt' / 'tool').mkdir(parents=True)
+        (guest / 'opt' / 'tool' / 'bin').write_text('ok')
+        stamps = {}
+        guest_calls = []
+
+        def fake_ic(*args):
+            if args[:2] == ('config', 'set'):
+                for item in args[3:]:
+                    k, _, v = item.partition('=')
+                    stamps[k] = v
+            return ''
+
+        def fake_run(command, *args, **kwargs):
+            if command[:1] == ['guest-exec']:
+                guest_calls.append(command[1:])
+            return subprocess.CompletedProcess(command, 0, b'', b'')
+
+        with mock.patch.multiple(cb, GUEST_FILES=guest, ic=fake_ic,
+                                 ic_exec=lambda name, *cmd, **k: ['guest-exec', *cmd],
+                                 overlay_state=lambda name, link: 'e' * 64,
+                                 query=lambda *a, **k: {'config': dict(stamps)},
+                                 push_guest_files=self.orig_push_guest_files), \
+                mock.patch.object(cb.subprocess, 'run', side_effect=fake_run):
+            cb.push_guest_files('cbx-w1', mode='warm-pool')
+            self.assertIn(cb.OVERLAY_STAMP, stamps)
+            self.assertTrue(any(cmd[0] == 'tar' for cmd in guest_calls))
+            self.assertTrue(any(cmd[0] == '/usr/bin/python3' for cmd in guest_calls))
+            guest_calls.clear()
+            cb.push_guest_files('cbx-w1', mode='runner')
+            self.assertEqual(guest_calls, [])
+
+    def test_autoscale_syncs_burst_name_after_warm_pool_claim(self):
+        state = self.tmp / 'state'
+        cb.note_worker(os.getpid(), 'me/app', 'cbx-warm-claimed', 'burst')
+        burst = argparse.Namespace(pid=os.getpid(), name='cbx-orig-name', size='default', poll=lambda: None)
+        args = argparse.Namespace(target='me/app', ttl=600, slots=0, allow_public=False)
+        github = FakeGitHub({'queued': [1], 'in_progress': []}, {1: queued(1)},
+                            runners=[dict(id=1, name='cbx-warm-claimed', status='online', busy=True, labels=[])])
+        with mock.patch.multiple(cb, STATE=state, host_lock=contextlib.nullcontext,
+                                 live_workers=lambda folder: [], host_vms=lambda: set(),
+                                 vm_memory=lambda: GIB, host_memory=lambda field='MemTotal': 16 * GIB,
+                                 query=lambda path: [], host_setting=lambda *a: 0, host_cpu_load=lambda: 0.0,
+                                 storage_room=lambda workers: (10, None), host_cpus=lambda: 12), \
+                mock.patch.object(cb.os, 'getloadavg', return_value=(0.0, 0.0, 0.0)), \
+                mock.patch.object(cb.subprocess, 'Popen', return_value=argparse.Namespace(pid=999999, poll=lambda: None)):
+            bursts = [burst]
+            quiet(cb.autoscale, github, args, bursts)
+        self.assertEqual(burst.name, 'cbx-warm-claimed')
+        self.assertEqual(len(bursts), 2)
+
+    def test_fill_warm_pool_later_uses_popen_close_fds_without_deadlocking_autoscale_lock(self):
+        state = self.tmp / 'fork-state'
+        state.mkdir(parents=True)
+        lock_path = state / 'autoscale.lock'
+        lock_path.touch()
+        pool_file = self.tmp / 'fork-warm-pool'
+        pool_file.write_text('0\n')
+        marker = self.tmp / 'refill-acquired.txt'
+        stub = self.tmp / 'stub_coldbox.py'
+        stub.write_text(
+            'import fcntl, os\n'
+            'from pathlib import Path\n'
+            'def fill_warm_pool():\n'
+            '    path = Path(os.environ["COLDBOX_STATE"]) / "autoscale.lock"\n'
+            '    with path.open("rb") as lock:\n'
+            '        fcntl.flock(lock, fcntl.LOCK_EX)\n'
+            '        Path(os.environ["REFILL_MARKER"]).write_text("ok")\n'
+        )
+        shared_held = cb.threading.Event()
+        release_shared = cb.threading.Event()
+
+        def hold_shared():
+            with lock_path.open('rb') as shared:
+                fcntl.flock(shared, fcntl.LOCK_SH)
+                shared_held.set()
+                release_shared.wait(10)
+
+        holder = cb.threading.Thread(target=hold_shared, daemon=True)
+        holder.start()
+        self.assertTrue(shared_held.wait(5))
+        real_popen = subprocess.Popen
+        spawned = []
+
+        def spy_popen(argv, **kwargs):
+            self.assertTrue(kwargs.get('close_fds'))
+            self.assertTrue(kwargs.get('start_new_session'))
+            proc = real_popen(argv, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        with mock.patch.dict(os.environ, COLDBOX_STATE=str(state), COLDBOX_WARM_POOL=str(pool_file),
+                             REFILL_MARKER=str(marker)), \
+                mock.patch.object(cb, '__file__', str(stub)), \
+                mock.patch.object(cb.os, 'fork', side_effect=AssertionError('fork must not be used')), \
+                mock.patch.object(cb.subprocess, 'Popen', side_effect=spy_popen):
+            cb.fill_warm_pool_later()
+        self.assertEqual(len(spawned), 1)
+        time.sleep(0.1)
+        self.assertFalse(marker.exists())
+        release_shared.set()
+        holder.join(5)
+        self.assertEqual(spawned[0].wait(10), 0)
+        self.assertEqual(marker.read_text(), 'ok')
+
+    def test_autoscale_admits_default_and_large_bursts_when_warm_standbys_fill_ceiling(self):
+        state = self.tmp / 'autoscale-state'
+        (state / 'workers').mkdir(parents=True)
+        self.pool_file.write_text('2\n')
+        self.add('cbx-w1', 'online:s1')
+        self.add('cbx-w2', 'online:s1')
+        args = argparse.Namespace(target='me/app', ttl=600, slots=0, allow_public=False)
+        spawned_argv = []
+        pids = iter([os.getpid(), os.getpid() + 100000, os.getpid() + 200000])
+        workers = []
+
+        def fake_popen(argv):
+            spawned_argv.append(argv)
+            return argparse.Namespace(pid=next(pids), poll=lambda: None)
+
+        def fake_note_worker(pid, target, name, kind, writers=None, memory=None):
+            workers.append(argparse.Namespace(pid=pid, target=target, name=name, kind=kind,
+                                              writers=writers, memory=memory))
+
+        def current_vms():
+            return {row['name'] for row in json.loads(self.rows.read_text())}
+
+        def fake_destroy(name):
+            self.destroyed.append(name)
+            rows = [row for row in json.loads(self.rows.read_text()) if row['name'] != name]
+            self.save(rows)
+            return True
+
+        github = FakeGitHub({'queued': [1], 'in_progress': []}, {1: queued(1)})
+        with mock.patch.multiple(cb, STATE=state, live_workers=lambda folder, prune=True: list(workers),
+                                 note_worker=fake_note_worker, host_vms=current_vms, destroy=fake_destroy,
+                                 vm_memory=lambda: GIB, host_memory=lambda field='MemTotal': 16 * GIB,
+                                 query=lambda path: [], host_setting=lambda *a: 0, host_cpu_load=lambda: 0.0,
+                                 storage_room=lambda w: (10, None), host_cpus=lambda: 6), \
+                mock.patch.object(cb.os, 'getloadavg', return_value=(0.0, 0.0, 0.0)), \
+                mock.patch.object(cb.subprocess, 'Popen', side_effect=fake_popen):
+            bursts = []
+            quiet(cb.autoscale, github, args, bursts)
+            self.assertEqual(len(bursts), 1)
+            self.assertEqual(bursts[0].name, 'cbx-w1')
+            self.assertIn('cbx-w1', spawned_argv[0])
+            self.assertEqual(self.destroyed, [])
+
+            github2 = FakeGitHub({'queued': [1], 'in_progress': []}, {1: queued(2)})
+            quiet(cb.autoscale, github2, args, bursts)
+            self.assertEqual(len(bursts), 2)
+            self.assertEqual(bursts[1].name, 'cbx-w2')
+            self.assertEqual(self.destroyed, [])
+
+        workers.clear()
+        spawned_argv.clear()
+        self.save([])
+        self.add('cbx-w3', 'online:s1')
+        self.add('cbx-w4', 'online:s1')
+        large_job = [dict(id=99, status='queued', labels=['self-hosted', 'linux', 'x64', 'coldbox-large'],
+                          created_at='2026-01-01T00:00:00Z')]
+        github_large = FakeGitHub({'queued': [1], 'in_progress': []}, {1: large_job})
+        with mock.patch.multiple(cb, STATE=state, live_workers=lambda folder, prune=True: list(workers),
+                                 note_worker=fake_note_worker, host_vms=current_vms, destroy=fake_destroy,
+                                 vm_shape=lambda sz: (2 * GIB, {'limits.memory': '2048MiB'}) if sz == 'large' else (None, {}),
+                                 vm_memory=lambda: GIB, host_memory=lambda field='MemTotal': 16 * GIB,
+                                 query=lambda path: [], host_setting=lambda *a: 0, host_cpu_load=lambda: 0.0,
+                                 storage_room=lambda w: (10, None), host_cpus=lambda: 6), \
+                mock.patch.object(cb.os, 'getloadavg', return_value=(0.0, 0.0, 0.0)), \
+                mock.patch.object(cb.subprocess, 'Popen', side_effect=fake_popen):
+            bursts_large = []
+            quiet(cb.autoscale, github_large, args, bursts_large)
+            self.assertEqual(self.destroyed, ['cbx-w3', 'cbx-w4'])
+            self.assertEqual(len(bursts_large), 1)
+            self.assertEqual(bursts_large[0].size, 'large')
+
+    def test_async_teardown_publish_verify_starts_coldverify_from_reaper_thread_without_signal_error(self):
+        state = self.tmp / 'cv-state'
+        self.addCleanup(cb.CLEANUP.clear)
+        self.addCleanup(cb.COLDVERIFY_CHILDREN.clear)
+        head, base, tree = 'a' * 40, 'b' * 40, 'c' * 40
+        api = {
+            'repos/me/app/actions/jobs/7': dict(
+                id=7, run_id=9, run_attempt=1, name='verify', status='completed', conclusion='success',
+                head_sha=head, runner_id=27, runner_name='cbx-1-cv', html_url='https://github.com/me/app/jobs/7'),
+            'repos/me/app/actions/runs/9': dict(
+                id=9, run_attempt=1, event='pull_request', path=cb.VERIFY_WORKFLOW, head_sha=head,
+                head_repository=dict(full_name='me/app'),
+                pull_requests=[dict(number=12, head=dict(sha=head), base=dict(sha=base))]),
+            f'repos/me/app/git/commits/{head}': dict(sha=head, tree=dict(sha=tree), parents=[dict(sha=base)]),
+            f'repos/me/app/git/trees/{tree}': dict(tree=[]),
+            f'repos/me/app/git/trees/{base}': dict(tree=[]),
+        }
+        posted = []
+        cv_spawned = []
+
+        def fake_gh(*args, body=None, _retries=None, **kwargs):
+            if args[:2] == ('-X', 'POST'):
+                posted.append(body)
+                return dict(id=51, conclusion=body['conclusion'], head_sha=head, output=body['output'])
+            return api[args[0]]
+
+        class FakeChild:
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+                self.waited = False
+
+            def poll(self):
+                return 0 if self.waited else None
+
+            def wait(self):
+                self.waited = True
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            child = FakeChild(argv, **kwargs)
+            cv_spawned.append(child)
+            return child
+
+        def fake_pull(name, path):
+            if path.endswith('job.json'):
+                return dict(repo='me/app', sha=head, job_id=7, refused=None)
+            return None
+
+        def fake_tee(command, log, stdin=None):
+            log.write(b'Running job: verify\nJob verify completed with result: Succeeded\n')
+            log.flush()
+            return 0
+
+        reaper = cb.TeardownReaper(max_workers=1, max_pending=2)
+        self.addCleanup(reaper.drain, 5, close=True)
+        with mock.patch.dict(os.environ, COLDBOX_COLDVERIFY_HOST='cv-host'), \
+                mock.patch.multiple(cb, STATE=state, COLDVERIFY_CHILDREN=[], HOST_CHECKS=state / 'no-checks',
+                                    GUEST_FILES=state / 'no-guest', boot=lambda *a, **k: {},
+                                    ic=mock.DEFAULT, ic_exec=lambda *a, **k: ['true'],
+                                    tee=fake_tee, pull=fake_pull,
+                                    strict_receipt=lambda *a: dict(result='PASS', reason='ok', commit=head,
+                                                                   tree=tree, pull_request=12, builders=['b'],
+                                                                   tests_ran=1),
+                                    record_queue_wait=mock.DEFAULT, vm_resources=lambda name: {},
+                                    copy_artifacts=lambda name, folder: ([], True),
+                                    destroy_job=lambda name: (True, None, 0.05),
+                                    runner_admission=lambda *a: dict(target='me/app', host='fixture'),
+                                    gh=fake_gh, host_cpus=lambda: 4), \
+                mock.patch.object(cb.subprocess, 'run',
+                                  return_value=subprocess.CompletedProcess([], 0, json.dumps(dict(
+                                      cb.junit_summary([]), total=1, skipped=0, files=['r.xml'], cold_verify=[])), '')), \
+                mock.patch.object(cb.subprocess, 'Popen', side_effect=fake_popen):
+            quiet(lambda: cb.job('runner', 'cbx-1-cv', 60, ['true'], 'me/app',
+                                 extra=dict(runner_id=27), receipts=state / 'receipts', teardown=reaper,
+                                 on_teardown=lambda done: cb.publish_verify('me/app', 'cbx-1-cv', done)))
+            self.assertTrue(reaper.drain(timeout=5, close=True))
+            self.assertEqual(reaper.failures, 0)
+            self.assertEqual(len(posted), 1)
+            self.assertEqual(len(cv_spawned), 1)
+            cb.wait_for_coldverify()
+            self.assertTrue(cv_spawned[0].waited)
+
+    def test_warm_claimed_vm_destroys_and_reboots_fresh_clone_when_overlay_file_removed(self):
+        guest = self.tmp / 'guest-rm'
+        (guest / 'opt').mkdir(parents=True)
+        (guest / 'opt' / 'keep').write_text('keep')
+        removed = guest / 'opt' / 'removed'
+        removed.write_text('stale')
+        stamps = {}
+        events = []
+
+        def fake_ic(*args):
+            if args[:2] == ('config', 'set'):
+                for item in args[3:]:
+                    k, _, v = item.partition('=')
+                    stamps[k] = v
+            return ''
+
+        def fake_run(command, *args, **kwargs):
+            if command[:1] == ['guest-exec']:
+                events.append(('guest', command[1]))
+            elif command[:1] == ['tar']:
+                return subprocess.run.__wrapped__(command, *args, **kwargs) if hasattr(subprocess.run, '__wrapped__') else subprocess.CompletedProcess(command, 0, b'tar-bytes:' + ','.join(sorted(p.name for p in (guest / 'opt').iterdir())).encode(), b'')
+            return subprocess.CompletedProcess(command, 0, b'', b'')
+
+        def fake_boot(name, expires, *args, **kwargs):
+            events.append(('boot', name))
+            stamps.clear()
+            return dict(clone_seconds=0.5, boot_seconds=1.5)
+
+        def fake_destroy(name):
+            events.append(('destroy', name))
+            stamps.clear()
+            return True
+
+        receipts = self.tmp / 'rm-receipts'
+        with mock.patch.multiple(cb, GUEST_FILES=guest, ic=fake_ic,
+                                 ic_exec=lambda name, *cmd, **k: ['guest-exec', *cmd],
+                                 overlay_state=lambda name, link: 'e' * 64,
+                                 query=lambda *a, **k: {'config': dict(stamps)},
+                                 push_guest_files=self.orig_push_guest_files,
+                                 boot=fake_boot, destroy=fake_destroy,
+                                 destroy_job=lambda name: (True, None, 0.05),
+                                 tee=lambda *a: 0, pull=lambda *a: None, collect_tests=mock.DEFAULT,
+                                 vm_resources=lambda name: {}, copy_artifacts=lambda name, folder: ([], True),
+                                 host_cpus=lambda: 4), \
+                mock.patch.object(cb.subprocess, 'run', side_effect=fake_run):
+            cb.push_guest_files('cbx-w-rm', mode='warm-pool')
+            self.assertIn(cb.OVERLAY_STAMP, stamps)
+            events.clear()
+            removed.unlink()
+            receipt = quiet(lambda: cb.job('adhoc', 'cbx-w-rm', 60, ['true'], 'adhoc',
+                                           receipts=receipts, warm_claimed=True))[0]
+
+        self.assertEqual(receipt['verdict'], 'pass')
+        self.assertNotIn('warm_claimed', receipt['vm'])
+        self.assertEqual(receipt['vm']['boot_seconds'], 1.5)
+        self.assertIn(('destroy', 'cbx-w-rm'), events)
+        self.assertIn(('boot', 'cbx-w-rm'), events)
+        destroy_idx = events.index(('destroy', 'cbx-w-rm'))
+        boot_idx = events.index(('boot', 'cbx-w-rm'))
+        tar_indices = [idx for idx, ev in enumerate(events) if ev == ('guest', 'tar')]
+        self.assertLess(destroy_idx, boot_idx)
+        self.assertTrue(tar_indices)
+        self.assertTrue(all(idx > boot_idx for idx in tar_indices))
+
+        stamps[cb.OVERLAY_STAMP] = 'old:stamp'
+        shutil.rmtree(guest)
+        with mock.patch.multiple(cb, GUEST_FILES=guest, query=lambda *a, **k: {'config': dict(stamps)},
+                                 push_guest_files=self.orig_push_guest_files):
+            with self.assertRaises(cb.WarmOverlayMismatch):
+                cb.push_guest_files('cbx-w-rm', mode='runner', strict_stamp=True)
+
+    def test_autoscale_reuses_ready_standby_when_storage_room_refuses_new_clone(self):
+        state = self.tmp / 'storage-state'
+        (state / 'workers').mkdir(parents=True)
+        self.pool_file.write_text('1\n')
+        self.add('cbx-w1', 'online:s1')
+        args = argparse.Namespace(target='me/app', ttl=600, slots=0, allow_public=False)
+        workers, spawned = [], []
+        pids = iter([os.getpid(), os.getpid() + 100000])
+
+        def fake_popen(argv):
+            spawned.append(argv)
+            return argparse.Namespace(pid=next(pids), poll=lambda: None)
+
+        def fake_note_worker(pid, target, name, kind, writers=None, memory=None):
+            workers.append(argparse.Namespace(pid=pid, target=target, name=name, kind=kind,
+                                              writers=writers, memory=memory))
+
+        github = FakeGitHub({'queued': [1], 'in_progress': []}, {1: queued(2)})
+        with mock.patch.multiple(cb, STATE=state, live_workers=lambda folder, prune=True: list(workers),
+                                 note_worker=fake_note_worker, host_vms=lambda: {'cbx-w1'},
+                                 vm_memory=lambda: GIB, host_memory=lambda field='MemTotal': 32 * GIB,
+                                 query=lambda path: [], host_setting=lambda *a: 0, host_cpu_load=lambda: 0.0,
+                                 storage_room=lambda w: (0, 'coldbox: storage pool full'), host_cpus=lambda: 12), \
+                mock.patch.object(cb.os, 'getloadavg', return_value=(0.0, 0.0, 0.0)), \
+                mock.patch.object(cb.subprocess, 'Popen', side_effect=fake_popen):
+            bursts = []
+            quiet(cb.autoscale, github, args, bursts)
+        self.assertEqual(len(bursts), 1)
+        self.assertEqual(bursts[0].name, 'cbx-w1')
+        self.assertIn('cbx-w1', spawned[0])
+
+    def test_push_guest_files_strict_stamp_fails_closed_on_query_error_or_removed_overlay_dir(self):
+        missing_guest = self.tmp / 'missing-guest'
+        present_guest = self.tmp / 'present-guest'
+        (present_guest / 'opt').mkdir(parents=True)
+        (present_guest / 'opt' / 'a').write_text('x')
+        timeout = subprocess.TimeoutExpired(['incus', 'query'], 10)
+        for guest_dir in (missing_guest, present_guest):
+            with self.subTest(guest_dir=guest_dir.name), \
+                    mock.patch.multiple(cb, GUEST_FILES=guest_dir,
+                                        query=mock.Mock(side_effect=timeout),
+                                        push_guest_files=self.orig_push_guest_files), \
+                    mock.patch.object(cb.subprocess, 'run',
+                                      return_value=subprocess.CompletedProcess([], 0, b'tar', b'')):
+                with self.assertRaises(cb.WarmOverlayMismatch):
+                    cb.push_guest_files('cbx-w-err', mode='runner', strict_stamp=True)
+
+        events = []
+        receipts = self.tmp / 'fail-closed-receipts'
+        with mock.patch.multiple(cb, GUEST_FILES=missing_guest,
+                                 query=mock.Mock(side_effect=timeout),
+                                 push_guest_files=self.orig_push_guest_files,
+                                 boot=lambda name, *a, **k: events.append(('boot', name)) or dict(clone_seconds=0.2, boot_seconds=1.0),
+                                 destroy=lambda name: events.append(('destroy', name)) or True,
+                                 destroy_job=lambda name: (True, None, 0.05),
+                                 ic=mock.DEFAULT, ic_exec=lambda *a, **k: ['true'],
+                                 tee=lambda *a: 0, pull=lambda *a: None, collect_tests=mock.DEFAULT,
+                                 vm_resources=lambda name: {}, copy_artifacts=lambda name, folder: ([], True),
+                                 host_cpus=lambda: 4):
+            receipt = quiet(lambda: cb.job('adhoc', 'cbx-w-err', 60, ['true'], 'adhoc',
+                                           receipts=receipts, warm_claimed=True))[0]
+        self.assertEqual(receipt['verdict'], 'pass')
+        self.assertNotIn('warm_claimed', receipt['vm'])
+        self.assertEqual(events, [('destroy', 'cbx-w-err'), ('boot', 'cbx-w-err')])
+
+
+REAL_WARM_JOB_STAMP = cb.warm_job_stamp
+
+
+class PoolHost:
+    def __init__(self, folder):
+        self.rows, self.lock, self.log = folder / 'pool-rows.json', folder / 'pool-rows.lock', folder / 'pool-deleted.log'
+        self.log.touch()
+        self.write([])
+
+    def write(self, rows):
+        staged = self.rows.with_suffix(f'.{os.getpid()}')
+        staged.write_text(json.dumps(rows))
+        os.replace(staged, self.rows)
+
+    def change(self, edit):
+        with open(self.lock, 'a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            rows = json.loads(self.rows.read_text())
+            result = edit(rows)
+            self.write(rows)
+            return result
+
+    def listed(self):
+        return json.loads(self.rows.read_text())
+
+    def names(self):
+        return [row['name'] for row in self.listed()]
+
+    def config(self, name):
+        return next(row['config'] for row in self.listed() if row['name'] == name)
+
+    def mark(self, name):
+        return self.config(name).get(cb.WARM_JOB)
+
+    def add(self, name, mark=None, expires=None, status='Running'):
+        config = {cb.MANAGED: 'true', cb.EXPIRES: str(int(time.time()) + cb.WARM_TTL if expires is None else expires)}
+        if mark is not None:
+            config[cb.WARM_JOB] = mark
+        self.change(lambda rows: rows.append(dict(name=name, status=status, config=config)))
+
+    def ic(self, *args, **kwargs):
+        if args[0] == 'list':
+            return self.rows.read_text()
+        if args[:2] == ('file', 'push'):
+            return ''
+        if args[:2] == ('config', 'get'):
+            return self.config(args[2]).get(args[3], '') + '\n'
+        if args[:2] != ('config', 'set'):
+            raise AssertionError(f'unexpected incus call {args}')
+
+        def edit(rows):
+            row = next((row for row in rows if row['name'] == args[2]), None)
+            if row is None:
+                raise subprocess.CalledProcessError(1, args, stderr='Error: Instance not found')
+            for item in args[3:]:
+                key, _, value = item.partition('=')
+                if value:
+                    row['config'][key] = value
+                else:
+                    row['config'].pop(key, None)
+
+        self.change(edit)
+        return ''
+
+    def boot(self, name, expires, offline, *config, **kwargs):
+        marks = dict(item.split('=', 1) for item in config[1::2])
+        self.change(lambda rows: rows.append(dict(name=name, status='Running',
+                                                  config={cb.MANAGED: 'true', cb.EXPIRES: str(expires), **marks})))
+        return dict(clone_seconds=0.1, boot_seconds=0.1)
+
+    def destroy(self, name, *args, **kwargs):
+        def edit(rows):
+            found = [row for row in rows if row['name'] == name]
+            rows[:] = [row for row in rows if row['name'] != name]
+            return found
+
+        found = self.change(edit)
+        with open(self.log, 'a') as log:
+            log.write(f"{name} {found[0]['config'].get(cb.WARM_JOB, '-') if found else 'gone'}\n")
+        return True
+
+    def deleted(self):
+        return [tuple(line.split()) for line in self.log.read_text().splitlines()]
+
+
+class PoolFixture:
+    def setUp(self):
+        def hung(*_):
+            raise TimeoutError(f'{type(self).__name__} test ran past 120 s')
+        signal.signal(signal.SIGALRM, hung)
+        signal.alarm(120)
+        self.addCleanup(signal.alarm, 0)
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.host = PoolHost(self.tmp)
+        self.state, self.pool_file, self.stamp_file = self.tmp / 'state', self.tmp / 'warm-pool', self.tmp / 'stamp'
+        self.stamp_file.write_text('online:s1')
+        snapshot = dict(created_at='2026-01-01T00:00:00Z', config={'volatile.base_image': 'f' * 64})
+        patches = dict(STATE=self.state, WARM_POOL=self.pool_file, VM_WARM=self.tmp / 'no-vm-warm',
+                       HOST_CHECKS=self.tmp / 'no-checks', GUEST_FILES=self.tmp / 'no-guest',
+                       ic=self.host.ic, boot=self.host.boot, destroy=self.host.destroy,
+                       query=lambda path, **kwargs: snapshot,
+                       warm_job_stamp=lambda *, base=cb.BASE, offline=False: self.stamp_file.read_text(),
+                       sync_acl=lambda: None, isolated=lambda name, offline: None,
+                       admit=lambda target, name, kind, *a, **k: cb.note_worker(os.getpid(), target, name, kind) or True,
+                       push_guest_files=lambda name, *, mode, strict_stamp=False: None)
+        for name, value in patches.items():
+            self.enterContext(mock.patch.object(cb, name, value))
+        self.enterContext(mock.patch.dict(os.environ, {'COLDBOX_WARM_POOL_SIZE': ''}))
+        self.agent = self.enterContext(mock.patch.object(
+            cb.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')))
+
+    def fork(self, target):
+        def silent():
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                target()
+
+        process = multiprocessing.get_context('fork').Process(target=silent, daemon=True)
+        process.start()
+        self.addCleanup(process.join, 5)
+        self.addCleanup(process.kill)
+        return process
+
+    def wait_for(self, path):
+        deadline = time.monotonic() + 30
+        while not path.exists():
+            self.assertLess(time.monotonic(), deadline, f'{path.name} never appeared')
+            time.sleep(0.02)
+        return path.read_text()
+
+    def standbys(self):
+        return {row['name']: row['config'][cb.WARM_JOB] for row in self.host.listed() if cb.WARM_JOB in row['config']}
+
+
+class WarmPoolHardening(PoolFixture, unittest.TestCase):
+    def test_an_abandoned_claim_is_deleted_at_the_next_refill_while_its_claimer_still_lives(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-w1', 'online:s1')
+        self.agent.return_value = subprocess.CompletedProcess([], 1, '', '')
+        with mock.patch.object(cb, 'destroy', lambda name: False):
+            self.assertIsNone(quiet(cb.claim_warm_job, 'me/app', 'base', 21600)[0])
+        self.assertTrue(self.host.mark('cbx-1-w1').startswith(f'claimed:{os.getpid()}:'))
+        self.assertLessEqual(int(self.host.config('cbx-1-w1')[cb.EXPIRES]), time.time() + 5 * 60)
+        with mock.patch.object(cb, 'new_id', lambda: 'cbx-2-w2'):
+            self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+        self.assertEqual(self.host.deleted(), [], 'a claim under five minutes old belongs to its live claimer')
+        with mock.patch.object(cb.time, 'time', return_value=time.time() + 5 * 60 + 1):
+            self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+        self.assertEqual(self.host.deleted(), [('cbx-1-w1', 'retired')])
+        self.assertEqual(self.standbys(), {'cbx-2-w2': 'online:s1'})
+
+    def test_a_finished_claim_gets_the_job_ttl_and_loses_its_mark_for_good(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-w1', 'online:s1')
+        self.assertEqual(cb.claim_warm_job('me/app', 'base', 21600), 'cbx-1-w1')
+        self.assertNotIn(cb.WARM_JOB, self.host.config('cbx-1-w1'))
+        self.assertAlmostEqual(int(self.host.config('cbx-1-w1')[cb.EXPIRES]), time.time() + 21600, delta=30)
+        self.assertIsNone(cb.claim_warm_job('me/app', 'base', 21600))
+        with mock.patch.object(cb, 'new_id', lambda: 'cbx-2-w2'):
+            self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+        self.assertNotIn(cb.WARM_JOB, self.host.config('cbx-1-w1'))
+        self.assertEqual(self.host.deleted(), [])
+
+    def test_a_claim_incus_refuses_leaves_the_standby_alone_so_the_job_boots_cold(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-w1', 'online:s1')
+
+        def refuse(*args, **kwargs):
+            if args[:2] == ('config', 'set'):
+                raise subprocess.CalledProcessError(1, args, stderr='Error: Instance is busy')
+            return self.host.ic(*args, **kwargs)
+
+        with mock.patch.object(cb, 'ic', refuse):
+            self.assertIsNone(quiet(cb.claim_warm_job, 'me/app', 'base', 600)[0])
+        self.assertEqual(self.host.deleted(), [])
+        self.assertEqual(self.standbys(), {'cbx-1-w1': 'online:s1'})
+        self.assertFalse((self.state / 'workers' / str(os.getpid())).exists())
+        self.assertEqual(cb.claim_warm_job('me/app', 'base', 600), 'cbx-1-w1')
+
+    def test_a_refill_that_cannot_finish_deletes_its_vm_before_any_job_could_claim_it(self):
+        self.pool_file.write_text('1\n')
+        touch = Path.touch
+
+        def refuse_ready_marker(path, *args, **kwargs):
+            if path.parent.name == 'ready':
+                raise PermissionError(errno.EACCES, 'Permission denied', str(path))
+            return touch(path, *args, **kwargs)
+
+        with mock.patch.object(Path, 'touch', refuse_ready_marker), mock.patch.object(cb, 'new_id', lambda: 'cbx-1-w1'):
+            self.assertEqual(quiet(cb.fill_warm_pool)[0], 1)
+        self.assertEqual(self.host.deleted(), [('cbx-1-w1', 'booting')])
+        self.assertEqual(self.host.names(), [])
+        self.assertFalse((self.state / 'workers' / str(os.getpid())).exists())
+        self.assertEqual(cb.pool_counters()['counts'], {'refill_failed': 1})
+
+    def test_a_refill_finishes_when_another_evictor_deletes_a_retired_vm_under_it(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-leaving', 'retired')
+
+        def already_deleted(*args, **kwargs):
+            if args[:3] == ('config', 'set', 'cbx-1-leaving'):
+                raise subprocess.CalledProcessError(1, args, stderr='Error: Instance not found')
+            return self.host.ic(*args, **kwargs)
+
+        with mock.patch.multiple(cb, ic=already_deleted, new_id=lambda: 'cbx-2-w2'):
+            self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+        self.assertEqual(self.standbys(), {'cbx-2-w2': 'online:s1'})
+        self.assertEqual(self.host.deleted(), [('cbx-1-leaving', 'retired')])
+        self.assertEqual(cb.pool_counters()['reaped'], {})
+
+    def test_folders_that_root_makes_under_the_state_folder_stay_with_its_owner(self):
+        self.pool_file.write_text('1\n')
+        self.state.mkdir()
+        owner = self.state.stat()
+        with mock.patch.object(cb.os, 'geteuid', return_value=0), mock.patch.object(cb.os, 'chown') as chown, \
+                mock.patch.object(cb, 'new_id', lambda: 'cbx-1-w1'):
+            self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+            self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+        self.assertCountEqual(chown.call_args_list, [mock.call(self.state / folder, owner.st_uid, owner.st_gid)
+                                                      for folder in ('workers', 'ready')])
+        self.assertEqual(self.standbys(), {'cbx-1-w1': 'online:s1'})
+
+    def test_reap_drops_the_ready_markers_of_vms_that_are_gone_and_keeps_the_rest(self):
+        (self.state / 'ready').mkdir(parents=True)
+        self.host.add('cbx-1-running')
+        live_worker(self, self.state, 'cbx-1-running')
+        live_worker(self, self.state, 'cbx-2-admitted')
+        for name in ('cbx-1-running', 'cbx-2-admitted', 'cbx-3-gone'):
+            (self.state / 'ready' / name).touch()
+        with mock.patch.multiple(cb, sync_acl=mock.DEFAULT, mark_host_objects=mock.DEFAULT):
+            code, _ = quiet(cb.reap, argparse.Namespace(keep_days=0))
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(marker.name for marker in (self.state / 'ready').iterdir()),
+                         ['cbx-1-running', 'cbx-2-admitted'])
+        self.assertEqual(self.host.deleted(), [])
+
+    def test_a_cold_job_that_needs_room_never_deletes_a_standby_a_live_worker_has_reserved(self):
+        self.pool_file.write_text('2\n')
+        self.host.add('cbx-1-w1', 'online:s1')
+        self.host.add('cbx-2-w2', 'online:s1')
+        live_worker(self, self.state, 'cbx-1-w1')
+        self.assertTrue(cb.yield_warm_job())
+        self.assertEqual(self.host.deleted(), [('cbx-2-w2', 'retired')])
+        self.assertFalse(cb.yield_warm_job())
+        self.assertEqual(self.standbys(), {'cbx-1-w1': 'online:s1'})
+
+    def host_lock_is_free(self):
+        try:
+            with open(self.state / 'autoscale.lock', 'a') as probe:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+    def test_the_host_lock_is_free_while_a_claim_hashes_the_stamp_to_look_for_a_standby(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-w1', 'online:s1')
+        self.state.mkdir()
+        free = []
+
+        def stamp(*, base=cb.BASE, offline=False):
+            free.append(self.host_lock_is_free())
+            return 'online:s1'
+
+        with mock.patch.object(cb, 'warm_job_stamp', stamp):
+            self.assertEqual(quiet(cb.claim_warm_job, 'me/app', 'base', 600)[0], 'cbx-1-w1')
+        self.assertEqual(free, [True, False])
+
+    def test_a_claim_rereads_the_stamp_under_the_host_lock_and_gives_up_a_vm_that_went_stale_while_it_waited(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-w1', 'online:s1')
+        self.state.mkdir()
+        stamp = lambda *, base=cb.BASE, offline=False: 'online:s1' if self.host_lock_is_free() else 'online:s2'
+        with mock.patch.object(cb, 'warm_job_stamp', stamp):
+            self.assertIsNone(quiet(cb.claim_warm_job, 'me/app', 'base', 600)[0])
+        self.assertEqual([name for name, _ in self.host.deleted()], ['cbx-1-w1'])
+        self.assertFalse((self.state / 'workers' / str(os.getpid())).exists())
+
+    def test_a_claim_that_outlives_its_deadline_gives_up_the_vm_and_never_gets_the_job_ttl(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-w1', 'online:s1')
+        with mock.patch.object(cb, 'WARM_CLAIM', -1):
+            self.assertIsNone(quiet(cb.claim_warm_job, 'me/app', 'base', 21600)[0])
+        self.assertEqual([name for name, _ in self.host.deleted()], ['cbx-1-w1'])
+        self.assertEqual(self.host.names(), [])
+
+    def test_a_claim_whose_deadline_passes_during_the_last_stamp_read_gives_up_the_vm(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-w1', 'online:s1')
+        now, late, reads = time.time, [0], []
+
+        def stamp(*, base=cb.BASE, offline=False):
+            reads.append(offline)
+            if len(reads) == 2:
+                late[0] = 5 * 60 + 1
+            return 'online:s1'
+
+        with mock.patch.object(cb, 'warm_job_stamp', stamp), mock.patch.object(cb.time, 'time', lambda: now() + late[0]):
+            self.assertIsNone(quiet(cb.claim_warm_job, 'me/app', 'base', 21600)[0])
+        self.assertEqual(len(reads), 2)
+        self.assertEqual([name for name, _ in self.host.deleted()], ['cbx-1-w1'])
+        self.assertEqual(self.host.names(), [])
+        self.assertFalse((self.state / 'workers' / str(os.getpid())).exists())
+
+    def test_a_burst_that_loses_its_standby_boots_under_a_new_name_so_a_late_delete_cannot_reach_it(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-w1', 'online:s1')
+        ran = []
+
+        def refill_retires_it(name, offline):
+            self.host.ic('config', 'set', name, f'{cb.WARM_JOB}=retired')
+
+        def job(mode, name, *args, **kwargs):
+            self.host.boot(name, int(time.time()) + 600, False)
+            ran.append(name)
+            return dict(verdict='pass', vm=dict(destroyed=False))
+
+        args = argparse.Namespace(target='me/app', worker=True, slots=1, ttl=600, allow_public=False, once=True,
+                                  idle=0, name='cbx-1-w1', standby=True, size='default')
+        with mock.patch.multiple(cb, isolated=refill_retires_it, job=job, guard=lambda *a: None,
+                                 new_id=lambda: 'cbx-2-cold', fill_warm_pool_later=lambda: None,
+                                 gh=lambda *a, **k: {'runner': {'id': 7}, 'encoded_jit_config': 'tok'},
+                                 publish_verify=lambda *a: None, cache_folder=lambda *a: None):
+            self.assertEqual(quiet(cb.serve_worker, args, 'primary')[0], 0)
+        self.assertEqual(ran, ['cbx-2-cold'])
+        self.assertEqual(self.host.deleted(), [('cbx-1-w1', 'retired')])
+        cb.destroy('cbx-1-w1')
+        self.assertEqual(self.host.names(), ['cbx-2-cold'])
+
+    def test_the_host_lock_is_free_while_an_autoscale_pass_hashes_the_pool_stamp(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-w1', 'online:s1')
+        self.state.mkdir()
+        workers = []
+
+        def stamp(*, base=cb.BASE, offline=False):
+            with open(self.state / 'autoscale.lock', 'a') as probe:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return 'online:s1'
+
+        spawned = []
+
+        def reserve(pid, target, name, kind, writers=None, memory=None):
+            workers.append(argparse.Namespace(pid=pid, target=target, name=name, kind=kind, writers=writers, memory=memory))
+
+        args = argparse.Namespace(target='me/app', ttl=600, slots=0, allow_public=False)
+        github = FakeGitHub({'queued': [1], 'in_progress': []}, {1: queued(1)})
+        with mock.patch.multiple(cb, warm_job_stamp=stamp, live_workers=lambda folder, prune=True: list(workers),
+                                 note_worker=reserve, host_vms=lambda: set(self.host.names()),
+                                 vm_memory=lambda: GIB, host_memory=lambda field='MemTotal': 32 * GIB,
+                                 query=lambda path: [], host_setting=lambda *a: 0, host_cpu_load=lambda: 0.0,
+                                 storage_room=lambda w: (10, None), host_cpus=lambda: 12), \
+                mock.patch.object(cb.os, 'getloadavg', return_value=(0.0, 0.0, 0.0)), \
+                mock.patch.object(cb.subprocess, 'Popen', side_effect=lambda argv: spawned.append(argv) or
+                                  argparse.Namespace(pid=os.getpid(), poll=lambda: None)):
+            bursts = []
+            quiet(cb.autoscale, github, args, bursts)
+        self.assertEqual([burst.name for burst in bursts], ['cbx-1-w1'])
+        self.assertEqual(spawned[0][spawned[0].index('--name'):][:3], ['--name', 'cbx-1-w1', '--standby'])
+        self.assertEqual(self.host.deleted(), [])
+
+    def test_a_vm_without_a_pool_mark_is_never_claimable_whatever_the_stamp(self):
+        soon = str(int(time.time()) + 3600)
+        job_vm = dict(name='cbx-1-job', status='Running', config={cb.EXPIRES: soon})
+        standby = dict(name='cbx-1-w1', status='Running', config={cb.EXPIRES: soon, cb.WARM_JOB: 'online:s1'})
+        for stamp in (None, '', 'online:s1'):
+            with self.subTest(stamp=stamp):
+                self.assertFalse(cb.claimable(job_vm, stamp, time.time()))
+                self.assertEqual(cb.claimable(standby, stamp, time.time()), stamp == 'online:s1')
+        for change in (dict(status='Stopped'), dict(name='base-dev'),
+                       dict(config={cb.EXPIRES: str(int(time.time()) + 30), cb.WARM_JOB: 'online:s1'}),
+                       dict(config={cb.EXPIRES: soon, cb.WARM_JOB: f'claimed:{os.getpid()}:1'}),
+                       dict(config={cb.EXPIRES: soon, cb.WARM_JOB: 'retired'}),
+                       dict(config={cb.EXPIRES: soon, cb.WARM_JOB: 'booting'}),
+                       dict(config=None)):
+            with self.subTest(change=change):
+                self.assertFalse(cb.claimable(dict(standby, **change), 'online:s1', time.time()))
+
+
+class WarmPoolSkewAndTtl(PoolFixture, unittest.TestCase):
+    def test_a_standby_from_an_older_image_profile_overlay_checks_or_cli_is_never_claimed_and_is_replaced(self):
+        guest, checks, cli = self.tmp / 'guest', self.tmp / 'checks.toml', self.tmp / 'coldbox-cli'
+        (guest / 'opt').mkdir(parents=True)
+        (guest / 'opt' / 'tool').write_text('v1')
+        cli.write_text('cli v1')
+        snapshot = {'created_at': '2026-01-01T00:00:00Z',
+                    'config': {'volatile.base_image': 'a' * 64, 'volatile.uuid': 'u1'}}
+        profile = {'config': {'limits.cpu': '4', 'limits.memory': '8GiB'}, 'devices': {'eth0': {'network': 'br0'}}}
+        changes = dict(base_snapshot=lambda: snapshot.update(created_at='2026-02-02T00:00:00Z'),
+                       base_image=lambda: snapshot['config'].update({'volatile.base_image': 'b' * 64}),
+                       base_instance=lambda: snapshot['config'].update({'volatile.uuid': 'u2'}),
+                       profile_cpu=lambda: profile['config'].update({'limits.cpu': '8'}),
+                       profile_memory=lambda: profile['config'].update({'limits.memory': '16GiB'}),
+                       profile_network=lambda: profile['devices']['eth0'].update(network='br1'),
+                       guest_overlay=lambda: (guest / 'opt' / 'tool').write_text('v2'),
+                       guest_overlay_mode=lambda: (guest / 'opt' / 'tool').chmod(0o755),
+                       host_checks=lambda: checks.write_text('[checks]\nlint = false\n'),
+                       cli=lambda: cli.write_text('cli v2'))
+        self.pool_file.write_text('1\n')
+        names = (f'cbx-{number}-w' for number in itertools.count(1))
+        with mock.patch.multiple(cb, GUEST_FILES=guest, HOST_CHECKS=checks, __file__=str(cli),
+                                 query=lambda path: snapshot if '/snapshots/' in path else profile,
+                                 warm_job_stamp=REAL_WARM_JOB_STAMP, new_id=lambda: next(names)):
+            for what, change in changes.items():
+                with self.subTest(changed=what):
+                    self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+                    (old, stamp), = self.standbys().items()
+                    self.assertEqual(stamp, cb.warm_job_stamp(offline=False))
+                    change()
+                    self.assertNotEqual(stamp, cb.warm_job_stamp(offline=False))
+                    self.assertIsNone(quiet(cb.claim_warm_job, 'me/app', 'base', 600)[0])
+                    self.assertEqual(self.standbys(), {old: stamp})
+                    self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+                    self.assertIn((old, 'retired'), self.host.deleted())
+                    (new, fresh), = self.standbys().items()
+                    self.assertEqual(fresh, cb.warm_job_stamp(offline=False))
+                    self.assertEqual(quiet(cb.claim_warm_job, 'me/app', 'base', 600)[0], new)
+                    self.host.destroy(new)
+
+    def test_a_standby_at_its_idle_ttl_is_never_claimed_and_the_refill_replaces_it(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-old', 'online:s1', expires=int(time.time()) + 30)
+        self.assertIsNone(cb.claim_warm_job('me/app', 'base', 600))
+        with mock.patch.object(cb, 'new_id', lambda: 'cbx-2-new'):
+            self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+        self.assertEqual(self.host.deleted(), [('cbx-1-old', 'retired')])
+        self.assertEqual(self.standbys(), {'cbx-2-new': 'online:s1'})
+        self.assertAlmostEqual(int(self.host.config('cbx-2-new')[cb.EXPIRES]), time.time() + 6 * 3600, delta=30)
+        self.assertEqual(cb.pool_counters()['reaped'], {'expired': 1})
+
+    def test_the_pool_never_holds_more_standbys_than_configured_or_than_the_host_admits(self):
+        self.pool_file.write_text('2\n')
+        names = (f'cbx-{number}-w' for number in itertools.count(1))
+        admitted = iter([True, False])
+        admit = lambda target, name, kind, *a, **k: next(admitted) and not cb.note_worker(os.getpid(), target, name, kind)
+        with mock.patch.multiple(cb, new_id=lambda: next(names), admit=admit):
+            self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+        self.assertEqual(self.standbys(), {'cbx-1-w': 'online:s1'})
+        for name in ('cbx-7-extra', 'cbx-8-extra', 'cbx-9-extra'):
+            self.host.add(name, 'online:s1')
+        with mock.patch.object(cb, 'new_id', lambda: next(names)):
+            self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+        self.assertEqual(self.standbys(), {'cbx-1-w': 'online:s1', 'cbx-7-extra': 'online:s1'})
+        self.assertEqual(cb.pool_counters()['reaped'], {'excess': 2})
+        self.pool_file.unlink()
+        self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+        self.assertEqual(self.host.names(), [])
+
+
+class WarmPoolCrashRecovery(PoolFixture, unittest.TestCase):
+    def test_reap_clears_what_crashed_workers_left_and_touches_no_live_sibling(self):
+        self.pool_file.write_text('1\n')
+        sibling = subprocess.Popen(['sleep', '600'])
+        self.addCleanup(sibling.wait)
+        self.addCleanup(sibling.kill)
+        live_claim = f'claimed:{sibling.pid}:{cb.process_start(sibling.pid)}'
+        soon = int(time.time()) + 200
+        self.host.add('cbx-1-ready', 'online:s1')
+        self.host.add('cbx-1-bootdead', 'booting', expires=soon)
+        self.host.add('cbx-1-claimdead', 'claimed:999999991:gone', expires=soon)
+        self.host.add('cbx-1-claimlive', live_claim, expires=soon)
+        self.host.add('cbx-1-job')
+        self.host.add('cbx-1-teardown')
+        self.host.add('cbx-1-orphan')
+        self.host.add('cbx-1-used')
+        live_worker(self, self.state, 'cbx-1-job')
+        (self.state / 'workers' / '999999992').write_text(json.dumps(['warm-pool', 'gone', 'cbx-1-bootdead', 'warm-pool']))
+        (self.state / 'workers' / '999999993').write_text(json.dumps(['me/app', 'gone', 'cbx-1-used', 'base']))
+        cb.note_teardown('cbx-1-teardown')
+        self.assertEqual(cb.claim_warm_job('me/app', 'base', 600), 'cbx-1-ready')
+        self.assertIsNone(cb.claim_warm_job('me/app', 'base', 600))
+        with mock.patch.multiple(cb, sync_acl=mock.DEFAULT, mark_host_objects=mock.DEFAULT, new_id=lambda: 'cbx-2-fresh'):
+            code, _ = quiet(cb.reap, argparse.Namespace(keep_days=0))
+        self.assertEqual(code, 0)
+        self.assertCountEqual(self.host.deleted(), [('cbx-1-orphan', '-'), ('cbx-1-used', '-'),
+                                                    ('cbx-1-bootdead', 'retired'), ('cbx-1-claimdead', 'retired')])
+        self.assertEqual(self.standbys(), {'cbx-1-claimlive': live_claim, 'cbx-2-fresh': 'online:s1'})
+        self.assertCountEqual(self.host.names(), ['cbx-1-ready', 'cbx-1-claimlive', 'cbx-1-job', 'cbx-1-teardown',
+                                                  'cbx-2-fresh'])
+        self.assertEqual(cb.pool_counters()['reaped'], {'abandoned': 2})
+
+    def test_a_refill_killed_while_booting_leaves_no_lock_and_its_vm_is_replaced(self):
+        self.pool_file.write_text('1\n')
+        booted = self.tmp / 'booted'
+
+        def stall(name, expires, offline, *config, **kwargs):
+            self.host.boot(name, expires, offline, *config)
+            booted.write_text(name)
+            time.sleep(600)
+
+        def refill():
+            with mock.patch.object(cb, 'boot', stall):
+                cb.fill_warm_pool()
+
+        process = self.fork(refill)
+        name = self.wait_for(booted)
+        os.kill(process.pid, signal.SIGKILL)
+        process.join(10)
+        self.assertEqual(self.standbys(), {name: 'booting'})
+        with mock.patch.object(cb, 'new_id', lambda: 'cbx-2-next'):
+            self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+        self.assertEqual(self.host.deleted(), [(name, 'retired')])
+        self.assertEqual(self.standbys(), {'cbx-2-next': 'online:s1'})
+
+    def test_a_claimer_killed_mid_claim_never_got_the_vm_and_the_refill_replaces_it(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-w1', 'online:s1')
+        claiming = self.tmp / 'claiming'
+
+        def stall(name, offline):
+            claiming.write_text(name)
+            time.sleep(600)
+
+        def claim():
+            with mock.patch.object(cb, 'isolated', stall):
+                cb.claim_warm_job('me/app', 'base', 600)
+
+        process = self.fork(claim)
+        self.assertEqual(self.wait_for(claiming), 'cbx-1-w1')
+        os.kill(process.pid, signal.SIGKILL)
+        process.join(10)
+        self.assertTrue(self.host.mark('cbx-1-w1').startswith(f'claimed:{process.pid}:'))
+        self.assertIsNone(cb.claim_warm_job('me/app', 'base', 600))
+        with mock.patch.object(cb, 'new_id', lambda: 'cbx-2-next'):
+            self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+        self.assertEqual(self.host.deleted(), [('cbx-1-w1', 'retired')])
+        self.assertEqual(self.standbys(), {'cbx-2-next': 'online:s1'})
+
+
+class WarmPoolRaces(PoolFixture, unittest.TestCase):
+    def test_claims_refills_and_evictions_racing_each_other_hand_each_vm_to_one_job_and_delete_no_claimed_vm(self):
+        self.pool_file.write_text('3\n')
+        for number in range(1, 5):
+            self.host.add(f'cbx-{number}-w', 'online:s1')
+        claims = multiprocessing.get_context('fork').Queue()
+        start = self.tmp / 'go'
+
+        def after_start(action):
+            def run():
+                self.wait_for(start)
+                action()
+            return run
+
+        claimers = [self.fork(after_start(lambda: claims.put(cb.claim_warm_job('me/app', 'base', 600))))
+                    for _ in range(6)]
+        others = [self.fork(after_start(cb.fill_warm_pool)) for _ in range(2)] + \
+                 [self.fork(after_start(cb.yield_warm_job)) for _ in range(2)]
+        start.touch()
+        claimed = [name for name in (claims.get(timeout=60) for _ in claimers) if name]
+        for process in claimers + others:
+            process.join(60)
+            self.assertEqual(process.exitcode, 0)
+        self.assertTrue(claimed)
+        self.assertEqual(len(claimed), len(set(claimed)), claimed)
+        deleted = self.host.deleted()
+        self.assertLessEqual({mark for _, mark in deleted}, {'retired', 'gone'})
+        self.assertFalse(set(claimed) & {name for name, _ in deleted})
+        for name in claimed:
+            self.assertNotIn(cb.WARM_JOB, self.host.config(name))
+        self.assertLessEqual(len(self.standbys()), 3)
+        self.assertEqual(set(self.standbys().values()) - {'online:s1'}, set())
+
+    def test_pool_counts_from_processes_writing_at_once_all_arrive(self):
+        def count():
+            for _ in range(25):
+                cb.note_pool('hit', vm='cbx-1-w')
+                cb.note_pool('reaped', vm='cbx-1-w', reason='stale')
+
+        writers = [self.fork(count) for _ in range(6)]
+        for process in writers:
+            process.join(60)
+            self.assertEqual(process.exitcode, 0)
+        seen = cb.pool_counters()
+        self.assertEqual((seen['counts'], seen['reaped']), ({'hit': 150, 'reaped': 150}, {'stale': 150}))
+        self.assertEqual(sorted(seen['last']), ['hit', 'reaped'])
+
+
+class WarmPoolStatus(PoolFixture, unittest.TestCase):
+    def run_job(self, offline=False):
+        args = argparse.Namespace(path=None, command=['true'], ttl=60, offline=offline, cpus=None, memory=None,
+                                  receipts=str(self.tmp / 'receipts'))
+        with mock.patch.multiple(cb, fill_warm_pool_later=lambda: None, ic_exec=lambda *a, **k: ['true'],
+                                 tee=lambda *a: 0, pull=lambda *a: None, collect_tests=mock.DEFAULT,
+                                 vm_resources=lambda name: {}, copy_artifacts=lambda name, folder: ([], True),
+                                 destroy_job=lambda name: self.host.destroy(name) and (True, None, 0.1),
+                                 host_cpus=lambda: 4):
+            return quiet(cb.run_adhoc, args)[0]
+
+    def report(self, *flags):
+        code, output = quiet(cb.main, ['pool', 'status', *flags])
+        return code, output
+
+    def test_pool_status_is_off_and_passing_on_a_host_without_a_pool(self):
+        code, output = self.report()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output.splitlines()[0], f'coldbox pool: off; write a number of VMs to {self.pool_file} '
+                         'to keep that many standby VMs')
+        code, output = self.report('--json')
+        report = json.loads(output)
+        self.assertEqual((code, report['schema_version'], report['verdict'], report['configured'], report['ready'],
+                          report['checks'], report['stamp'], report['base']), (0, 1, 'PASS', 0, 0, [], None, None))
+        self.assertEqual(report['metrics'], dict(since=None, hits=0, misses=0, reaped={}, refill_failures=0, last={}))
+        self.assertFalse(self.state.exists(), 'pool status must write nothing')
+
+    def test_pool_status_json_reports_ready_stamp_base_age_teardowns_and_event_counts(self):
+        self.pool_file.write_text('warm_pool_size = 3\n')
+        now = int(time.time())
+        self.host.add(f'cbx-{now - 900}-aaaaaa-builder', 'online:s1')
+        self.host.add(f'cbx-{now - 60}-bbbbbb-builder', 'booting', expires=now + 240)
+        self.host.add(f'cbx-{now - 300}-cccccc-builder', 'online:s0')
+        self.host.add(f'cbx-{now - 5}-dddddd-builder', f'claimed:{os.getpid()}:{cb.process_start(os.getpid())}',
+                      expires=now + 295)
+        self.host.add(f'cbx-{now - 30}-eeeeee-builder')
+        cb.note_teardown('cbx-1-finishing')
+        (self.state / 'teardown' / 'cbx-1-crashed').write_text(json.dumps([999999991, 'gone', 'cbx-1-crashed']))
+        before = sorted(path.name for path in self.state.rglob('*'))
+        code, output = self.report('--json')
+        report = json.loads(output)
+        self.assertEqual(code, 0, output)
+        self.assertEqual((report['schema_version'], report['verdict'], report['configured'], report['ready']),
+                         (1, 'PASS', 3, 1))
+        self.assertEqual(report['standbys'], dict(ready=1, booting=1, claimed=1, stale=1, retired=0))
+        self.assertEqual((report['stamp'], report['overdue']), ('online:s1', []))
+        self.assertEqual(report['base'], dict(snapshot='base-dev/warm', created_at='2026-01-01T00:00:00Z', image='f' * 64))
+        self.assertAlmostEqual(report['oldest_standby_seconds'], 900, delta=30)
+        self.assertEqual((report['teardown']['pending'], report['teardown']['abandoned']), (1, 1))
+        self.assertLess(report['teardown']['oldest_seconds'], 30)
+        self.assertEqual([check['ok'] for check in report['checks']], [True, True])
+        self.assertEqual(sorted(path.name for path in self.state.rglob('*')), before, 'pool status must write nothing')
+        self.assertTrue((self.state / 'teardown' / 'cbx-1-crashed').exists(), 'pool status must not prune records')
+
+    def test_pool_status_counts_a_hit_a_miss_and_each_reap_once_per_vm(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-w1', 'online:s1')
+        self.assertEqual(self.run_job(), 0)
+        with mock.patch.object(cb, 'new_id', lambda: 'cbx-2-cold'):
+            self.assertEqual(self.run_job(), 0)
+        self.host.add('cbx-3-w3', 'online:s0')
+        with mock.patch.object(cb, 'new_id', lambda: 'cbx-4-w4'):
+            self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+        self.assertTrue(cb.yield_warm_job())
+        report = json.loads(self.report('--json')[1])['metrics']
+        self.assertEqual((report['hits'], report['misses'], report['reaped'], report['refill_failures']),
+                         (1, 1, {'stale': 1, 'yielded': 1}, 0))
+        self.assertEqual({event: entry.get('vm') for event, entry in report['last'].items()},
+                         {'hit': 'cbx-1-w1', 'miss': 'cbx-2-cold', 'reaped': 'cbx-4-w4'})
+        self.assertEqual(report['last']['reaped']['reason'], 'yielded')
+        datetime.fromisoformat(report['since'])
+        code, output = self.report()
+        self.assertEqual(code, 0, output)
+        self.assertRegex(output, r'  events since \S+: 1 hit\(s\), 1 miss\(es\), 2 reaped \(1 stale, 1 yielded\), '
+                                 r'0 failed refill\(s\)\n')
+        self.assertRegex(output, r'  last hit: \S+ cbx-1-w1\n  last miss: \S+ cbx-2-cold\n  last reaped: \S+ cbx-4-w4 yielded\n')
+
+    def test_a_runner_claims_a_standby_whose_ready_marker_another_user_made(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-w1', 'online:s1')
+        (self.state / 'ready').mkdir(parents=True)
+        (self.state / 'ready' / 'cbx-1-w1').touch()
+        touch = Path.touch
+
+        def refuse_a_foreign_file(path, *args, **kwargs):
+            if path.exists():
+                raise PermissionError(errno.EACCES, 'Permission denied', str(path))
+            return touch(path, *args, **kwargs)
+
+        with mock.patch.object(Path, 'touch', refuse_a_foreign_file):
+            self.assertEqual(self.run_job(), 0)
+        receipt = json.loads((self.tmp / 'receipts' / 'cbx-1-w1.json').read_text())
+        self.assertEqual((receipt['verdict'], receipt['vm']['warm_claimed'], receipt.get('error')), ('pass', True, None))
+
+    def test_a_job_that_was_never_eligible_or_ran_with_the_pool_off_counts_nothing(self):
+        with mock.patch.object(cb, 'new_id', lambda: 'cbx-1-cold'):
+            self.assertEqual(self.run_job(), 0)
+        self.pool_file.write_text('1\n')
+        with mock.patch.object(cb, 'new_id', lambda: 'cbx-2-offline'):
+            self.assertEqual(self.run_job(offline=True), 0)
+        self.assertEqual(self.host.deleted(), [('cbx-1-cold', '-'), ('cbx-2-offline', '-')])
+        self.assertFalse((self.state / 'warm-pool.json').exists())
+
+    def test_pool_status_fails_while_a_pool_vm_is_past_its_expiry_and_passes_after_the_refill(self):
+        self.pool_file.write_text('1\n')
+        self.host.add('cbx-1-late', 'online:s1', expires=int(time.time()) - 5)
+        code, output = self.report('--json')
+        report = json.loads(output)
+        self.assertEqual((code, report['verdict'], report['ready'], report['overdue']), (1, 'FAIL', 0, ['cbx-1-late']))
+        self.assertIn(dict(ok=False, message='1 warm pool VM(s) past their expiry: cbx-1-late', fix='coldbox reap'),
+                      report['checks'])
+        code, output = self.report()
+        self.assertEqual(code, 1, output)
+        self.assertIn('FAIL  1 warm pool VM(s) past their expiry: cbx-1-late\n      fix: coldbox reap\n', output)
+        with mock.patch.object(cb, 'new_id', lambda: 'cbx-2-new'):
+            self.assertEqual(quiet(cb.fill_warm_pool)[0], 0)
+        code, output = self.report()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output.splitlines()[0], f'coldbox pool: 1 of 1 standby VM(s) ready ({self.pool_file})')
+        self.assertIn('PASS  0 warm pool VM(s) past their expiry\n', output)
+
+    def test_pool_status_fails_on_an_unreadable_size_or_stamp_and_is_incomplete_without_incus(self):
+        self.pool_file.write_text('many\n')
+        code, output = self.report('--json')
+        report = json.loads(output)
+        self.assertEqual((code, report['verdict'], report['configured']), (1, 'FAIL', None))
+        self.assertEqual(report['checks'], [dict(
+            ok=False, message=f"{self.pool_file} must hold a whole number or warm_pool_size = N, not 'many'",
+            fix=f'write a whole number or warm_pool_size = N to {self.pool_file}, or delete it')])
+        self.pool_file.write_text('1\n')
+
+        def unreadable(*, base=cb.BASE, offline=False):
+            raise RuntimeError('base-dev/warm is missing')
+
+        with mock.patch.object(cb, 'warm_job_stamp', unreadable):
+            self.host.add('cbx-1-w1', 'online:s1')
+            code, output = self.report('--json')
+        report = json.loads(output)
+        self.assertEqual((code, report['verdict'], report['ready'], report['stamp']), (1, 'FAIL', 0, None))
+        self.assertEqual(report['standbys']['stale'], 1)
+        self.assertIn(dict(ok=False, message='warm pool stamp unreadable, so no standby VM can be claimed: '
+                           'base-dev/warm is missing', fix='coldbox status'), report['checks'])
+
+        def down(*args, **kwargs):
+            raise subprocess.CalledProcessError(1, ['incus', *args], stderr='Error: incus is not running')
+
+        with mock.patch.object(cb, 'ic', down):
+            code, output = self.report('--json')
+            self.assertEqual(self.report()[0], 125)
+        report = json.loads(output)
+        self.assertEqual((code, report['schema_version'], report['verdict']), (2, 1, 'INCOMPLETE'))
+        self.assertIn('error', report)
+        usage = io.StringIO()
+        with self.assertRaises(SystemExit) as refused, contextlib.redirect_stdout(usage), \
+                contextlib.redirect_stderr(io.StringIO()):
+            cb.main(['pool', 'status', '--jso', '--bogus'])
+        self.assertEqual((refused.exception.code, json.loads(usage.getvalue())['verdict']), (2, 'INCOMPLETE'))
+
+    def test_coldbox_status_counts_a_standby_ready_only_when_a_job_could_claim_it(self):
+        self.pool_file.write_text('2\n')
+        later = str(int(time.time()) + 3600)
+        rows = [dict(name='cbx-1-ready', status='Running', config={cb.MANAGED: 'true', cb.EXPIRES: later,
+                                                                    cb.WARM_JOB: 'online:s1'}),
+                dict(name='cbx-1-stale', status='Running', config={cb.MANAGED: 'true', cb.EXPIRES: later,
+                                                                    cb.WARM_JOB: 'online:s0'}),
+                dict(name='cbx-1-stopped', status='Stopped', config={cb.MANAGED: 'true', cb.EXPIRES: later,
+                                                                      cb.WARM_JOB: 'online:s1'})]
+        code, output = Status.healthy_status(self, self.tmp, rows)
+        self.assertEqual(code, 0, output)
+        self.assertIn(f'  warm-pool: 1/2 standby VM(s) ready ({self.pool_file}); coldbox pool status shows the rest\n',
+                      output)
+        self.assertIn('PASS  0 warm pool VM(s) past their expiry\n', output)
+        self.assertRegex(output, r'  cbx-1-stale +Running +expires in 60 min  warm pool\n')
+        rows.append(dict(name='cbx-1-late', status='Running', config={cb.MANAGED: 'true', cb.WARM_JOB: 'online:s1',
+                                                                      cb.EXPIRES: str(int(time.time()) - 5)}))
+        code, output = Status.healthy_status(self, self.tmp, rows)
+        self.assertEqual(code, 1, output)
+        self.assertIn('FAIL  1 warm pool VM(s) past their expiry: cbx-1-late\n      fix: coldbox reap\n', output)
+        self.assertEqual(output.count('FAIL'), 1, output)
+
+    def test_coldbox_status_says_nothing_about_the_pool_on_a_host_without_one(self):
+        code, output = Status.healthy_status(self, self.tmp, [])
+        self.assertEqual(code, 0, output)
+        self.assertNotIn('warm', output.replace('base-dev/warm', ''))
+
+
+class WarmPoolPublicExport(PoolFixture, unittest.TestCase):
+    PRIVATE = re.compile(r'/home/(?!runner\b)[\w.-]+|/Users/|\b[a-z][a-z-]*-\d{2}\b|\b\d{1,3}(?:\.\d{1,3}){3}\b'
+                         r'|[\w.+-]+@[\w-]+\.[a-z]{2,}')
+
+    def test_pool_code_docs_and_reports_name_no_private_host_home_path_address_or_person(self):
+        source = (ROOT / 'coldbox').read_text()
+        readme = (ROOT / 'README.md').read_text()
+        self.pool_file.write_text('2\n')
+        now = int(time.time())
+        self.host.add(f'cbx-{now - 900}-aaaaaa-builder', 'online:s1')
+        self.host.add(f'cbx-{now - 600}-bbbbbb-builder', 'online:s1', expires=now - 5)
+        cb.note_pool('hit', vm=f'cbx-{now - 900}-aaaaaa-builder')
+        cb.note_pool('reaped', vm=f'cbx-{now - 950}-cccccc-builder', reason='stale')
+        cb.note_pool('refill_failed', error='the warm pool stamp changed while it started')
+        texts = dict(
+            pool_code=source[source.index('\ndef warm_pool_size('):source.index('\ndef vm_cmd(')],
+            report_code=source[source.index('\ndef pool_report('):source.index('\ndef status(')],
+            readme=readme[readme.index('CI jobs can also opt into a warm-standby VM pool'):
+                          readme.index('\nAdmission lasts for the runner VM lifetime')],
+            readme_command=next(line for line in readme.splitlines() if line.startswith('| `coldbox pool status')),
+            human_report=self.report_text(), json_report=self.report_text('--json'))
+        for label, text in texts.items():
+            with self.subTest(text=label):
+                self.assertTrue(text.strip())
+                self.assertEqual(self.PRIVATE.findall(text), [])
+                self.assertNotIn(str(self.state), text)
+                self.assertNotIn(str(Path.home()), text)
+
+    def report_text(self, *flags):
+        return quiet(cb.main, ['pool', 'status', *flags])[1].replace(str(self.pool_file), '/etc/coldbox/warm-pool')

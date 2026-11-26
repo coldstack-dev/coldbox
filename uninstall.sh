@@ -2,6 +2,10 @@
 set -euo pipefail
 
 [[ $EUID == 0 ]] || { echo 'coldbox uninstall: run with sudo' >&2; exit 1; }
+if (( $# > 1 )) || { (( $# == 1 )) && [[ $1 != --remove-app-credentials ]]; }; then
+    echo 'usage: sudo ./uninstall.sh [--remove-app-credentials]' >&2
+    exit 2
+fi
 ic() { incus --force-local "$@"; }
 prefix=$(sed -n 's/^COLDBOX_NAME_PREFIX=//p' /etc/coldbox/incus.env 2>/dev/null || true)
 prefix=${prefix:-coldbox}
@@ -53,6 +57,17 @@ if command -v ufw >/dev/null && [[ -f /var/lib/coldbox/ufw-rules ]]; then
     done < /var/lib/coldbox/ufw-rules
     rm -f /var/lib/coldbox/ufw-rules
 fi
+shopt -s nullglob
+for path in /etc/coldbox/github-app.pem /etc/coldbox/github-app.env /etc/coldbox/github-app-*.{pem,env}; do
+    if [[ ! -e $path && ! -L $path ]]; then
+        echo "Absent: $path"
+    elif [[ ${1-} == --remove-app-credentials ]]; then
+        rm -f -- "$path"
+        echo "Removed: $path"
+    else
+        echo "Kept: $path (use --remove-app-credentials to remove)"
+    fi
+done
 [[ -z ${kept-} ]] || { echo "$kept" >&2; exit 1; }
 echo 'coldbox uninstall: PASS removed Coldbox VMs, network, storage, services and CLI.'
 echo 'Kept: Incus itself, installed packages and receipts in /var/lib/coldbox (delete them yourself if unwanted).'

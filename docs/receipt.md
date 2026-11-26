@@ -1,7 +1,11 @@
 # Receipt format: `coldbox.receipt/v1`
 
-Every job VM writes one JSON receipt to `/var/lib/coldbox/receipts/<id>.json`, with its full console log next to it
+Every job VM writes one JSON receipt to `/var/lib/coldbox/receipts/<id>.json`, with its console log next to it
 (`<id>.log`). `coldbox run --receipts DIR` writes them to DIR instead, for stress and test runs. `examples/receipts/` has real ones.
+
+The tail of a truncated log stays in memory until the job finishes. An abrupt worker kill can leave only the head
+and marker. Timing statistics that need timestamps from omitted lines may be unavailable. Runner verdicts use
+the job result observed during capture.
 
 ## Stability
 
@@ -29,13 +33,14 @@ Optional fields are missing, not `null`, when they don't apply, except where not
 | `reason_code` | string | Stable outcome detail on newly finalized receipts. See below |
 | `verification` | object | Check publication state for runner and selected host-suite jobs, and for receipts finished by `coldbox reap`. `pending` means publication is unresolved. `sending` means the POST may have reached GitHub. `posted` records `check_id`. `not_posted` records the `reason` |
 | `started_at` | string | ISO 8601 UTC |
-| `log` | string | Path of the console log on the host |
+| `log` | string | Path of the console log on the host. Coldbox retains up to 1 MiB per job. Longer logs keep the beginning and end with a truncation marker between them |
+| `console_truncated_bytes` | int | On truncated logs, the number of original output bytes omitted |
 | `exit` | int | Exit code of the job command in the VM |
 | `job_seconds` | number | Time the job command ran. Runner mode: includes the wait for GitHub to assign a job |
 | `job_started_at`, `job_ended_at` | string | ISO 8601 UTC, when the job command started and ended on the host |
 | `seconds` | number | VM create to VM destroyed |
 | `error` | string | Why the job could not finish (`TTL reached`, `no job before the burst idle limit`, `stopped`, a failed command) |
-| `vm` | object | `name`, `image`, `ttl_seconds`, `offline`, `ready_seconds` (create to VM agent and cloud-init ready), `clone_seconds` (copying the base), `boot_seconds` (start to ready), `host_ceiling` (the host's VM ceiling, its CPU threads), `destroyed` (bool), `destroyed_at`, `destroy_seconds` (delete and confirm), `lifetime_seconds` |
+| `vm` | object | `name`, `image`, `ttl_seconds`, `offline`, `ready_seconds` (create to VM agent and cloud-init ready), `clone_seconds` (copying the base; `0.0` when claimed from the warm pool), `boot_seconds` (start to ready; `0.0` when claimed from the warm pool), `warm_claimed` (optional bool, `true` when claimed from the standby warm pool), `teardown` (optional string, `"async"` when handed to the background teardown reaper), `host_ceiling` (the host's VM ceiling, its CPU threads), `destroyed` (bool), `destroyed_at`, `destroy_seconds` (delete and confirm), `lifetime_seconds` |
 | `resources` | object | Read just before the VM is destroyed: `cpus` and `memory_bytes` given (`limits.cpu`, `limits.memory`), `peak_rss_bytes` (peak resident memory of the VM's QEMU process on the host), `cpu_seconds` (CPU time Incus reports for the VM), `disk_read_bytes` and `disk_write_bytes` (the guest's whole disks, from Incus metrics). Unlike other fields, a value that could not be read is `null`; collecting them never changes the verdict |
 | `vm.reclaimed_bytes` | int | Observed drop in ZFS pool usage around successful VM deletion when that VM is the only job using the pool. Missing when the pool delta could not be attributed |
 | `cache` | object | Runner jobs and authorized exact-SHA direct jobs of a repo with a host cache folder: `in_bytes` (size of the `npm.tar` unpacked into the VM, 0 when there was none), `in_seconds` and `in_exit` (the guest `tar -x` exit; non-zero never fails the job). After a runner job passes on a push to the default branch, also `out_bytes` and `out_seconds` for the saved `~/.npm`, `out_bytes: 0` with `out_absent: true` when the job never made that folder, or `out_bytes: 0` with `out_refused` when tar failed, it was over 2 GiB or another job of the repo was saving; the saved tar is then kept. `pip` holds the same fields for `pip.tar` and `~/.cache/pip`, `go` for `go.tar` and `~/go/pkg/mod` (the module cache only), `cargo` for `cargo.tar` and `~/.cargo/registry`, `cargo-git` for `cargo-git.tar` and `~/.cargo/git` |
@@ -47,8 +52,9 @@ Optional fields are missing, not `null`, when they don't apply, except where not
 | `job_result` | string | Runner mode: the runner's conclusion, `Succeeded`, `Failed` or `Canceled` |
 | `github` | object | Runner mode, from the job-started hook: `repo`, `sha`, `ref`, `event`, `workflow`, `job` (the job id), `run_id`, `run_attempt`, `actor`, `fork_pr` (true, false, or null when the event can't show where the code came from), `refused` (null or a reason) |
 | `tests` | object | Present when JUnit XML reports were found. See below |
-| `tests_ran` | int | Tests that ran and were not skipped, `0` when nothing showed a test ran. Written once the job command ends; missing if the VM failed before that or the count could not be read. See below |
-| `tests_source` | string or null | Source of `tests_ran`. `junit` identifies the `tests` reports, `cold-verify` identifies a ColdVerify result, and `host-suite` identifies a host observation. Null indicates no source was found |
+| `tests_ran` | int | Tests that ran and were not skipped, `0` when nothing showed a test ran. Includes tests observed before an interruption. Omitted when collection could not run or the count could not be read. See below |
+| `tests_missing_reason` | string | Why an incomplete receipt lacks test evidence. See below |
+| `tests_source` | string or null | Observed evidence source, including a ColdVerify result with an unreadable count. `junit` identifies the `tests` reports, `cold-verify` identifies a ColdVerify result, `job-log` identifies a test summary parsed from the runner job log, and `host-suite` identifies a host observation. Null indicates no source was found |
 | `isolation` | object | `coldbox selftest isolation` only (ad-hoc mode, repo `selftest`): `expected` (`cpus`, `memory_bytes`, `disk_bytes` from the profile, `write_bytes` the root disk plus 1 GiB), `found` (the guest's `probes` with `kind` `host`, `lan`, `tailnet`, `ipv6` or `control`, `address`, `port`, `error` and `errno`, both null when it connected; every probe but the control and public IPv6 targets the host's own address on a port the host is listening on, and `ipv6` probes must fail with ENETUNREACH; `cpus` from `nproc`'s affinity, `memory_bytes` from `MemTotal`, `disk_bytes` the size of the block device holding `/`, `written_bytes`, `write_errno`) or null if the guest reported nothing, and `problems`. Any problem makes the verdict `fail` |
 | `reason` | string | Why a job that otherwise succeeded reads `incomplete`: no tests ran, or the test count could not be read |
 | `reconciled_by` | string | `coldbox reap` when the reaper, not the worker, finalized the receipt after the worker died and its VM was gone |
@@ -162,8 +168,19 @@ discovered JUnit XML and may include fixture reports. Otherwise, Coldbox takes t
 test case per passing test. Without reports, it reads `.cold/verify-result.json`, which ColdVerify writes into the checkout, from any
 checkout under the same folders, written during the job and not committed (in local mode, not copied in from
 `git archive`), and adds up their `tests_ran`. If one of those files can't be read or has no valid `tests_ran`, the
-count is left out and the job reads `incomplete` with `reason` set. A job with neither, such as a lint-only or deploy job, reads `incomplete` with `reason` set, never `pass`. Ad-hoc commands
+count is left out and the job reads `incomplete` with `reason` set. For a runner job with none of those reports,
+Coldbox reads the GitHub Actions job log after teardown and counts executed (non-skipped) tests from `unittest`,
+`pytest`, `cargo test` and `go test` summaries with `tests_source` set to `job-log`. A job with none of these, such as
+a lint-only or deploy job, reads `incomplete` with `reason` set, never `pass`. Ad-hoc commands
 (`coldbox run -- COMMAND`) keep their exit-code verdict; their count covers only reports under `$COLDBOX_JOB_DIR/junit`.
+
+An interrupted job retains the test reports it produced before teardown. An empty JUnit report keeps its file path
+and zero counts in `tests`. When an incomplete receipt has no test report, `tests_missing_reason` is
+`no_test_report` after a successful scan or `test_count_unavailable` when the count could not be collected.
+
+In `coldbox stats --json`, `requests.missing_observations` lists each accepted request without a definitive outcome.
+Each entry identifies the direct submission or GitHub repository and job ID. It includes the recorded verdict and
+reason, or a null verdict with the missing assignment or terminal observation.
 
 ### `suite_observation`
 

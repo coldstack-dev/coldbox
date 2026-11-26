@@ -26,6 +26,12 @@ class ReleaseManifest(unittest.TestCase):
             with self.subTest(finding=finding):
                 self.assertIn(finding, approved)
 
+    def test_audit_closeouts_stay_out_of_the_public_export(self):
+        excluded = json.loads(MANIFEST.read_text())['exclude']
+        for closeout in ('docs/oss-audit-2026-45.md', 'docs/oss-audit-2026-47.md', 'docs/oss-audit-2026-47-tailnet-fixture.md'):
+            with self.subTest(closeout=closeout):
+                self.assertIn(closeout, excluded)
+
 
 if __name__ == '__main__':
     unittest.main()

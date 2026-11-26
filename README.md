@@ -17,8 +17,8 @@ A self-hosted runner executes whatever a workflow tells it to. Coldbox limits wh
   [warns](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#self-hosted-runner-security)
   that on public repos a fork's pull request can run code on your machine.
 - **A public repo you own runs only with your opt-in, and only its writers' own code runs.**
-  `coldbox register OWNER/REPO --allow-public` (the flag, not an environment variable) serves one public repo owned by a
-  user account, and records `COLDBOX_ALLOW_PUBLIC=1` in that repo's service. Jobs triggered by a user with write access
+  `coldbox register OWNER/REPO --allow-public` (the flag, not an environment variable) serves one public repo and
+  records `COLDBOX_ALLOW_PUBLIC=1` in that repo's service. Jobs triggered by a user with write access
   then run at once, except fork pull requests (next item). Coldbox refuses the repo, and logs the fix, unless its
   Actions setting requires approval for all outside contributors, a second lock in case a fork check is ever missed:
   `gh api -X PUT repos/OWNER/REPO/actions/permissions/fork-pr-contributor-approval -f approval_policy=all_external_contributors`.
@@ -27,7 +27,10 @@ A self-hosted runner executes whatever a workflow tells it to. Coldbox limits wh
   `pull_request_target` or `workflow_run` job is never run. Each runner remembers the
   writer list it started with. If the setting is relaxed or write access changes, every autoscale pass (each 30 seconds)
   deregisters this host's idle runners whose list is out of date, so their workers start over with fresh rules; running
-  jobs keep going. An org-owned public repo is refused.
+  jobs keep going. To serve an organization-owned public repo, configure its App with the expected sole member.
+  At registration, during autoscaling, and when a waiting runner receives a job, Coldbox checks that the organization
+  has exactly that member, the repo has no outside collaborators, and the approval policy still holds. The VM hook
+  waits for the host's decision before workflow steps can start. An unreadable policy or membership list refuses the job.
 - **Fork pull requests never run, on any repo.** No setting, opt-in or approval on GitHub changes this. The autoscaler
   starts no VM for a run whose head repo differs from the repo, and the job-started hook inside the VM fails any job
   that reaches one anyway before any step runs, when the pull request's (`pull_request`, `pull_request_target`) or
@@ -81,27 +84,6 @@ A self-hosted runner executes whatever a workflow tells it to. Coldbox limits wh
   16 GiB, plus 1.5 GiB for the host's own idle use) plus one job VM (5.5 GiB with the default sizing) and less free space under `/var/lib` than
   the storage pool needs (`COLDBOX_POOL_SIZE` for ZFS, one `--disk` for `dir`), and stops with the fix. 8 GB runs one
   3 GiB job VM at a time.
-- A GitHub account with admin rights on the repo (or org) you register.
-
-Coldbox authenticates as a GitHub App you own, with only the permissions it needs: Administration read/write (to
-add and remove runners), Actions read (to see queued jobs), Checks read/write (to post `coldbox verify`), Contents
-read (to compare trees and clone private repos) and Metadata read. An App for org-wide runners also gets the
-organization self-hosted runners permission. `coldbox setup-app` prints a link to GitHub's App form with exactly
-those permissions filled in. After you create the App, `sudo coldbox setup-app --app-id <id> --key <pem>` checks the
-key against GitHub and refuses an App with any other permission. It then puts the key at `/etc/coldbox/github-app.pem`
-(mode 600, owned by you) and the App ID in `/etc/coldbox/github-app.env`. Install the App on the repos you register.
-
-Every GitHub API call, including `gh` subprocesses, then uses a short-lived installation token. Tokens stay in process
-memory and refresh five minutes before expiry. Targeted calls select the installation by owner; host-wide lookups and
-`status` use the first available installation. No key or token is written to logs. A configured App that fails stops
-the request without falling back.
-
-Without the App, Coldbox refuses to call GitHub. `coldbox register OWNER/REPO --allow-personal-login` opts that runner
-into your personal `gh auth login`, which can do anything your account can; other commands take
-`COLDBOX_ALLOW_PERSONAL_LOGIN=1`. `coldbox status` names the active auth and warns on a personal login.
-
-The JWT follows [GitHub's RS256 requirements](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app)
-and uses the host's `openssl` executable with Python's standard library.
 
 macOS, Windows and ARM hosts are not supported: Coldbox needs Incus with KVM on a Linux host. An old laptop or desktop
 with Linux on it is the target.
@@ -114,18 +96,81 @@ hardware virtualization check. Install Linux on a spare machine, or use a VPS wi
 
 ## Quickstart
 
+### Run checks locally
+
+Install Coldbox on a supported host.
+
 ```sh
 git clone https://github.com/TayHCode/coldbox.git && cd coldbox && sudo ./install.sh
-coldbox setup-app                                                                      # prints the GitHub App link; create it
-sudo coldbox setup-app --app-id 123456 --key ~/Downloads/coldbox.private-key.pem       # then install the App on the repo
-coldbox detect ~/src/myrepo > ~/src/myrepo/coldbox.toml                                 # review, switch checks on/off
-git -C ~/src/myrepo add coldbox.toml && git -C ~/src/myrepo commit -m 'Add coldbox.toml' # run uses the committed HEAD
-coldbox run ~/src/myrepo                                                                # checks in a throwaway VM
-coldbox detect --workflow ~/src/myrepo > coldbox.yml &&                                  # refuses if a workflow already
-  [ ! -e ~/src/myrepo/.github/workflows/coldbox.yml ] &&                                # requires executed tests; never
-  install -Dm644 coldbox.yml ~/src/myrepo/.github/workflows/coldbox.yml                # overwrites; commit, push
-coldbox register you/myrepo                                                              # 1 slot, or 0 (on demand) if none fits
 ```
+
+Open your project checkout. Run `coldbox detect .` to preview the suggested checks.
+To create `coldbox.toml`, run this block from that checkout. It reports an existing
+config and keeps it in place. If detection fails, the block exits non-zero.
+
+```sh
+(
+  if [ -e coldbox.toml ] || [ -L coldbox.toml ]; then
+    printf '%s\n' 'coldbox.toml already exists. Keeping it.'
+    exit 0
+  fi
+  config=$(coldbox detect .) || exit "$?"
+  staged=$(mktemp .coldbox.toml.XXXXXX) || exit "$?"
+  trap 'rm -f -- "$staged"' EXIT
+  printf '%s\n' "$config" > "$staged" && ln -T -- "$staged" coldbox.toml
+)
+```
+
+Review the checks and commit any changes to `coldbox.toml` before running. Coldbox
+runs the committed `HEAD`. This local run works without a GitHub account or App.
+
+```sh
+coldbox run .
+```
+
+Open the JSON receipt at the path printed by the run. Check the executed-test
+count (`tests_ran`), `verdict`, and `vm.destroyed`. See the
+[recorded one-test runs](docs/install-trials.md) for examples.
+
+### Set up GitHub Actions
+
+For GitHub CI, use an account with admin rights on the repo or organization you
+register.
+
+```sh
+coldbox setup-app                                                                     # prints the GitHub App link
+sudo coldbox setup-app --app-id 123456 --key ~/Downloads/coldbox.private-key.pem       # then install the App on the repo
+coldbox detect --workflow ~/src/myrepo > coldbox.yml &&                                 # refuses if a workflow already
+  [ ! -e ~/src/myrepo/.github/workflows/coldbox.yml ] &&                                # requires executed tests; never
+  install -Dm644 coldbox.yml ~/src/myrepo/.github/workflows/coldbox.yml                 # overwrites; commit, push
+coldbox register you/myrepo                                                            # 1 slot, or 0 (on demand) if none fits
+```
+
+Coldbox authenticates as a GitHub App you own, with only the permissions it needs: Administration read/write (to
+add and remove runners), Actions read (to see queued jobs), Checks read/write (to post `coldbox verify`), Contents
+read (to compare trees and clone private repos) and Metadata read. An App for org-wide runners also gets the
+organization self-hosted runners permission. `coldbox setup-app` prints a link to GitHub's App form with exactly
+those permissions filled in. After you create the App, `sudo coldbox setup-app --app-id <id> --key <pem>` checks the
+key against GitHub and refuses an App with any other permission. It then puts the key at `/etc/coldbox/github-app.pem`
+(mode 600, owned by you) and the App ID in `/etc/coldbox/github-app.env`. If setup stops between writes, rerun the same command with the same account, App ID and key.
+It reports the missing path and completes the matching pair. Install the App on the repos you register.
+
+For public repos in a single-member organization, run `coldbox setup-app --org ORG --sole-member LOGIN`.
+Use the same two options when installing the downloaded key. This App adds organization Members read to the
+repository permissions above. Install it on the selected repositories. Coldbox stores its files alongside the
+default App as `github-app-ORG.pem` and `github-app-ORG.env`, using the lowercase organization login.
+
+Every GitHub API call, including `gh` subprocesses, then uses a short-lived installation token. Tokens stay in process
+memory and refresh five minutes before expiry. Targeted calls select the installation by owner; host-wide lookups and
+`status` use the first available installation. No key or token is written to logs. A configured App that fails stops
+the request without falling back.
+
+Without the App, Coldbox refuses to call GitHub. `coldbox register OWNER/REPO --allow-personal-login` opts that runner
+into your personal `gh auth login`, which can do anything your account can; other commands take
+`COLDBOX_ALLOW_PERSONAL_LOGIN=1`. `coldbox status` names the active auth and warns on a personal login.
+
+The JWT follows [GitHub's RS256 requirements](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app)
+and uses the host's `openssl` executable with Python's standard library.
 
 `coldbox status` shows whether everything is healthy (with the fix for anything that is not), the registered repos,
 running job VMs and the latest receipts.
@@ -258,7 +303,9 @@ On a host below x86-64-v3, a `python` line fails the rebuild, because Python's i
 
 To add your own files to every job VM, put them under `/etc/coldbox/guest/` on the host at the path they should have in the
 VM. Each newly started job VM receives them without a base rebuild. For example, `/etc/coldbox/guest/opt/tools/run` becomes `/opt/tools/run`. They are
-copied owned by root with file modes kept, at each job and each base build. The startup copy adds and replaces files.
+copied owned by root with file modes kept. A managed clone skips the copy when the host overlay and the guest paths
+still match the stamp recorded during the base build. Older bases and explicit `--image` VMs receive the full overlay.
+The startup copy adds and replaces files.
 Runner VMs already waiting for a job keep the overlay copied when they started.
 A directory the overlay created takes the overlay's current mode at each copy. A directory the VM already had, such as
 `/etc` or `/opt`, keeps its own mode and stays a symlink if it is one. A base built before this change does not know
@@ -314,7 +361,8 @@ To compare a host's build with a commit, run `git show <ref>:coldbox | sha256sum
 | `coldbox --version` | Prints the version and the first 12 hex characters of the running file's SHA-256, for example `coldbox 0.2.0 (build 0123456789ab)`. Releases are tagged `vX.Y.Z`. |
 | `coldbox status` | Prints the same version and build first, then health checks, registered repos with their GitHub visibility, job VMs and recent receipts. For each active runner supervisor, it reports the startup build as `current` or `stale` relative to the installed CLI. A supervisor without matching startup evidence reports `unknown`. A registered repo that is now public without `--allow-public`, or whose visibility cannot be read, is a FAIL. Exit 1 if a check fails. |
 | `coldbox status --hosts` | Reports each configured host's installed build, verdict, orphan job VMs, last receipt and jobs in the last 24 h. Reports loaded supervisor builds and fleet health findings below the table. Exit 1 unless every host passes. Without `/etc/coldbox/ci-hosts.json`, it checks only this host. |
-| `coldbox stats [--since 1h] [--receipts DIR]... [--json]` | Shows observed request outcomes, settled VM outcomes, queue wait, job throughput, timing coverage and host saturation in the window. Repeat `--receipts` to combine host data. `--json` adds `savings`: `vm_minutes` for every VM in the window, and `billable_minutes` (each GitHub Actions runner job's wall time rounded up to a minute, as GitHub bills) times GitHub's Linux 2-core rate as `estimated_usd`. Runner jobs without a measured wall time (older receipts, or a failed GitHub lookup) are left out and counted in `unmeasured_jobs`. |
+| `coldbox stats [--since 1h] [--receipts DIR]... [--json]` | Shows observed request outcomes, settled VM outcomes, queue wait, job throughput, timing coverage and host saturation in the window. Repeat `--receipts` to combine host data; a receipt found in more than one directory counts once, by its `id`. `--json` adds `savings`: `vm_minutes` for every VM in the window, and `billable_minutes` (each GitHub Actions runner job's wall time rounded up to a minute, as GitHub bills) times GitHub's Linux 2-core rate as `estimated_usd`. Runner jobs without a measured wall time (older receipts, or a failed GitHub lookup) are left out and counted in `unmeasured_jobs`. |
+| `coldbox pool status [--json]` | Shows the warm pool of standby VMs for CI jobs: the configured and ready counts, the stamp a standby must carry, standby VMs by state and the oldest one's age, pending VM teardowns, and hit, miss and reap counts. It reads only. Exits 0 when the pool is healthy or off, and 1 when a pool VM is past its expiry or the pool size or stamp cannot be read. |
 | `coldbox shell --repo PATH [--ttl S]` | Opens an interactive shell in an offline throwaway VM with the checkout's committed HEAD in `~/repo`, and destroys the VM when the shell exits. It writes a receipt with `mode: "shell"`. |
 | `coldbox run PATH [--offline] [--receipts DIR]` | Copies the committed HEAD (`git archive`) into a fresh VM, runs `coldbox checks`, writes a receipt, destroys the VM. Exit 0 pass, 1 fail, 125 incomplete. `--receipts DIR` (either form of `run`) writes the receipt to DIR instead of `/var/lib/coldbox/receipts`, so stress and test runs stay out of the production receipts; the job still counts against the host ceiling. At the ceiling `run` waits up to 30 minutes for room, then exits 1. |
 | `coldbox run --repo OWNER/REPO --sha SHA` | Like `coldbox run PATH`, but the VM clones that exact commit from GitHub. With GitHub App auth, Coldbox mints a token limited to that one repo with Contents: read and hands it to the clone over stdin; if there is no App, or it is not installed on the repo with Contents: read, Coldbox says so and clones anonymously, so only public repos work. Private clones stay off until the App is granted Contents: read. It uses the default VM size, not `[vm] size`. |
@@ -328,7 +376,7 @@ To compare a host's build with a commit, run `git show <ref>:coldbox | sha256sum
 | `coldbox serve OWNER/REPO --once` | The loop the service runs, in the foreground; `--once` stops after one VM and exits 0 for `pass`, 1 for `fail`, 125 otherwise (like `coldbox run`). |
 | `coldbox reap [--keep-days 30]` | Deletes job VMs past their TTL (`--ttl`, default 6h for runners, 1h for `run`), job VMs other than `vm up` ones with no live worker (left behind by a reboot or a crash) regardless of TTL, and receipts, job logs, submission logs, and artifacts older than 30 days. Active or unreconciled jobs keep their evidence until the reaper can settle them. Every VM Coldbox creates carries `user.coldbox.managed=true` and `user.coldbox.expires` (Unix seconds, or `never` for the live `base-dev` and a base still being built); reap gives the retired `base-prev` 14 days for `build-base --rollback`, then deletes it and any other marked VM past its expiry. It finalizes each receipt in `/var/lib/coldbox/receipts` whose VM and worker are gone (`vm.destroyed: true`, `reconciled_by`). The reaper timer runs it every minute. `coldbox status` FAILs while such a VM or receipt exists, and on any receipt still at `vm.destroyed: false` past its TTL even if its worker is alive, and on any instance in the project without both marks, such as a hand-renamed old base. |
 | `sudo coldbox build-base [--rollback]` | Rebuilds `base-dev/warm` with current packages and the newest actions-runner (what the weekly timer runs), or restores `base-prev` without rebuilding. Repeated rollback commands are safe until another rebuild starts. |
-| `sudo ./uninstall.sh` | Removes everything Coldbox created except Incus itself and the receipts. It deletes only the Incus project, network, ACL and pool marked `user.coldbox.managed=true`; `install.sh` sets that mark and refuses to take over a same-named resource without it. The one exception is an unmarked pool whose every user is in Coldbox's own marked project (an install from before the mark): it marks that pool and changes nothing else. Likewise, it deletes only the UFW rules that `install.sh` added (listed in `/var/lib/coldbox/ufw-rules`). |
+| `sudo ./uninstall.sh` | Keeps the GitHub App key and ID by default and reports each path. Use `sudo ./uninstall.sh --remove-app-credentials` to delete both installed files. Incus, installed packages and receipts are retained. It deletes only the Incus project, network, ACL and pool marked `user.coldbox.managed=true`; `install.sh` sets that mark and refuses to take over a same-named resource without it. The one exception is an unmarked pool whose every user is in Coldbox's own marked project (an install from before the mark): it marks that pool and changes nothing else. Likewise, it deletes only the UFW rules that `install.sh` added (listed in `/var/lib/coldbox/ufw-rules`). |
 
 Stats counts observed requests accepted in the window and how many were assigned, reached a terminal
 outcome (including incomplete), or got a definitive pass or fail. The definitive share uses observed
@@ -455,6 +503,41 @@ A host can also limit ad-hoc VMs, counted apart from CI: `echo 6 | sudo tee /etc
 refuses while that many `vm up` VMs exist; they still count against the host's job VM ceiling. Without the file there is
 no separate limit, and `coldbox status` shows it when set. `vm up` always refuses on the CI primary, so CI keeps its places.
 
+A host can keep up to two booted VMs ready for a plain `vm up` or `vm up --offline`, so either is ready in about 2 s
+instead of about 30 s: `echo offline offline | sudo tee /etc/coldbox/vm-warm` (any two of `online` and `offline`). A
+`vm up` takes one under the host lock and it becomes that caller's ad-hoc VM; it is never returned to the pool. The
+reaper boots a replacement, and so does the `vm up` that took one. A warm VM is deleted and replaced when the CLI, the
+base snapshot, the `coldbox` profile or the guest overlay changes, or 6 h after it booted. Warm VMs count against the job
+VM ceiling but not `vm-max`, and a cold `vm up` that would pass that ceiling deletes one to make room. A claimed VM is
+handed out only after its agent answers and its network rules are set; otherwise it is deleted and the `vm up` boots a
+fresh VM. `vm list`, `vm exec` and `vm down` never show warm VMs. A `vm up` with any other option boots a VM as before. Deleting the file deletes the warm VMs at the next reap.
+
+CI jobs can also opt into a warm-standby VM pool (default `0`, off) by writing a count or `warm_pool_size = N` to
+`/etc/coldbox/warm-pool` (or setting `COLDBOX_WARM_POOL_SIZE`). When enabled, `coldbox reap` and post-claim refills keep
+up to `N` clean pre-booted VMs keyed by the CLI, base snapshot, `coldbox` profile, guest overlay content, and host checks
+stamp (`user.coldbox.warm-job`). Any change to the base snapshot or guest overlay invalidates and reaps stale standby VMs.
+Claims are atomic under the host lock, verify isolation and agent health, clear the warm tag permanently, and still destroy
+the VM after a single job. Continuous `coldbox serve` workers also hand off post-job VM deletion to a bounded background
+teardown reaper tracked under `STATE/teardown/` and drained on reload or shutdown, so the slot can start the next runner
+immediately without losing crash recovery in `coldbox reap`.
+
+A standby VM is prepared before any job exists. It holds the CLI and the guest overlay, and no token, repo or job input.
+A job takes one only while it is running, carries the current stamp and has over a minute left. Once taken it loses its
+pool mark for good, so no VM is handed to a second job, even when its delete fails. The next refill deletes a claim that
+is not finished within 5 minutes or whose process died, a standby within 10 minutes of its 6 h TTL, one with an older
+stamp and any beyond `N`. Each standby boot passes the same admission check as a job VM, so the pool never takes memory,
+disk or a place a job could not have had, and a job that needs the room deletes a standby to get it. After a crash or a
+reboot the next `coldbox reap` deletes what was left: a VM mid-boot, a VM mid-claim, a stopped standby and a VM whose job
+ended without a delete. It deletes no VM that a live worker holds.
+
+`coldbox pool status` shows the configured and ready counts, the pool stamp and base image, standby VMs by state
+(`ready`, `booting`, `claimed`, `stale`, `retired`), the oldest one's age, the VM teardowns still pending, and the hits,
+misses and reaps counted since `warm-pool.json` appeared in the state folder. A hit is a job VM taken from the pool. A
+miss is a job VM that could have come from the pool and booted cold. Reaps are counted by cause: `stale` (the stamp
+changed), `expired`, `excess`, `abandoned` (a crashed boot or claim), `yielded` (deleted to make room for a job) and
+`unhealthy` (failed its checks when claimed). The command fails while a pool VM is past its expiry or the pool size or
+stamp cannot be read, and `coldbox status` runs the same checks. Delete `warm-pool.json` to start the counts again.
+
 Admission lasts for the runner VM lifetime configured with `--ttl`.
 An idle runner VM is recycled when its TTL ends. A job that starts just before then can be cut off, so raise `--ttl` if your jobs are long.
 
@@ -486,7 +569,7 @@ builds are listed separately, so check those rows too.
 
 ### JSON output
 
-Both commands emit one JSON object with `schema_version: 1`. Usage errors follow the CLI's
+These commands emit one JSON object with `schema_version: 1`. Usage errors follow the CLI's
 standard exit 2 behavior and write to stderr.
 
 | Command | Exit 0 | Exit 1 | Exit 2 | Schema |
@@ -494,6 +577,13 @@ standard exit 2 behavior and write to stderr.
 | `coldbox status --json` | Health checks pass | A health check fails | Status cannot be read | [Status v1](docs/status.schema.json) |
 | `coldbox status --hosts --json` | All hosts pass | At least one host fails, including build drift | No host reports failure and at least one is incomplete, or the fleet cannot be read | [Status v1](docs/status.schema.json) |
 | `coldbox stats --json` | The report is readable with zero receipt-based orphans | At least one receipt indicates an orphan | Evidence is unreadable and no orphan is known, or stats cannot produce a report | [Stats v1](docs/stats.schema.json) |
+| `coldbox pool status --json` | The warm pool is healthy or off | A pool VM is past its expiry, or the pool size or stamp cannot be read | The pool cannot be read | Fields below |
+
+`coldbox pool status --json` adds `verdict`, `configured` (`null` when unreadable), `ready`, `standbys` (a count per
+state), `overdue` (the names of pool VMs past their expiry), `stamp`, `base` (`snapshot`, `created_at`, `image`),
+`oldest_standby_seconds`, `teardown` (`pending`, `abandoned` for records a dead worker left, `oldest_seconds`),
+`metrics` (`since`, `hits`, `misses`, `reaped` by cause, `refill_failures`, and `last` with the newest event of each
+kind) and `checks` in the shape status uses.
 
 Stats still reports historical job outcomes. A failed job with a cleaned-up VM is a valid
 observation. `unreadable_receipts` counts unreadable receipt files and unreadable input directories.
@@ -545,7 +635,7 @@ Coldbox stays a separate repo. Other tools connect through two plain seams:
   receipt (up to 100 MiB and 1000 files), listed in the receipt's `artifacts`.
 - **Cleanup (for Coldcleaner):** `coldbox reap` is idempotent and deletes only VMs in Incus project `coldbox`: `cbx-*` ones whose
   `user.coldbox.expires` has passed, whose name is older than a day with no readable expiry, or that no live worker owns
-  (except `vm up` VMs), other VMs marked `user.coldbox.managed=true` whose expiry has passed (including `base-prev` 14 days after it was retired), plus receipts and their artifacts older than `--keep-days`. `sudo ./uninstall.sh` removes everything else.
+  (except `vm up` VMs), other VMs marked `user.coldbox.managed=true` whose expiry has passed (including `base-prev` 14 days after it was retired), plus receipts and their artifacts older than `--keep-days`. Use `sudo ./uninstall.sh` to remove the Coldbox services and managed Incus resources.
 
 ## Tested on
 

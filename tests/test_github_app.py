@@ -70,6 +70,13 @@ class AppAuth(unittest.TestCase):
                                   input=f'{header}.{payload}'.encode(), capture_output=True)
         self.assertEqual(verified.returncode, 0)
 
+    def test_member_token_requires_confirmed_read_permission(self):
+        scope = dict(repositories=['repo'], permissions=dict(members='read', metadata='read'))
+        with mock.patch.object(cb.urllib.request, 'urlopen', self.response):
+            with self.assertRaisesRegex(RuntimeError, 'does not confirm'):
+                cb.app_token('repos/owner/repo', scope)
+        self.assertEqual(cb.APP_TOKENS, {})
+
     def test_repo_token_asks_for_one_repository_with_contents_read_only(self):
         with mock.patch.object(cb.urllib.request, 'urlopen', self.response):
             self.assertEqual(cb.repo_token('owner/app'), 'test-token')
@@ -140,6 +147,14 @@ class AppAuth(unittest.TestCase):
                     cb.GitHub().get('repos/owner/repo')
                 self.assertEqual(run.call_args.args[0], ['gh', 'auth', 'token'])
                 self.assertEqual(self.requests[-1].get_header('Authorization'), 'Bearer legacy')
+
+    def test_managed_user_owner_keeps_the_default_signing_key(self):
+        requests = [[dict(id=7, account=dict(login='dev_enterprise'))],
+                    dict(token='fixture', expires_at='2099-01-01T00:00:00Z')]
+        with mock.patch.object(cb, 'app_request', side_effect=requests), \
+                mock.patch.object(cb, 'app_jwt', return_value='fixture-jwt') as sign:
+            self.assertEqual(cb.app_token('repos/dev_enterprise/repo'), 'fixture')
+        sign.assert_called_once_with('12345', self.key)
 
     def test_other_owner_cannot_reuse_cached_token(self):
         with mock.patch.object(cb.urllib.request, 'urlopen', self.response):
@@ -321,6 +336,52 @@ class SetupApp(unittest.TestCase):
             code = cb.setup_app(args)
         return code, output.getvalue()
 
+    def test_owner_scoped_setup_and_token_selection_preserve_default_app(self):
+        self.setup('--app-id', '4242', '--key', str(self.download))
+        legacy_key = self.key.stat().st_ino
+        flags = ('--org', 'Acme', '--sole-member', 'Alice')
+        _, output = self.setup(*flags)
+        query = dict(cb.urllib.parse.parse_qsl(cb.urllib.parse.urlsplit(output.split('Open ')[1].split()[0]).query))
+        wanted = dict(self.permissions, members='read')
+        self.assertEqual({k: v for k, v in query.items() if v in ('read', 'write')}, wanted)
+        app = dict(slug='acme-app', permissions=wanted, owner=dict(type='Organization', login='acme'))
+        with mock.patch.object(cb, 'app_request', return_value=app):
+            self.setup(*flags, '--app-id', '777', '--key', str(self.download))
+        self.assertEqual(self.key.stat().st_ino, legacy_key)
+        self.assertEqual(self.env.read_text(), 'COLDBOX_GITHUB_APP_ID=4242\n')
+        scoped_key = self.key.with_name('github-app-acme.pem')
+        self.assertEqual(scoped_key.stat().st_mode & 0o777, 0o600)
+
+        def issue(path, jwt, *args):
+            if path.startswith('app/installations?'):
+                return [dict(id=1, account=dict(login='acme' if jwt == '777' else 'owner'))]
+            return dict(token='fixture-' + jwt, expires_at='2099-01-01T00:00:00Z')
+
+        with mock.patch.dict(os.environ, COLDBOX_GITHUB_APP_ID='4242'), \
+                mock.patch.object(cb, 'APP_TOKENS', {}), mock.patch.object(cb, 'app_request', issue), \
+                mock.patch.object(cb, 'app_jwt', side_effect=lambda app_id, key: app_id) as sign:
+            for target, expected in [('repos/Owner/app', '4242'), ('repos/ACME/app', '777'),
+                                     ('orgs/acme/members', '777'), ('', '4242')]:
+                self.assertEqual(cb.app_token(target), 'fixture-' + expected)
+            self.assertEqual(sign.call_args_list, [mock.call('4242', self.key), mock.call('777', scoped_key),
+                                                  mock.call('4242', self.key)])
+            scoped_key.unlink()
+            with self.assertRaisesRegex(RuntimeError, 'incomplete organization credentials'):
+                cb.app_token('repos/acme/app')
+
+    def test_public_org_app_requires_matching_owner_and_exact_permissions(self):
+        flags = ('--org', 'acme', '--sole-member', 'Alice', '--app-id', '777', '--key', str(self.download))
+        for owner, change, error in [('other', dict(members='read'), 'owner'),
+                                     ('acme', {}, 'add members:read'),
+                                     ('acme', dict(members='write'), 'remove members:write'),
+                                     ('acme', dict(members='read', organization_self_hosted_runners='write'),
+                                      'remove organization_self_hosted_runners:write')]:
+            app = dict(owner=dict(type='Organization', login=owner), permissions=dict(self.permissions, **change))
+            with self.subTest(owner=owner, change=change), mock.patch.object(cb, 'app_request', return_value=app), \
+                    self.assertRaisesRegex(cb.ConfigError, error):
+                self.setup(*flags)
+        self.assertFalse(self.key.parent.exists())
+
     def test_without_arguments_it_prints_a_prefilled_least_privilege_form(self):
         code, output = self.setup()
         self.assertEqual(code, 0)
@@ -349,6 +410,69 @@ class SetupApp(unittest.TestCase):
         self.assertTrue(self.requests[0].get_header('Authorization').startswith('Bearer '))
         self.assertIn('https://github.com/apps/coldbox-test/installations/new', output)
         self.assertNotIn('PRIVATE KEY', output)
+
+    def test_retry_completes_the_matching_key_after_an_interrupted_setup(self):
+        self.key.parent.mkdir()
+        self.key.write_bytes(self.download.read_bytes())
+        self.key.chmod(0o600)
+        inode = self.key.stat().st_ino
+        try:
+            code, output = self.setup('--app-id', '4242', '--key', str(self.download))
+        except cb.ConfigError as error:
+            self.fail(str(error))
+        self.assertEqual(code, 0)
+        self.assertIn('partial', output.lower())
+        self.assertIn(str(self.key), output)
+        self.assertIn(str(self.env), output)
+        self.assertTrue(self.download.read_text().splitlines()[1] not in output)
+        self.assertEqual(self.key.stat().st_ino, inode)
+        self.assertEqual(self.env.read_text(), 'COLDBOX_GITHUB_APP_ID=4242\n')
+
+    def test_retry_finishes_legacy_chown_only_for_a_root_owned_matching_key(self):
+        self.key.parent.mkdir()
+        self.key.write_bytes(self.download.read_bytes())
+        self.key.chmod(0o600)
+        owner = cb.pwd.struct_passwd(('runner', '', 1001, 1002, '', '/', '/bin/sh'))
+        actual_stat = self.key.stat()
+        real_fstat = os.fstat
+        changed = []
+
+        def chown(fd, uid, gid):
+            changed.append((real_fstat(fd).st_ino, uid, gid))
+
+        with mock.patch.object(cb.pwd, 'getpwnam', return_value=owner), mock.patch.object(cb.os, 'chown', chown):
+            for uid in (1003, 0):
+                stat = list(actual_stat)
+                stat[4] = uid
+                with mock.patch.object(cb.os, 'fstat', return_value=os.stat_result(stat)):
+                    if uid:
+                        with self.assertRaisesRegex(cb.ConfigError, 'existing key'):
+                            self.setup('--app-id', '4242', '--key', str(self.download))
+                        self.assertEqual(changed, [])
+                        self.assertFalse(self.env.exists())
+                    else:
+                        self.assertEqual(self.setup('--app-id', '4242', '--key', str(self.download))[0], 0)
+                        self.assertEqual(changed, [(actual_stat.st_ino, owner.pw_uid, owner.pw_gid)])
+                        self.assertEqual(self.env.read_text(), 'COLDBOX_GITHUB_APP_ID=4242\n')
+
+    def test_retry_refuses_to_pair_a_different_key(self):
+        self.key.parent.mkdir()
+        self.key.write_bytes(b'different fixture')
+        self.key.chmod(0o600)
+        with self.assertRaisesRegex(cb.ConfigError, 'partial'):
+            self.setup('--app-id', '4242', '--key', str(self.download))
+        self.assertEqual(self.key.read_bytes(), b'different fixture')
+        self.assertFalse(self.env.exists())
+
+    def test_retry_installs_the_missing_key_for_the_same_recorded_id(self):
+        self.env.parent.mkdir()
+        self.env.write_text('COLDBOX_GITHUB_APP_ID=4242\n')
+        inode = self.env.stat().st_ino
+        code, output = self.setup('--app-id', '4242', '--key', str(self.download))
+        self.assertEqual(code, 0)
+        self.assertIn('partial', output.lower())
+        self.assertEqual(self.env.stat().st_ino, inode)
+        self.assertTrue(self.key.read_bytes() == self.download.read_bytes())
 
     def test_refuses_an_app_with_more_permissions_and_writes_nothing(self):
         self.permissions.update(contents='write', actions='write')
