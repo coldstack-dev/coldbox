@@ -10254,7 +10254,7 @@ class CIAdmission(unittest.TestCase):
                 self.assertEqual(code, 125)
                 self.assertIn(str(path), err)
                 self.assertIn('{"primary": "<host>", "overflow": ["<host>", ...]}', err)
-                self.assertIn('https://github.com/TayHCode/coldbox#autoscaling', err)
+                self.assertIn('https://github.com/coldstack-dev/coldbox#autoscaling', err)
                 self.assertNotIn('delete', err)
         with mock.patch.object(cb, 'CI_HOSTS', directory / 'unlisted'), \
                 mock.patch.object(cb.os, 'uname', return_value=argparse.Namespace(nodename='scripts-host')):

@@ -3699,7 +3699,7 @@ def setup_app(args):
         wanted = dict(APP_PERMISSIONS, members='read')
     if args.app_id is None and args.key is None:
         query = urllib.parse.urlencode(dict(name=f'coldbox-{args.org if member else os.uname().nodename}',
-                                            url=f'https://github.com/{args.org}' if member else 'https://github.com/TayHCode/coldbox',
+                                            url=f'https://github.com/{args.org}' if member else 'https://github.com/coldstack-dev/coldbox',
                                             public='false', webhook_active='false',
                                             **wanted))
         owner = f'organizations/{urllib.parse.quote(args.org)}/settings' if args.org else 'settings'
@@ -4447,7 +4447,7 @@ print(json.dumps(dict(host=os.uname().nodename, target=requested_target, measure
 
 CI_HOSTS = Path('/etc/coldbox/ci-hosts.json')
 CI_HOSTS_HELP = ('it must hold {"primary": "<host>", "overflow": ["<host>", ...]} with distinct kernel host names, '
-                 'none in overflow equal to the primary. See https://github.com/TayHCode/coldbox#autoscaling')
+                 'none in overflow equal to the primary. See https://github.com/coldstack-dev/coldbox#autoscaling')
 
 
 def fleet():

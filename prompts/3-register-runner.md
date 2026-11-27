@@ -3,15 +3,15 @@
 Paste this after checks are switched on. Replace OWNER/REPO.
 
 ```text
-Register a Coldbox ephemeral GitHub Actions runner for OWNER/REPO.
+Register a Coldbox ephemeral GitHub Actions runner for OWNER/REPO. Stop and ask me before anything marked ASK.
 
 1. Confirm `coldbox status` shows `GitHub auth: GitHub App installation token` and that the App is installed on
    OWNER/REPO. If it warns about a personal gh login, ask me whether to run `coldbox setup-app` first.
-2. The repo must be private. `coldbox register` checks this through the App and refuses a public repo.
-   If it refuses, STOP and ask me.
+2. ASK for my explicit approval before starting a persistent systemd runner service, and confirm the repo is private.
+   `coldbox register` checks this through the App and refuses a public repo; if it refuses, STOP and ask me.
    Never pass --allow-public unless I explicitly say so in this conversation. Fork pull requests never run on
    Coldbox, even with --allow-public; I review those by hand and set that repo's approval setting myself.
-3. Run `coldbox register OWNER/REPO`. It starts the systemd service coldbox-runner@... which keeps one
+3. Once approved, run `coldbox register OWNER/REPO`. It starts the systemd service coldbox-runner@... which keeps one
    throwaway VM waiting for a job; each VM takes exactly one job and is then destroyed. If the repo's workflows run
    several jobs at once and `coldbox status` shows spare RAM, add `--slots 2` (it refuses if the RAM is not there).
 4. Check that it is waiting: `systemctl status 'coldbox-runner@*'` and `coldbox status` (expect OWNER/REPO under

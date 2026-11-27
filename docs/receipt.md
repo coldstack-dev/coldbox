@@ -232,7 +232,7 @@ ColdVerify path. To require host-observed evidence, name `coldbox verify (host s
 
 ## Flaky tests
 
-Coldbox records; it does not judge. A reader such as Coldfix can find flakes by grouping runner receipts on
+Coldbox records; it does not judge. A receipt reader can find flakes by grouping runner receipts on
 `github.repo`, `github.sha`, `github.workflow`, `job_name`. Within a group, `github.run_id` plus `github.run_attempt`
 tells the attempts apart, and `job_result` is each attempt's conclusion. A test is identified by `suite` + `classname` +
 `name` (each is `""` when the report leaves it out). A test whose `tests.results[].status` differs across attempts at

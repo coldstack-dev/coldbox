@@ -4,6 +4,18 @@ CI on a computer you already own. Every job gets a fresh VM cloned from a warm s
 switched on, writes a JSON receipt, and the VM is destroyed. A self-hosted GitHub Actions runner feeds it jobs.
 It costs $0 per minute, against GitHub's $0.006 per minute.
 
+Needs Linux with /dev/kvm. No macOS or Windows.
+
+## What you get
+
+```json
+{
+  "verdict": "pass",
+  "tests_ran": 70,
+  "vm": {"destroyed": true}
+}
+```
+
 ## Safety model (read this first)
 
 A self-hosted runner executes whatever a workflow tells it to. Coldbox limits what that code can reach:
@@ -88,6 +100,8 @@ A self-hosted runner executes whatever a workflow tells it to. Coldbox limits wh
 macOS, Windows and ARM hosts are not supported: Coldbox needs Incus with KVM on a Linux host. An old laptop or desktop
 with Linux on it is the target.
 
+No telemetry. Network: host setup downloads OS packages and (with opt-in) the Zabbly Incus repo key/packages; image builds download the VM base image and toolchain/runner packages; runner registration and CI use the GitHub API; running jobs can reach public IPv4 destinations unless run with `--offline`.
+
 ### WSL2
 
 WSL2 on a Windows 11 PC gave no `/dev/kvm`, so `install.sh` stops at its first check and `coldbox status` fails its
@@ -101,7 +115,7 @@ hardware virtualization check. Install Linux on a spare machine, or use a VPS wi
 Install Coldbox on a supported host.
 
 ```sh
-git clone https://github.com/TayHCode/coldbox.git && cd coldbox && sudo ./install.sh
+git clone https://github.com/coldstack-dev/coldbox.git && cd coldbox && sudo ./install.sh
 ```
 
 Open your project checkout. Run `coldbox detect .` to preview the suggested checks.
@@ -626,7 +640,7 @@ If a check might already have reached GitHub, the reaper looks for it using the 
 
 Coldbox stays a separate repo. Other tools connect through two plain seams:
 
-- **Receipt (for Coldfix):** one JSON file per VM at `/var/lib/coldbox/receipts/<id>.json`, with the raw log next to it as `<id>.log`.
+- **Receipt:** one JSON file per VM at `/var/lib/coldbox/receipts/<id>.json`, with the raw log next to it as `<id>.log`.
   Each file is written atomically, first as `incomplete` when the VM is requested and finally after the VM is destroyed.
   [docs/receipt.md](docs/receipt.md) documents schema `coldbox.receipt/v1`: verdicts, the GitHub job identity, per-test
   results from JUnit reports, and how to group receipts to find flaky tests. [examples/receipts/](examples/receipts/) has real

@@ -8,9 +8,10 @@ Set up Coldbox so OWNER/REPO runs its CI in throwaway VMs on this machine. Stop 
 
 1. Install. If `coldbox status` already passes, skip to step 2. Otherwise:
    - Check this is x86_64 Ubuntu 24.04+ or Debian 13+ with /dev/kvm, and that I can run sudo.
-   - `git clone https://github.com/TayHCode/coldbox.git ~/coldbox`, read the README safety model and install.sh,
+   - `git clone https://github.com/coldstack-dev/coldbox.git ~/coldbox`, read the README safety model and install.sh,
      and tell me in 3 lines what install.sh will change on this host.
-   - Run `sudo ~/coldbox/install.sh`. If it stops, it prints the fix; apply it and run it again.
+   - ASK for my explicit approval before modifying host packages or running `sudo ~/coldbox/install.sh`. Once approved,
+     run `sudo ~/coldbox/install.sh`. If it stops, it prints the fix; apply it and run it again.
      Never edit install.sh to skip a check.
    - `coldbox status` must pass every check. If the `GitHub auth` line fails or warns, ASK me to run `coldbox setup-app` and follow its steps.
 2. Check the repo is private. `coldbox register` checks this itself and refuses a public repo. If it refuses, ASK. Fork
@@ -23,7 +24,8 @@ Set up Coldbox so OWNER/REPO runs its CI in throwaway VMs on this machine. Stop 
 5. Workflow. On the same branch, add .github/workflows/coldbox.yml copied from ~/coldbox/examples/coldbox.yml. If the repo
    already has workflows, list them and ASK whether to move them to `runs-on: [self-hosted, coldbox]` too.
    Open a PR. Do not merge it.
-6. Register: `coldbox register OWNER/REPO --slots 0`. Coldbox starts a runner VM when a job queues.
+6. Register: ASK for my explicit approval before starting a persistent runner service, then run
+   `coldbox register OWNER/REPO --slots 0`. Coldbox starts a runner VM when a job queues.
 7. Prove it on GitHub: the PR's coldbox workflow must run on a cbx-* runner. Show the newest receipt
    (`ls -t /var/lib/coldbox/receipts/*.json | head -1`): verdict, job_result and vm.destroyed = true.
 8. Report what you installed, the checks, the PR link, the receipt verdict and anything you could not verify.

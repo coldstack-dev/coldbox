@@ -17,7 +17,7 @@ Maintainer CI runs `coldbox checks` on a Coldbox runner: compileall, shellcheck 
 `tests/stress.sh LANES SECONDS` runs `coldbox run` in parallel lanes against a throwaway fixture on a Coldbox host
 and fails if Incus restarted or a job did not pass. Its receipts go to `.smoke/stress-<time>/receipts`, never to
 `/var/lib/coldbox/receipts`. Any other manual or test `coldbox run` on a production host needs `--receipts DIR` too,
-so Coldfix only sees real jobs.
+so production receipts only record real jobs.
 
 ## Style
 

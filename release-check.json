@@ -171,8 +171,8 @@
     {"scope": "verification", "kind": "dependency-license-review", "path": "@dependency/PyYAML", "fingerprint": "457f4a485629ac3d", "reason": "Owner approval: \"PyYAML is MIT, which is compatible.\""}
   ],
   "quickstart": [
-    {"file": "README.md", "line": 186, "argv": ["./coldbox", "--help"]},
-    {"file": "README.md", "line": 188, "argv": ["python3", "-m", "pip", "install", "pyyaml"]}
+    {"file": "README.md", "line": 200, "argv": ["./coldbox", "--help"]},
+    {"file": "README.md", "line": 202, "argv": ["python3", "-m", "pip", "install", "pyyaml"]}
   ],
   "verify_tools": ["shellcheck"],
   "checks": [
